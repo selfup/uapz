@@ -17,7 +17,9 @@ It also ensures all Go is correct and run from source.
 - Use `cargo fmt`
 - Use `cargo check` before `cargo run` or `cargo build`
 - No Warnings
-- cargo doc has been run on this repo, search there first if you are not sure about dependency APIs
+- cargo doc has been run on this repo
+- search there first if you are not sure about dependency APIs
+- cargo docs can be found here: `target/doc/`
 
 ## Git
 
@@ -28,14 +30,16 @@ It also ensures all Go is correct and run from source.
 
 ## Additional CLI Tools
 
-ripgrep
+ripgrep (rg)
 hexyl
 exa
 uv
-imagemagick
+imagemagick (magick)
 ffmpeg
 curl
 wget
+grype
+syft
 
 ## Python
 
