@@ -1,8 +1,14 @@
-//! The workspace: the sidebar of saved graphs and custom node kinds, the toolbar, and
-//! the editor itself.
+//! The workspace: the sidebar of saved graphs, blank node kinds and the per-type library
+//! (agents, prompts, databases, scripts, data), the toolbar, the editor, and the inspector.
 
 use crate::doc::{self, NodeKind};
-use crate::graph::{Graph, hsla_of};
+use crate::graph::{Current, Graph, hsla_of, type_color};
+use crate::inspector::{Inspector, InspectorEvent};
+use crate::library::{self, Preset};
+use crate::node_data::{
+    AgentConfig, DataConfig, DataFormat, DatabaseConfig, NodeData, NodeType, Runtime, ScriptConfig,
+};
+use crate::validate;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::color_picker::{ColorPicker, ColorPickerState};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -10,11 +16,12 @@ use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::{ActiveTheme, IndexPath, Sizable, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
+use std::collections::HashSet;
 
 gpui_kit::actions!(workspace, [Save, NewGraph]);
 
 pub const KEY_CONTEXT: &str = "Workspace";
-const SIDEBAR_W: f32 = 240.0;
+const SIDEBAR_W: f32 = 260.0;
 /// First entry of the kind dropdown: a plain node.
 const BLANK: &str = "Blank";
 /// Starting color in the node creator.
@@ -27,8 +34,18 @@ const DEFAULT_KIND_COLOR: Hsla = Hsla {
 
 type KindSelect = SelectState<Vec<SharedString>>;
 
+/// Sidebar sections, by the key used to remember which are collapsed.
+const GRAPHS: &str = "graphs";
+const KINDS: &str = "kinds";
+const AGENTS: &str = "agents";
+const PROMPTS: &str = "prompts";
+const DATABASES: &str = "databases";
+const SCRIPTS: &str = "scripts";
+const DATA: &str = "data";
+
 pub struct Workspace {
     graph: Entity<Graph>,
+    inspector: Entity<Inspector>,
     /// Name field for the graph being edited.
     name: Entity<InputState>,
     files: Vec<String>,
@@ -40,6 +57,12 @@ pub struct Workspace {
     /// Toolbar dropdown choosing what Add node creates.
     kind_select: Entity<KindSelect>,
     kinds: Vec<NodeKind>,
+    agents: Vec<Preset<AgentConfig>>,
+    prompts: Vec<String>,
+    databases: Vec<Preset<DatabaseConfig>>,
+    scripts: Vec<String>,
+    data: Vec<String>,
+    collapsed: HashSet<&'static str>,
     status: Option<Status>,
     _subscriptions: Vec<Subscription>,
 }
@@ -49,11 +72,39 @@ struct Status {
     error: bool,
 }
 
-/// Dropdown entries: Blank first, then every kind in list order.
+/// Dropdown entries: Blank, the four content types, then every saved kind in list order.
 fn select_items(kinds: &[NodeKind]) -> Vec<SharedString> {
     std::iter::once(SharedString::from(BLANK))
+        .chain(NodeType::ALL.iter().map(|t| SharedString::from(t.label())))
         .chain(kinds.iter().map(|k| SharedString::from(k.name.clone())))
         .collect()
+}
+
+/// What a dropdown entry means for new nodes.
+fn current_of(value: &str) -> Current {
+    if value == BLANK {
+        Current::Blank
+    } else if let Some(ty) = NodeType::from_label(value) {
+        Current::Type(ty)
+    } else {
+        Current::Kind(value.to_string())
+    }
+}
+
+/// Node content pointing at a file the user dropped into `scripts/` or `data/`.
+fn file_data(ty: NodeType, path: &str) -> NodeData {
+    let ext = validate::extension(path).unwrap_or_default();
+    match ty {
+        NodeType::Script => NodeData::Script(ScriptConfig {
+            runtime: Runtime::for_extension(&ext).unwrap_or(Runtime::Python),
+            path: path.to_string(),
+            ..ScriptConfig::default()
+        }),
+        _ => NodeData::Data(DataConfig {
+            path: path.to_string(),
+            format: DataFormat::for_extension(&ext),
+        }),
+    }
 }
 
 impl Workspace {
@@ -64,6 +115,7 @@ impl Workspace {
             graph.set_kinds(&kinds, cx);
             graph
         });
+        let inspector = cx.new(|cx| Inspector::new(graph.clone(), window, cx));
         let name = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("graph name")
@@ -95,20 +147,36 @@ impl Workspace {
                 window,
                 |this, _, event: &SelectEvent<Vec<SharedString>>, _, cx| match event {
                     SelectEvent::Confirm(value) => {
-                        let kind = value
+                        let current = value
                             .as_ref()
-                            .filter(|v| v.as_ref() != BLANK)
-                            .map(|v| v.to_string());
+                            .map_or(Current::Blank, |v| current_of(v.as_ref()));
                         this.graph
-                            .update(cx, |graph, cx| graph.set_current_kind(kind, cx));
+                            .update(cx, |graph, cx| graph.set_current(current, cx));
                     }
+                },
+            ),
+            cx.subscribe_in(
+                &inspector,
+                window,
+                |this, _, event: &InspectorEvent, _, cx| {
+                    match event {
+                        InspectorEvent::LibraryChanged => this.refresh_library(),
+                        InspectorEvent::Status { text, error } => {
+                            this.status = Some(Status {
+                                text: text.clone(),
+                                error: *error,
+                            });
+                        }
+                    }
+                    cx.notify();
                 },
             ),
         ];
 
         graph.read(cx).focus_handle.clone().focus(window, cx);
-        Self {
+        let mut workspace = Self {
             graph,
+            inspector,
             name,
             files: doc::list(),
             current: None,
@@ -116,9 +184,17 @@ impl Workspace {
             kind_color,
             kind_select,
             kinds,
+            agents: Vec::new(),
+            prompts: Vec::new(),
+            databases: Vec::new(),
+            scripts: Vec::new(),
+            data: Vec::new(),
+            collapsed: HashSet::new(),
             status: None,
             _subscriptions: subscriptions,
-        }
+        };
+        workspace.refresh_library();
+        workspace
     }
 
     fn ok(&mut self, text: String) {
@@ -142,6 +218,7 @@ impl Workspace {
             Err(text) => self.err(text),
         }
         self.files = doc::list();
+        self.refresh_library();
         cx.notify();
     }
 
@@ -159,6 +236,7 @@ impl Workspace {
             Err(text) => self.err(text),
         }
         self.files = doc::list();
+        self.refresh_library();
         cx.notify();
     }
 
@@ -179,10 +257,17 @@ impl Workspace {
         self.new_graph(window, cx);
     }
 
-    // ----- node kinds -----
+    // ----- blank node kinds -----
 
     fn save_kind_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name = doc::sanitize_name(&self.kind_name.read(cx).value());
+        if name == BLANK || NodeType::from_label(&name).is_some() {
+            self.err(format!(
+                "`{name}` is reserved for the node types; pick another name"
+            ));
+            cx.notify();
+            return;
+        }
         let color = Rgba::from(
             self.kind_color
                 .read(cx)
@@ -214,11 +299,12 @@ impl Workspace {
         let Some(kind) = self.kinds.get(index).cloned() else {
             return;
         };
+        let item = 1 + NodeType::ALL.len() + index;
         self.kind_select.update(cx, |select, cx| {
-            select.set_selected_index(Some(IndexPath::new(index + 1)), window, cx)
+            select.set_selected_index(Some(IndexPath::new(item)), window, cx)
         });
         self.graph.update(cx, |graph, cx| {
-            graph.set_current_kind(Some(kind.name.clone()), cx)
+            graph.set_current(Current::Kind(kind.name.clone()), cx)
         });
         self.kind_name.update(cx, |input, cx| {
             input.set_value(kind.name.clone(), window, cx)
@@ -236,7 +322,7 @@ impl Workspace {
     }
 
     /// Re-read `nodes/`, hand the kinds to the editor so instances pick up color edits,
-    /// and rebuild the dropdown, keeping its selection when that kind still exists.
+    /// and rebuild the dropdown, keeping its selection when that entry still exists.
     fn refresh_kinds(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.kinds = doc::list_kinds();
         let kinds = self.kinds.clone();
@@ -248,14 +334,460 @@ impl Workspace {
         let index = selected
             .and_then(|value| items.iter().position(|item| *item == value))
             .unwrap_or(0);
+        let current = current_of(items[index].as_ref());
         self.kind_select.update(cx, |select, cx| {
             select.set_items(items, window, cx);
             select.set_selected_index(Some(IndexPath::new(index)), window, cx);
         });
-        let current = (index > 0).then(|| self.kinds[index - 1].name.clone());
         self.graph
-            .update(cx, |graph, cx| graph.set_current_kind(current, cx));
+            .update(cx, |graph, cx| graph.set_current(current, cx));
         cx.notify();
+    }
+
+    // ----- library -----
+
+    fn refresh_library(&mut self) {
+        self.agents = library::list_agents();
+        self.prompts = library::list_prompts();
+        self.databases = library::list_databases();
+        self.scripts = library::list_scripts();
+        self.data = library::list_data();
+    }
+
+    fn add_preset(&mut self, name: &str, data: NodeData, cx: &mut Context<Self>) {
+        self.graph
+            .update(cx, |graph, cx| graph.add_preset(name, data, cx));
+    }
+
+    fn delete_agent(&mut self, name: &str, cx: &mut Context<Self>) {
+        match library::delete_agent(name) {
+            Ok(()) => self.ok(format!("Deleted agent {name}; its outputs/ folder is kept")),
+            Err(text) => self.err(text),
+        }
+        self.refresh_library();
+        cx.notify();
+    }
+
+    fn delete_database(&mut self, name: &str, cx: &mut Context<Self>) {
+        match library::delete_database(name) {
+            Ok(()) => self.ok(format!("Deleted database {name}")),
+            Err(text) => self.err(text),
+        }
+        self.refresh_library();
+        cx.notify();
+    }
+
+    fn delete_prompt(&mut self, name: &str, cx: &mut Context<Self>) {
+        match library::delete_prompt(name) {
+            Ok(()) => self.ok(format!("Deleted prompt {name}")),
+            Err(text) => self.err(text),
+        }
+        self.refresh_library();
+        cx.notify();
+    }
+
+    fn apply_prompt(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.inspector
+            .update(cx, |inspector, cx| inspector.apply_prompt(name, window, cx));
+    }
+
+    /// Point the selected script/data node at the file, or add a new node for it.
+    fn use_file(&mut self, ty: NodeType, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let applied = self
+            .inspector
+            .update(cx, |inspector, cx| inspector.use_file(ty, path, window, cx));
+        if !applied {
+            let data = file_data(ty, path);
+            self.graph.update(cx, |graph, cx| graph.add_data(data, cx));
+        }
+    }
+
+    fn toggle_section(&mut self, key: &'static str, cx: &mut Context<Self>) {
+        if !self.collapsed.remove(key) {
+            self.collapsed.insert(key);
+        }
+        cx.notify();
+    }
+}
+
+// ----- rendering helpers -----
+
+#[derive(Clone, Copy)]
+struct Colors {
+    fg: Hsla,
+    muted: Hsla,
+    accent: Hsla,
+    accent_fg: Hsla,
+    border: Hsla,
+}
+
+fn row(id: impl Into<ElementId>, c: Colors) -> Stateful<Div> {
+    let accent = c.accent;
+    h_flex()
+        .id(id)
+        .gap_2()
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .text_sm()
+        .text_color(c.fg)
+        .cursor_pointer()
+        .hover(move |d| d.bg(accent))
+}
+
+fn swatch(color: Hsla) -> Div {
+    div()
+        .flex_shrink_0()
+        .w(px(12.0))
+        .h(px(12.0))
+        .rounded_sm()
+        .bg(color)
+}
+
+fn ellipsis(text: impl Into<SharedString>) -> Div {
+    div()
+        .flex_1()
+        .min_w_0()
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_ellipsis()
+        .child(text.into())
+}
+
+fn hint(text: impl Into<SharedString>, c: Colors) -> Div {
+    div()
+        .px_2()
+        .text_xs()
+        .text_color(c.muted)
+        .child(text.into())
+}
+
+fn ghost_button(id: impl Into<ElementId>, label: &'static str) -> Button {
+    Button::new(id).ghost().xsmall().label(label)
+}
+
+impl Workspace {
+    /// A collapsible sidebar section: header row with a chevron, title and count; the body
+    /// only when expanded.
+    fn section(
+        &self,
+        key: &'static str,
+        title: &'static str,
+        count: usize,
+        c: Colors,
+        extra: Option<AnyElement>,
+        body: AnyElement,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let open = !self.collapsed.contains(key);
+        let header = h_flex()
+            .id(key)
+            .gap_2()
+            .items_center()
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_section(key, cx)))
+            .child(
+                div()
+                    .w(px(12.0))
+                    .text_xs()
+                    .text_color(c.muted)
+                    .child(if open { "▾" } else { "▸" }),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(c.fg)
+                    .child(title),
+            )
+            .child(div().text_xs().text_color(c.muted).child(count.to_string()))
+            .children(extra.map(|e| div().ml_auto().child(e)));
+        v_flex()
+            .gap_2()
+            .child(header)
+            .when(open, |d| d.child(body))
+            .child(div().h(px(1.0)).flex_shrink_0().bg(c.border))
+    }
+
+    fn render_graphs(&self, c: Colors, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let current = self.current.clone();
+        let mut rows = Vec::with_capacity(self.files.len());
+        for (i, name) in self.files.iter().enumerate() {
+            let active = current.as_deref() == Some(name.as_str());
+            let load_name = name.clone();
+            rows.push(
+                row(("file", i), c)
+                    .when(active, |d| d.bg(c.accent).text_color(c.accent_fg))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.load(&load_name, window, cx)
+                    }))
+                    .child(ellipsis(name.clone())),
+            );
+        }
+        let empty = self
+            .files
+            .is_empty()
+            .then(|| hint("Nothing saved yet. Name the graph and press Save.", c));
+        v_flex()
+            .gap_2()
+            .child(Input::new(&self.name))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("save")
+                            .primary()
+                            .small()
+                            .label("Save")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.save_now(cx))),
+                    )
+                    .child(Button::new("new").outline().small().label("New").on_click(
+                        cx.listener(|this, _: &ClickEvent, window, cx| this.new_graph(window, cx)),
+                    )),
+            )
+            .child(hint(format!("saved in {}/", doc::DIR), c))
+            .child(v_flex().gap_1().children(rows).children(empty))
+    }
+
+    fn render_kinds(&self, c: Colors, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let mut rows = Vec::with_capacity(self.kinds.len());
+        for (i, kind) in self.kinds.iter().enumerate() {
+            let color = hsla_of(&kind.color).unwrap_or(c.muted);
+            let add_kind = kind.clone();
+            let delete_name = kind.name.clone();
+            rows.push(
+                row(("kind", i), c)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.select_kind(i, window, cx)
+                    }))
+                    .child(swatch(color))
+                    .child(ellipsis(kind.name.clone()))
+                    .child(ghost_button(("add-kind", i), "+").on_click(cx.listener(
+                        move |this, _: &ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.add_kind(&add_kind, cx)
+                        },
+                    )))
+                    .child(ghost_button(("delete-kind", i), "×").on_click(cx.listener(
+                        move |this, _: &ClickEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.delete_kind(&delete_name, window, cx)
+                        },
+                    ))),
+            );
+        }
+        let empty = self.kinds.is_empty().then(|| {
+            hint(
+                "Blank, colored node kinds. Name one, pick a color, press Save kind.",
+                c,
+            )
+        });
+        v_flex()
+            .gap_2()
+            .child(Input::new(&self.kind_name))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(ColorPicker::new(&self.kind_color))
+                    .child(
+                        Button::new("save-kind")
+                            .primary()
+                            .small()
+                            .label("Save kind")
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.save_kind_now(window, cx)
+                            })),
+                    ),
+            )
+            .child(hint(
+                format!("in {}/ · click selects, + adds, × deletes", doc::NODES_DIR),
+                c,
+            ))
+            .child(v_flex().gap_1().children(rows).children(empty))
+    }
+
+    fn render_agents(&self, c: Colors, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let color = type_color(NodeType::Agent);
+        let mut rows = Vec::with_capacity(self.agents.len());
+        for (i, agent) in self.agents.iter().enumerate() {
+            let (name, config) = (agent.name.clone(), agent.config.clone());
+            let delete_name = agent.name.clone();
+            rows.push(
+                row(("agent", i), c)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.add_preset(&name, NodeData::Agent(config.clone()), cx)
+                    }))
+                    .child(swatch(color))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(ellipsis(agent.name.clone()))
+                            .child(
+                                ellipsis(agent.config.summary())
+                                    .text_xs()
+                                    .text_color(c.muted),
+                            ),
+                    )
+                    .child(ghost_button(("delete-agent", i), "×").on_click(cx.listener(
+                        move |this, _: &ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.delete_agent(&delete_name, cx)
+                        },
+                    ))),
+            );
+        }
+        let empty = self.agents.is_empty().then(|| {
+            hint(
+                format!(
+                    "Configure an Agent node and press Save agent; it lands in {}/<name>/.",
+                    library::AGENTS_DIR
+                ),
+                c,
+            )
+        });
+        v_flex()
+            .gap_1()
+            .child(hint("click adds to the canvas · × deletes", c))
+            .children(rows)
+            .children(empty)
+    }
+
+    fn render_prompts(&self, c: Colors, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let mut rows = Vec::with_capacity(self.prompts.len());
+        for (i, name) in self.prompts.iter().enumerate() {
+            let apply_name = name.clone();
+            let delete_name = name.clone();
+            rows.push(
+                row(("prompt", i), c)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.apply_prompt(&apply_name, window, cx)
+                    }))
+                    .child(ellipsis(name.clone()))
+                    .child(
+                        ghost_button(("delete-prompt", i), "×").on_click(cx.listener(
+                            move |this, _: &ClickEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.delete_prompt(&delete_name, cx)
+                            },
+                        )),
+                    ),
+            );
+        }
+        let empty = self.prompts.is_empty().then(|| {
+            hint(
+                format!(
+                    "Write a prompt in an Agent node and press Save prompt; it lands in {}/.",
+                    library::PROMPTS_DIR
+                ),
+                c,
+            )
+        });
+        v_flex()
+            .gap_1()
+            .child(hint("click loads into the selected agent · × deletes", c))
+            .children(rows)
+            .children(empty)
+    }
+
+    fn render_databases(&self, c: Colors, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let color = type_color(NodeType::Database);
+        let mut rows = Vec::with_capacity(self.databases.len());
+        for (i, db) in self.databases.iter().enumerate() {
+            let (name, config) = (db.name.clone(), db.config.clone());
+            let delete_name = db.name.clone();
+            rows.push(
+                row(("database", i), c)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.add_preset(&name, NodeData::Database(config.clone()), cx)
+                    }))
+                    .child(swatch(color))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(ellipsis(db.name.clone()))
+                            .child(ellipsis(db.config.summary()).text_xs().text_color(c.muted)),
+                    )
+                    .child(
+                        ghost_button(("delete-database", i), "×").on_click(cx.listener(
+                            move |this, _: &ClickEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.delete_database(&delete_name, cx)
+                            },
+                        )),
+                    ),
+            );
+        }
+        let empty = self.databases.is_empty().then(|| {
+            hint(
+                format!(
+                    "Configure a Database node and press Save database; it lands in {}/.",
+                    library::DATABASES_DIR
+                ),
+                c,
+            )
+        });
+        v_flex()
+            .gap_1()
+            .child(hint("click adds to the canvas · × deletes", c))
+            .children(rows)
+            .children(empty)
+    }
+
+    /// Files under `scripts/` or `data/`: click points the selected node of that type at
+    /// the file, or adds a node for it.
+    fn render_files(
+        &self,
+        ty: NodeType,
+        files: &[String],
+        dir: &'static str,
+        c: Colors,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let color = type_color(ty);
+        let key = match ty {
+            NodeType::Script => "script",
+            _ => "datafile",
+        };
+        let mut rows = Vec::with_capacity(files.len());
+        for (i, path) in files.iter().enumerate() {
+            let use_path = path.clone();
+            rows.push(
+                row((key, i), c)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.use_file(ty, &use_path, window, cx)
+                    }))
+                    .child(swatch(color))
+                    .child(ellipsis(path.clone())),
+            );
+        }
+        let empty = files.is_empty().then(|| {
+            hint(
+                format!("Put files in {dir}/ and press ↻; they are listed here."),
+                c,
+            )
+        });
+        v_flex()
+            .gap_1()
+            .child(hint(
+                "click points the selected node at the file, or adds one",
+                c,
+            ))
+            .children(rows)
+            .children(empty)
+    }
+
+    fn refresh_button(&self, id: &'static str, cx: &mut Context<Self>) -> AnyElement {
+        ghost_button(id, "↻")
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                cx.stop_propagation();
+                this.refresh_library();
+                this.ok("Re-read the library directories".into());
+                cx.notify();
+            }))
+            .into_any_element()
     }
 }
 
@@ -264,123 +796,24 @@ impl Render for Workspace {
         let theme = cx.theme();
         let bg = theme.sidebar;
         let canvas_bg = theme.background;
-        let border = theme.sidebar_border;
-        let fg = theme.sidebar_foreground;
-        let muted = theme.muted_foreground;
-        let accent = theme.sidebar_accent;
-        let accent_fg = theme.sidebar_accent_foreground;
         let danger = theme.danger;
-
-        let section_title = |text: &'static str| {
-            div()
-                .text_sm()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(fg)
-                .child(text)
+        let c = Colors {
+            fg: theme.sidebar_foreground,
+            muted: theme.muted_foreground,
+            accent: theme.sidebar_accent,
+            accent_fg: theme.sidebar_accent_foreground,
+            border: theme.sidebar_border,
         };
-
-        // Saved graphs.
-        let current = self.current.clone();
-        let mut file_rows = Vec::with_capacity(self.files.len());
-        for (i, name) in self.files.iter().enumerate() {
-            let active = current.as_deref() == Some(name.as_str());
-            let load_name = name.clone();
-            file_rows.push(
-                div()
-                    .id(("file", i))
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .text_sm()
-                    .text_color(fg)
-                    .cursor_pointer()
-                    .when(active, |d| d.bg(accent).text_color(accent_fg))
-                    .hover(|d| d.bg(accent))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        this.load(&load_name, window, cx)
-                    }))
-                    .child(name.clone()),
-            );
-        }
-        let no_files = self.files.is_empty().then(|| {
-            div()
-                .px_2()
-                .text_xs()
-                .text_color(muted)
-                .child("Nothing saved yet. Name the graph and press Save.")
-        });
-
-        // Custom node kinds: click a row to make it current, + adds one, × deletes it.
-        let mut kind_rows = Vec::with_capacity(self.kinds.len());
-        for (i, kind) in self.kinds.iter().enumerate() {
-            let swatch = hsla_of(&kind.color).unwrap_or(muted);
-            let add_kind = kind.clone();
-            let delete_name = kind.name.clone();
-            kind_rows.push(
-                h_flex()
-                    .id(("kind", i))
-                    .gap_2()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .text_sm()
-                    .text_color(fg)
-                    .cursor_pointer()
-                    .hover(|d| d.bg(accent))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        this.select_kind(i, window, cx)
-                    }))
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .w(px(12.0))
-                            .h(px(12.0))
-                            .rounded_sm()
-                            .bg(swatch),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .child(kind.name.clone()),
-                    )
-                    .child(
-                        Button::new(("add-kind", i))
-                            .ghost()
-                            .xsmall()
-                            .label("+")
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                cx.stop_propagation();
-                                this.add_kind(&add_kind, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new(("delete-kind", i))
-                            .ghost()
-                            .xsmall()
-                            .label("×")
-                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                cx.stop_propagation();
-                                this.delete_kind(&delete_name, window, cx)
-                            })),
-                    ),
-            );
-        }
-        let no_kinds = self.kinds.is_empty().then(|| {
-            div()
-                .px_2()
-                .text_xs()
-                .text_color(muted)
-                .child("No custom nodes yet. Name one, pick a color, press Save node.")
-        });
 
         let status = self.status.as_ref().map(|s| {
             div()
+                .flex_shrink_0()
+                .px_3()
+                .py_2()
+                .border_t_1()
+                .border_color(c.border)
                 .text_xs()
-                .text_color(if s.error { danger } else { muted })
+                .text_color(if s.error { danger } else { c.muted })
                 .child(s.text.clone())
         });
 
@@ -388,49 +821,102 @@ impl Render for Workspace {
             let graph = self.graph.read(cx);
             (graph.node_count(), graph.edge_count())
         };
-        let toolbar =
-            h_flex()
-                .flex_shrink_0()
-                .gap_2()
-                .px_3()
-                .py_2()
-                .bg(canvas_bg)
-                .border_b_1()
-                .border_color(border)
-                .child(
-                    Select::new(&self.kind_select)
-                        .small()
-                        .w(px(160.0))
-                        .menu_width(px(200.0)),
-                )
-                .child(
-                    Button::new("add-node")
-                        .primary()
-                        .small()
-                        .label("Add node")
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.graph.update(cx, |graph, cx| graph.add_current(cx))
-                        })),
-                )
-                .child(
-                    Button::new("clear")
-                        .outline()
-                        .small()
-                        .label("Clear")
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.graph.update(cx, |graph, cx| graph.clear(cx))
-                        })),
-                )
-                .child(
-                    div()
-                        .ml_2()
-                        .text_xs()
-                        .text_color(muted)
-                        .child(format!("{node_count} nodes · {edge_count} connections")),
-                )
-                .child(div().ml_2().text_xs().text_color(muted).child(
-                    "drag ● to connect · double-click to add · ⌫ deletes · drag space to pan",
-                ));
+        let toolbar = h_flex()
+            .flex_shrink_0()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .bg(canvas_bg)
+            .border_b_1()
+            .border_color(c.border)
+            .child(
+                Select::new(&self.kind_select)
+                    .small()
+                    .w(px(160.0))
+                    .menu_width(px(200.0)),
+            )
+            .child(
+                Button::new("add-node")
+                    .primary()
+                    .small()
+                    .label("Add node")
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.graph.update(cx, |graph, cx| graph.add_current(cx))
+                    })),
+            )
+            .child(
+                Button::new("clear")
+                    .outline()
+                    .small()
+                    .label("Clear")
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.graph.update(cx, |graph, cx| graph.clear(cx))
+                    })),
+            )
+            .child(
+                div()
+                    .ml_2()
+                    .text_xs()
+                    .text_color(c.muted)
+                    .child(format!("{node_count} nodes · {edge_count} connections")),
+            )
+            .child(div().ml_2().text_xs().text_color(c.muted).child(
+                "drag ● to connect · double-click to add · ⌫ deletes · drag space to pan · select a node to edit it",
+            ));
+
+        let graphs = self.render_graphs(c, cx).into_any_element();
+        let kinds = self.render_kinds(c, cx).into_any_element();
+        let agents = self.render_agents(c, cx).into_any_element();
+        let prompts = self.render_prompts(c, cx).into_any_element();
+        let databases = self.render_databases(c, cx).into_any_element();
+        let scripts = self
+            .render_files(
+                NodeType::Script,
+                &self.scripts.clone(),
+                library::SCRIPTS_DIR,
+                c,
+                cx,
+            )
+            .into_any_element();
+        let data = self
+            .render_files(NodeType::Data, &self.data.clone(), library::DATA_DIR, c, cx)
+            .into_any_element();
+        let refresh_scripts = self.refresh_button("refresh-scripts", cx);
+        let refresh_data = self.refresh_button("refresh-data", cx);
+
+        let sections = v_flex()
+            .gap_3()
+            .child(self.section(GRAPHS, "Graphs", self.files.len(), c, None, graphs, cx))
+            .child(self.section(KINDS, "Kinds", self.kinds.len(), c, None, kinds, cx))
+            .child(self.section(AGENTS, "Agents", self.agents.len(), c, None, agents, cx))
+            .child(self.section(PROMPTS, "Prompts", self.prompts.len(), c, None, prompts, cx))
+            .child(self.section(
+                DATABASES,
+                "Databases",
+                self.databases.len(),
+                c,
+                None,
+                databases,
+                cx,
+            ))
+            .child(self.section(
+                SCRIPTS,
+                "Scripts",
+                self.scripts.len(),
+                c,
+                Some(refresh_scripts),
+                scripts,
+                cx,
+            ))
+            .child(self.section(
+                DATA,
+                "Data",
+                self.data.len(),
+                c,
+                Some(refresh_data),
+                data,
+                cx,
+            ));
 
         div()
             .key_context(KEY_CONTEXT)
@@ -446,74 +932,15 @@ impl Render for Workspace {
                     .flex_shrink_0()
                     .bg(bg)
                     .border_r_1()
-                    .border_color(border)
-                    .p_3()
-                    .gap_3()
-                    .child(section_title("Graphs"))
-                    .child(Input::new(&self.name))
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                Button::new("save")
-                                    .primary()
-                                    .small()
-                                    .label("Save")
-                                    .on_click(
-                                        cx.listener(|this, _: &ClickEvent, _, cx| {
-                                            this.save_now(cx)
-                                        }),
-                                    ),
-                            )
-                            .child(Button::new("new").outline().small().label("New").on_click(
-                                cx.listener(|this, _: &ClickEvent, window, cx| {
-                                    this.new_graph(window, cx)
-                                }),
-                            )),
-                    )
-                    .child(div().text_xs().text_color(muted).child(format!(
-                        "{} saved in {}/",
-                        self.files.len(),
-                        doc::DIR
-                    )))
+                    .border_color(c.border)
                     .child(
                         div()
-                            .id("files")
+                            .id("sidebar")
                             .flex_1()
                             .min_h_0()
                             .overflow_y_scroll()
-                            .child(v_flex().gap_1().children(file_rows).children(no_files)),
-                    )
-                    .child(div().h(px(1.0)).flex_shrink_0().bg(border))
-                    .child(section_title("Nodes"))
-                    .child(Input::new(&self.kind_name))
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(ColorPicker::new(&self.kind_color))
-                            .child(
-                                Button::new("save-kind")
-                                    .primary()
-                                    .small()
-                                    .label("Save node")
-                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                        this.save_kind_now(window, cx)
-                                    })),
-                            ),
-                    )
-                    .child(div().text_xs().text_color(muted).child(format!(
-                        "{} in {}/ · click to select, + adds, × deletes",
-                        self.kinds.len(),
-                        doc::NODES_DIR
-                    )))
-                    .child(
-                        div()
-                            .id("kinds")
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .child(v_flex().gap_1().children(kind_rows).children(no_kinds)),
+                            .p_3()
+                            .child(sections),
                     )
                     .children(status),
             )
@@ -525,5 +952,6 @@ impl Render for Workspace {
                     .child(toolbar)
                     .child(div().flex_1().min_h_0().w_full().child(self.graph.clone())),
             )
+            .child(self.inspector.clone())
     }
 }
