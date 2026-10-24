@@ -5,5 +5,5 @@ nodes
 /prompts/
 /databases/
 /data/
-sbom.syft.json
+*sbom.syft.json
 .ori/
