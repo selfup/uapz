@@ -1,44 +1,75 @@
-//! The node graph editor view: empty nodes that can be dragged around and wired together.
+//! The node graph editor view: nodes that can be dragged around and wired together, each
+//! optionally carrying typed content (an agent, database, script or data config).
 //!
 //! Interaction model:
 //! - drag a node body to move it, drag empty space to pan the whole graph
 //! - drag from a node's output port (right) and release on any other node to connect them
 //! - click a node or a wire to select it, Backspace/Delete removes the selection
 //! - double-click empty space (or press the button / cmd-n) to add a node
+//!
+//! The editor owns layout and selection only. Node content is edited in the inspector,
+//! which follows [`GraphEvent::SelectionChanged`] and writes back with [`Graph::set_node_data`].
 
-use gpui_kit::component::ActiveTheme;
+use gpui_kit::component::{ActiveTheme, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
-use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
 use crate::doc::{self, EdgeDoc, GraphDoc, NodeDoc, NodeKind, View};
+use crate::node_data::{NodeData, NodeType};
 
 gpui_kit::actions!(graph, [AddNode, DeleteSelection, ClearAll, Cancel]);
 
 pub const KEY_CONTEXT: &str = "Graph";
-const NODE_W: f32 = 120.0;
+const NODE_W: f32 = 150.0;
 const NODE_H: f32 = 72.0;
 const PORT_R: f32 = 6.0;
 const GRID: f32 = 24.0;
 /// How close (in px) the cursor must be to a wire to pick it.
 const WIRE_HIT: f32 = 6.0;
 
-type NodeId = usize;
+pub type NodeId = usize;
+
+/// Emitted so the workspace and inspector can follow the editor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphEvent {
+    SelectionChanged,
+}
+
+impl EventEmitter<GraphEvent> for Graph {}
+
+/// What Add node, cmd-n and double-click create.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Current {
+    #[default]
+    Blank,
+    Type(NodeType),
+    /// A saved blank kind by name. Unknown names make blank nodes.
+    Kind(String),
+}
+
+/// A read-only look at one node, for the inspector.
+pub struct NodeView<'a> {
+    pub id: NodeId,
+    /// Name of the saved kind or preset this node was made from, if any.
+    pub preset: Option<SharedString>,
+    pub data: Option<&'a NodeData>,
+}
 
 #[derive(Clone, Debug)]
 struct Node {
     id: NodeId,
     /// Top-left corner, in graph space.
     pos: Point<Pixels>,
-    /// The custom kind this node was made from, if any.
+    /// The kind or preset this node was made from, if any.
     style: Option<NodeStyle>,
-    /// Free-form payload, round-tripped through the JSON sidecar.
-    data: Value,
+    /// Typed content; `None` for a blank node.
+    data: Option<NodeData>,
 }
 
 /// What a node shows for its kind. `color` is the value captured when the node was
-/// created or loaded; the live color from the kind library wins when the kind exists.
+/// created or loaded; the live color from the kind library wins when the kind exists, and
+/// the node type's color wins over both when the node has typed content.
 #[derive(Clone, Debug)]
 struct NodeStyle {
     name: SharedString,
@@ -118,10 +149,9 @@ pub struct Graph {
     pan: Point<Pixels>,
     /// Where the canvas sits in the window, captured each frame during prepaint.
     canvas: Bounds<Pixels>,
-    /// Custom node kinds by name, for resolving node colors.
+    /// Custom blank node kinds by name, for resolving node colors.
     kinds: HashMap<String, Hsla>,
-    /// Kind that new nodes are made from; `None` means a blank node.
-    current_kind: Option<String>,
+    current: Current,
     next_id: NodeId,
     pub(crate) focus_handle: FocusHandle,
 }
@@ -136,13 +166,13 @@ impl Graph {
             pan: Point::default(),
             canvas: Bounds::default(),
             kinds: HashMap::new(),
-            current_kind: None,
+            current: Current::Blank,
             next_id: 0,
             focus_handle: cx.focus_handle(),
         };
-        graph.add_node(point(px(160.0), px(220.0)));
-        graph.add_node(point(px(460.0), px(330.0)));
-        graph.add_node(point(px(760.0), px(200.0)));
+        graph.insert_node(point(px(160.0), px(220.0)), None, None, cx);
+        graph.insert_node(point(px(460.0), px(330.0)), None, None, cx);
+        graph.insert_node(point(px(760.0), px(200.0)), None, None, cx);
         graph.selection = None;
         graph
     }
@@ -160,20 +190,30 @@ impl Graph {
         self.nodes.iter_mut().find(|n| n.id == id)
     }
 
-    fn add_node(&mut self, pos: Point<Pixels>) -> NodeId {
-        self.insert_node(pos, None)
+    /// Change the selection, telling subscribers when it actually changed.
+    fn set_selection(&mut self, selection: Option<Selection>, cx: &mut Context<Self>) {
+        if self.selection != selection {
+            self.selection = selection;
+            cx.emit(GraphEvent::SelectionChanged);
+        }
     }
 
-    fn insert_node(&mut self, pos: Point<Pixels>, style: Option<NodeStyle>) -> NodeId {
+    fn insert_node(
+        &mut self,
+        pos: Point<Pixels>,
+        style: Option<NodeStyle>,
+        data: Option<NodeData>,
+        cx: &mut Context<Self>,
+    ) -> NodeId {
         let id = self.next_id;
         self.next_id += 1;
         self.nodes.push(Node {
             id,
             pos,
             style,
-            data: doc::empty_object(),
+            data,
         });
-        self.selection = Some(Selection::Node(id));
+        self.set_selection(Some(Selection::Node(id)), cx);
         id
     }
 
@@ -196,7 +236,7 @@ impl Graph {
         })
     }
 
-    fn connect(&mut self, from: NodeId, to: NodeId) {
+    fn connect(&mut self, from: NodeId, to: NodeId, cx: &mut Context<Self>) {
         if from == to {
             return;
         }
@@ -204,7 +244,7 @@ impl Graph {
         if !self.edges.contains(&edge) {
             self.edges.push(edge);
         }
-        self.selection = Some(Selection::Edge(edge));
+        self.set_selection(Some(Selection::Edge(edge)), cx);
     }
 
     // ----- mouse -----
@@ -218,12 +258,17 @@ impl Graph {
         self.focus_handle.focus(window, cx);
         let p = self.to_graph(ev.position);
         if ev.click_count == 2 {
-            let style = self.current_style();
-            self.insert_node(p - point(px(NODE_W / 2.0), px(NODE_H / 2.0)), style);
+            let (style, data) = self.current_parts();
+            self.insert_node(
+                p - point(px(NODE_W / 2.0), px(NODE_H / 2.0)),
+                style,
+                data,
+                cx,
+            );
         } else if let Some(edge) = self.edge_at(p) {
-            self.selection = Some(Selection::Edge(edge));
+            self.set_selection(Some(Selection::Edge(edge)), cx);
         } else {
-            self.selection = None;
+            self.set_selection(None, cx);
             self.drag = Some(Drag::Pan { last: ev.position });
         }
         cx.notify();
@@ -245,7 +290,7 @@ impl Graph {
             let node = self.nodes.remove(i);
             self.nodes.push(node);
         }
-        self.selection = Some(Selection::Node(id));
+        self.set_selection(Some(Selection::Node(id)), cx);
         self.drag = Some(Drag::Node { id, grab });
         cx.notify();
     }
@@ -259,7 +304,7 @@ impl Graph {
     ) {
         cx.stop_propagation();
         self.focus_handle.focus(window, cx);
-        self.selection = Some(Selection::Node(id));
+        self.set_selection(Some(Selection::Node(id)), cx);
         self.drag = Some(Drag::Wire {
             from: id,
             cursor: self.to_graph(ev.position),
@@ -304,7 +349,7 @@ impl Graph {
         if let Drag::Wire { from, .. } = drag {
             let p = self.to_graph(ev.position);
             if let Some(to) = self.node_at(p, Some(from)) {
-                self.connect(from, to);
+                self.connect(from, to, cx);
             }
         }
         cx.notify();
@@ -324,7 +369,7 @@ impl Graph {
     }
 
     fn delete_selection(&mut self, _: &DeleteSelection, _: &mut Window, cx: &mut Context<Self>) {
-        match self.selection.take() {
+        match self.selection {
             Some(Selection::Node(id)) => {
                 self.nodes.retain(|n| n.id != id);
                 self.edges.retain(|e| e.from != id && e.to != id);
@@ -332,6 +377,7 @@ impl Graph {
             Some(Selection::Edge(edge)) => self.edges.retain(|e| *e != edge),
             None => return,
         }
+        self.set_selection(None, cx);
         cx.notify();
     }
 
@@ -341,13 +387,13 @@ impl Graph {
 
     fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
         self.drag = None;
-        self.selection = None;
+        self.set_selection(None, cx);
         cx.notify();
     }
 
-    // ----- node kinds -----
+    // ----- node kinds and types -----
 
-    /// Replace the kind library. Existing nodes of a kind pick up its current color.
+    /// Replace the blank-kind library. Existing nodes of a kind pick up its current color.
     pub fn set_kinds(&mut self, kinds: &[NodeKind], cx: &mut Context<Self>) {
         self.kinds = kinds
             .iter()
@@ -356,25 +402,60 @@ impl Graph {
         cx.notify();
     }
 
-    /// Choose what Add node, cmd-n and double-click create. Unknown names make blank nodes.
-    pub fn set_current_kind(&mut self, kind: Option<String>, cx: &mut Context<Self>) {
-        self.current_kind = kind;
+    /// Choose what Add node, cmd-n and double-click create.
+    pub fn set_current(&mut self, current: Current, cx: &mut Context<Self>) {
+        self.current = current;
         cx.notify();
     }
 
-    fn current_style(&self) -> Option<NodeStyle> {
-        let name = self.current_kind.as_ref()?;
-        let color = *self.kinds.get(name)?;
-        Some(NodeStyle {
-            name: name.clone().into(),
-            color,
-        })
+    fn current_parts(&self) -> (Option<NodeStyle>, Option<NodeData>) {
+        match &self.current {
+            Current::Blank => (None, None),
+            Current::Type(ty) => (None, Some(ty.default_data())),
+            Current::Kind(name) => {
+                let style = self.kinds.get(name).map(|color| NodeStyle {
+                    name: name.clone().into(),
+                    color: *color,
+                });
+                (style, None)
+            }
+        }
     }
 
-    /// Add a node of the current kind near the visible center.
+    /// Add a node of the current kind or type near the visible center.
     pub fn add_current(&mut self, cx: &mut Context<Self>) {
-        let (pos, style) = (self.spawn_pos(), self.current_style());
-        self.insert_node(pos, style);
+        let (style, data) = self.current_parts();
+        let pos = self.spawn_pos();
+        self.insert_node(pos, style, data, cx);
+        cx.notify();
+    }
+
+    /// Add a blank node of a custom kind near the visible center.
+    pub fn add_kind_node(&mut self, kind: &NodeKind, cx: &mut Context<Self>) {
+        let style = NodeStyle {
+            name: kind.name.clone().into(),
+            color: hsla_of(&kind.color).unwrap_or(FALLBACK_KIND_COLOR),
+        };
+        let pos = self.spawn_pos();
+        self.insert_node(pos, Some(style), None, cx);
+        cx.notify();
+    }
+
+    /// Add a node carrying `data`, labeled by its type.
+    pub fn add_data(&mut self, data: NodeData, cx: &mut Context<Self>) {
+        let pos = self.spawn_pos();
+        self.insert_node(pos, None, Some(data), cx);
+        cx.notify();
+    }
+
+    /// Add a node made from a saved preset: its content plus the preset's name as label.
+    pub fn add_preset(&mut self, name: &str, data: NodeData, cx: &mut Context<Self>) {
+        let style = NodeStyle {
+            name: name.to_string().into(),
+            color: type_color(data.node_type()),
+        };
+        let pos = self.spawn_pos();
+        self.insert_node(pos, Some(style), Some(data), cx);
         cx.notify();
     }
 
@@ -386,19 +467,66 @@ impl Graph {
         self.edges.len()
     }
 
-    /// Add a node of a custom kind near the visible center.
-    pub fn add_kind_node(&mut self, kind: &NodeKind, cx: &mut Context<Self>) {
-        let style = NodeStyle {
-            name: kind.name.clone().into(),
-            color: hsla_of(&kind.color).unwrap_or(FALLBACK_KIND_COLOR),
+    // ----- node content -----
+
+    /// The selected node, if the selection is a node.
+    pub fn selected(&self) -> Option<NodeView<'_>> {
+        let Some(Selection::Node(id)) = self.selection else {
+            return None;
         };
-        let pos = self.spawn_pos();
-        self.insert_node(pos, Some(style));
+        let node = self.node(id)?;
+        Some(NodeView {
+            id,
+            preset: node.style.as_ref().map(|s| s.name.clone()),
+            data: node.data.as_ref(),
+        })
+    }
+
+    pub fn node_data(&self, id: NodeId) -> Option<&NodeData> {
+        self.node(id)?.data.as_ref()
+    }
+
+    /// Replace a node's content. `None` makes it blank again.
+    pub fn set_node_data(&mut self, id: NodeId, data: Option<NodeData>, cx: &mut Context<Self>) {
+        if let Some(node) = self.node_mut(id) {
+            node.data = data;
+            cx.notify();
+        }
+    }
+
+    /// Set or clear the kind/preset name shown on a node.
+    pub fn set_node_label(&mut self, id: NodeId, label: Option<String>, cx: &mut Context<Self>) {
+        let Some(node) = self.node_mut(id) else {
+            return;
+        };
+        node.style = label.map(|name| {
+            let color = match &node.data {
+                Some(data) => type_color(data.node_type()),
+                None => FALLBACK_KIND_COLOR,
+            };
+            NodeStyle {
+                name: name.into(),
+                color,
+            }
+        });
         cx.notify();
     }
 
-    /// The node's style with the color taken from the live kind library when it has one.
+    /// The node's style for display. Typed content wins: its type sets the color and, when
+    /// the node has no preset name, the label. Otherwise the live kind color wins over the
+    /// one captured at load time.
     fn resolved_style(&self, node: &Node) -> Option<NodeStyle> {
+        if let Some(data) = &node.data {
+            let ty = data.node_type();
+            return Some(NodeStyle {
+                name: node
+                    .style
+                    .as_ref()
+                    .map(|s| s.name.clone())
+                    .unwrap_or_else(|| ty.label().into()),
+                color: type_color(ty),
+            });
+        }
         let style = node.style.as_ref()?;
         Some(NodeStyle {
             name: style.name.clone(),
@@ -428,16 +556,13 @@ impl Graph {
             },
             nodes: nodes
                 .into_iter()
-                .map(|n| {
-                    let style = self.resolved_style(n);
-                    NodeDoc {
-                        id: node_key(n.id),
-                        x: n.pos.x.as_f32(),
-                        y: n.pos.y.as_f32(),
-                        kind: style.as_ref().map(|s| s.name.to_string()),
-                        color: style.as_ref().map(|s| hex_of(s.color)),
-                        data: n.data.clone(),
-                    }
+                .map(|n| NodeDoc {
+                    id: node_key(n.id),
+                    x: n.pos.x.as_f32(),
+                    y: n.pos.y.as_f32(),
+                    kind: n.style.as_ref().map(|s| s.name.to_string()),
+                    color: self.resolved_style(n).map(|s| hex_of(s.color)),
+                    data: n.data.clone(),
                 })
                 .collect(),
             edges: edges
@@ -498,6 +623,7 @@ impl Graph {
         self.pan = point(px(doc.view.pan_x), px(doc.view.pan_y));
         self.selection = None;
         self.drag = None;
+        cx.emit(GraphEvent::SelectionChanged);
         cx.notify();
     }
 
@@ -507,6 +633,7 @@ impl Graph {
         self.selection = None;
         self.drag = None;
         self.pan = Point::default();
+        cx.emit(GraphEvent::SelectionChanged);
         cx.notify();
     }
 
@@ -598,6 +725,7 @@ impl Graph {
         // element's border after its children, so a border on the node would be drawn
         // over the ports. As the first sibling, the body stays beneath them.
         let style = self.resolved_style(node);
+        let summary = node.data.as_ref().map(|d| d.summary());
         let fill = style.as_ref().map_or(c.node, |s| s.color);
         let edge = style.as_ref().map_or(c.node_border, |s| darken(s.color));
         let label_color =
@@ -605,6 +733,10 @@ impl Graph {
                 c.text,
                 |s| if is_light(s.color) { black() } else { white() },
             );
+        let summary_color = Hsla {
+            a: 0.75,
+            ..label_color
+        };
         let body = div()
             .absolute()
             .inset_0()
@@ -623,14 +755,30 @@ impl Graph {
             .px_2()
             .when_some(style, |d, s| {
                 d.child(
-                    div()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(label_color)
-                        .child(s.name),
+                    v_flex()
+                        .min_w_0()
+                        .items_center()
+                        .child(
+                            div()
+                                .max_w_full()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(label_color)
+                                .child(s.name),
+                        )
+                        .children(summary.map(|text| {
+                            div()
+                                .max_w_full()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_xs()
+                                .text_color(summary_color)
+                                .child(text)
+                        })),
                 )
             });
 
@@ -818,6 +966,11 @@ fn style_from_doc(n: &NodeDoc, kinds: &HashMap<String, Hsla>) -> Option<NodeStyl
 pub(crate) fn hsla_of(hex: &str) -> Option<Hsla> {
     let (r, g, b) = doc::hex_to_rgb(hex)?;
     Some(Hsla::from(Rgba { r, g, b, a: 1.0 }))
+}
+
+/// The fill color nodes of a type use everywhere: canvas, sidebar swatches, inspector.
+pub(crate) fn type_color(ty: NodeType) -> Hsla {
+    hsla_of(ty.color()).unwrap_or(FALLBACK_KIND_COLOR)
 }
 
 fn hex_of(color: Hsla) -> String {

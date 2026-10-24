@@ -1,8 +1,14 @@
 //! uapz: a node graph editor built on gpui-kit.
 
 mod doc;
+mod exec;
 mod graph;
+mod inspector;
+mod library;
+mod node_data;
+mod providers;
 mod sidebar;
+mod validate;
 
 use gpui_kit::*;
 use graph::{AddNode, Cancel, DeleteSelection};
@@ -33,7 +39,7 @@ fn main() {
         })
         .detach();
 
-        let bounds = Bounds::centered(None, size(px(1240.0), px(760.0)), cx);
+        let bounds = Bounds::centered(None, size(px(1440.0), px(880.0)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(TitlebarOptions {

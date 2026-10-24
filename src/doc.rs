@@ -7,9 +7,11 @@
 //! out automatically.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use crate::node_data::{self, NodeData};
+use crate::validate;
 
 /// Directory, relative to the working directory, that holds saved graphs.
 pub const DIR: &str = "graphs";
@@ -47,9 +49,13 @@ pub struct NodeDoc {
     /// `#rrggbb` fill, copied from the kind at save time so the graph renders without it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
-    /// Free-form payload for whatever a node will hold later.
-    #[serde(default = "empty_object")]
-    pub data: Value,
+    /// Typed content for agent, database, script and data nodes; `{}` for a blank node.
+    #[serde(
+        default,
+        serialize_with = "node_data::serialize_opt",
+        deserialize_with = "node_data::deserialize_opt"
+    )]
+    pub data: Option<NodeData>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,10 +66,6 @@ pub struct EdgeDoc {
 
 fn version() -> u32 {
     VERSION
-}
-
-pub fn empty_object() -> Value {
-    Value::Object(Default::default())
 }
 
 impl GraphDoc {
@@ -105,25 +107,9 @@ impl GraphDoc {
     }
 }
 
-/// Turn user input into a file stem that stays inside `graphs/`.
+/// Turn user input into a file stem that stays inside `graphs/`. See [`validate::file_stem`].
 pub fn sanitize_name(raw: &str) -> String {
-    let cleaned: String = raw
-        .trim()
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || matches!(c, '-' | '_' | ' ') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let cleaned = cleaned.trim().to_string();
-    if cleaned.is_empty() {
-        "untitled".to_string()
-    } else {
-        cleaned
-    }
+    validate::file_stem(raw)
 }
 
 pub fn paths(name: &str) -> (PathBuf, PathBuf) {
@@ -320,7 +306,7 @@ pub fn parse_markdown(text: &str) -> GraphDoc {
                 y,
                 kind: None,
                 color: None,
-                data: empty_object(),
+                data: None,
             })
             .collect(),
         edges,
@@ -425,6 +411,7 @@ fn auto_layout(ids: &[String], edges: &[EdgeDoc]) -> Vec<(f32, f32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node_data::{DataConfig, DataFormat};
 
     fn sample() -> GraphDoc {
         GraphDoc {
@@ -441,7 +428,7 @@ mod tests {
                     y: 2.0,
                     kind: None,
                     color: None,
-                    data: empty_object(),
+                    data: None,
                 },
                 NodeDoc {
                     id: "n1".into(),
@@ -449,7 +436,10 @@ mod tests {
                     y: 4.0,
                     kind: Some("Fetch".into()),
                     color: Some("#ff8800".into()),
-                    data: serde_json::json!({"k": 1}),
+                    data: Some(NodeData::Data(DataConfig {
+                        path: "a.csv".into(),
+                        format: DataFormat::Csv,
+                    })),
                 },
             ],
             edges: vec![EdgeDoc {
@@ -510,7 +500,12 @@ mod tests {
         assert_eq!(back.nodes[0].kind, None);
         assert_eq!(back.nodes[1].kind.as_deref(), Some("Fetch"));
         assert_eq!(back.nodes[1].color.as_deref(), Some("#ff8800"));
-        assert_eq!(back.nodes[1].data["k"], 1);
+        assert!(
+            text.contains(r#""data":{}"#),
+            "blank nodes write an empty object"
+        );
+        assert!(text.contains(r#""type":"data""#));
+        assert_eq!(back.nodes[1].data, sample().nodes[1].data);
         assert_eq!(back.edges, sample().edges);
         assert_eq!(back.view.pan_x, 10.0);
     }
@@ -519,7 +514,7 @@ mod tests {
     fn json_missing_fields_use_defaults() {
         let back: GraphDoc = serde_json::from_str(r#"{"nodes":[{"id":"a","x":0,"y":0}]}"#).unwrap();
         assert_eq!(back.version, VERSION);
-        assert!(back.nodes[0].data.is_object());
+        assert!(back.nodes[0].data.is_none());
         assert!(back.edges.is_empty());
     }
 

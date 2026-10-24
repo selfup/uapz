@@ -1,5 +1,9 @@
 /target
 graphs
 nodes
+/agents/
+/prompts/
+/databases/
+/data/
 sbom.syft.json
 .ori/
