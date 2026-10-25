@@ -3,6 +3,8 @@ import { request } from "./api";
 import type { GraphDoc, NodeDoc, NodeData } from "./types";
 import {
   isNamedWorkflow,
+  nodeLabel,
+  NODE_COLORS as COLORS,
   publishOutput,
   workflowPorts,
   type WorkflowGraphs,
@@ -159,16 +161,6 @@ const LABELS: Record<Config["type"], string> = {
   data: "Data",
   directory: "Directory",
   file: "Write file",
-};
-const COLORS: Record<Config["type"], string> = {
-  input: "#06b6d4",
-  workflow: "#6366f1",
-  agent: "#8b5cf6",
-  database: "#0ea5e9",
-  script: "#f59e0b",
-  data: "#22c55e",
-  directory: "#14b8a6",
-  file: "#ef4444",
 };
 const PROVIDERS = [
   ["ollama", "Ollama"],
@@ -630,7 +622,7 @@ export default function Inspector(props: InspectorProps) {
     onChange({
       ...node,
       data: data as NodeData,
-      color: writable ? "#ef4444" : COLORS[data.type],
+      color: node.color || (writable ? "#ef4444" : COLORS[data.type]),
     });
   };
   const updateAsync = (patch: Record<string, unknown>) => {
@@ -653,7 +645,7 @@ export default function Inspector(props: InspectorProps) {
     current.onChange({
       ...target,
       data: data as NodeData,
-      color: writable ? "#ef4444" : COLORS[data.type],
+      color: target.color || (writable ? "#ef4444" : COLORS[data.type]),
     });
   };
   async function perform(action: () => Promise<unknown>, success?: string) {
@@ -1391,11 +1383,7 @@ export default function Inspector(props: InspectorProps) {
           <span className="ins-eyebrow">
             {readOnly ? "CHILD GRAPH · INSPECT" : "NODE INSPECTOR"}
           </span>
-          <h2>
-            {node
-              ? node.name || (config ? LABELS[config.type] : "Untyped node")
-              : "Your workspace"}
-          </h2>
+          <h2>{node ? nodeLabel(node) : "Your workspace"}</h2>
         </div>
         {node && <span className="ins-node-id">{node.id}</span>}
       </header>
@@ -1518,7 +1506,7 @@ export default function Inspector(props: InspectorProps) {
                                 data: structuredClone(
                                   DEFAULTS[type],
                                 ) as NodeData,
-                                color: COLORS[type],
+                                color: node.color || COLORS[type],
                               })
                             }
                           >
@@ -1536,7 +1524,7 @@ export default function Inspector(props: InspectorProps) {
                               ...structuredClone(DEFAULTS.database),
                               read_only: false,
                             } as NodeData,
-                            color: "#ef4444",
+                            color: node.color || "#ef4444",
                           })
                         }
                       >
@@ -1600,7 +1588,14 @@ export default function Inspector(props: InspectorProps) {
                                 : library.databases
                             ).find((item) => item.name === name);
                             if (preset) {
-                              update({ ...preset.config });
+                              onChange({
+                                ...node,
+                                kind: preset.name,
+                                data: {
+                                  ...preset.config,
+                                  type: config.type,
+                                } as NodeData,
+                              });
                               setDraft({ preset: name });
                             }
                           }}
@@ -1658,7 +1653,7 @@ export default function Inspector(props: InspectorProps) {
                                   data: structuredClone(
                                     DEFAULTS[type],
                                   ) as NodeData,
-                                  color: COLORS[type],
+                                  color: node.color || COLORS[type],
                                 })
                               }
                             >
@@ -1680,7 +1675,7 @@ export default function Inspector(props: InspectorProps) {
                                 ...structuredClone(DEFAULTS.database),
                                 read_only: false,
                               } as NodeData,
-                              color: "#ef4444",
+                              color: node.color || "#ef4444",
                             })
                           }
                         >

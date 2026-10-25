@@ -113,6 +113,7 @@ export default function App() {
     resolve: (accepted: boolean) => void;
   } | null>(null);
   const [busy, setBusy] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [kindEditor, setKindEditor] = useState(false);
   const [kindName, setKindName] = useState("");
   const [kindColor, setKindColor] = useState("#64748b");
@@ -127,6 +128,11 @@ export default function App() {
   const [rightWidth, setRightWidth] = useState(370);
   const lastCompleted = useRef<string | null>(null);
   const documentEpoch = useRef(0);
+  const graphRef = useRef(graph);
+  graphRef.current = graph;
+  const saveInFlight = useRef(false);
+  const rootNavigation = useRef(0);
+  const childNavigation = useRef(0);
   const epoch = documentEpoch.current;
   const initialSession = useRef(true);
   const activeChild = children.at(-1);
@@ -371,6 +377,7 @@ export default function App() {
       data: data || {},
       ...(kind ? { kind: kind.name, color: kind.color } : {}),
     };
+    if (data && !kind) node.color = nodeColor(node);
     updateGraph({ ...graph, nodes: [...graph.nodes, node] });
     setSelected(id);
   }
@@ -386,7 +393,10 @@ export default function App() {
     );
   }
   async function newGraph() {
-    if (occupied || !(await discardDraft())) return;
+    if (occupied) return;
+    const navigation = ++rootNavigation.current;
+    if (!(await discardDraft()) || navigation !== rootNavigation.current)
+      return;
     documentEpoch.current += 1;
     setRemembered({ nodes: {}, origins: {} });
     setHistorical(false);
@@ -399,10 +409,18 @@ export default function App() {
     setNotice("New workflow");
   }
   async function openGraph(name: string) {
-    if (occupied || !(await discardDraft())) return;
-    const loaded = normalizeGraph(
-      await request<GraphDoc>("load_graph", { name }),
-    );
+    if (occupied) return;
+    const navigation = ++rootNavigation.current;
+    if (!(await discardDraft()) || navigation !== rootNavigation.current)
+      return;
+    let loaded: GraphDoc;
+    try {
+      loaded = normalizeGraph(await request<GraphDoc>("load_graph", { name }));
+    } catch (error) {
+      if (navigation !== rootNavigation.current) return;
+      throw error;
+    }
+    if (navigation !== rootNavigation.current) return;
     documentEpoch.current += 1;
     setRemembered({ nodes: {}, origins: {} });
     setHistorical(false);
@@ -415,13 +433,33 @@ export default function App() {
     setNotice(`Opened ${name}`);
   }
   async function save() {
-    if (readOnly) return;
+    if (readOnly || saveInFlight.current) return;
+    saveInFlight.current = true;
+    setSaving(true);
     const saved = { ...graph, name: safeGraphName(graph.name) };
-    await request("save_graph", { doc: saved });
-    setGraph(saved);
-    setDirty(false);
-    setNotice(`Saved ${saved.name}`);
-    await refreshLibrary();
+    try {
+      await request("save_graph", { doc: saved });
+      if (epoch === documentEpoch.current) {
+        // A save acknowledges only the submitted document. Preserve any edits
+        // made during IPC, including changes to the workflow name or viewport.
+        const unchanged = graphRef.current === graph;
+        if (unchanged) setGraph(saved);
+        setDirty(!unchanged);
+        setNotice(
+          unchanged
+            ? `Saved ${saved.name}`
+            : `Saved ${saved.name}; newer edits are unsaved`,
+        );
+      }
+      await refreshLibrary();
+    } finally {
+      saveInFlight.current = false;
+      setSaving(false);
+    }
+  }
+  function navigateChildren(depth = 0) {
+    childNavigation.current += 1;
+    setChildren((items) => items.slice(0, depth));
   }
   async function openChild(id: string) {
     if (children.length >= 8)
@@ -430,11 +468,24 @@ export default function App() {
     const config = node && typedData(node);
     if (!node || config?.type !== "workflow") return;
     const path = childPath ? `${childPath}/${id}` : id;
+    const navigation = ++childNavigation.current;
+    const root = rootNavigation.current;
+    const stillCurrent = () =>
+      epoch === documentEpoch.current &&
+      navigation === childNavigation.current &&
+      root === rootNavigation.current;
     const snapshot = activeChild?.snapshot || (!activeChild && snapshotContext);
     const call = callAt(currentRun, path);
-    const doc = snapshot
-      ? captured[path] || call?.graph
-      : await request<GraphDoc>("load_graph", { name: config.graph });
+    let doc: GraphDoc | undefined;
+    try {
+      doc = snapshot
+        ? captured[path] || call?.graph
+        : await request<GraphDoc>("load_graph", { name: config.graph });
+    } catch (error) {
+      if (!stillCurrent()) return;
+      throw error;
+    }
+    if (!stillCurrent()) return;
     if (!doc)
       throw new Error(
         "No prepared snapshot is available for this child in the displayed run.",
@@ -705,7 +756,11 @@ export default function App() {
                 libraryRow(
                   `agent:${agent.name}`,
                   agent.name,
-                  () => addNode({ type: "agent", ...agent.config }),
+                  () =>
+                    addNode({ type: "agent", ...agent.config }, undefined, {
+                      name: agent.name,
+                      color: "#8b5cf6",
+                    }),
                   "#8b5cf6",
                   () =>
                     void action(() =>
@@ -743,7 +798,17 @@ export default function App() {
                 libraryRow(
                   `database:${database.name}`,
                   database.name,
-                  () => addNode({ type: "database", ...database.config }),
+                  () =>
+                    addNode(
+                      { type: "database", ...database.config },
+                      undefined,
+                      {
+                        name: database.name,
+                        color: database.config.read_only
+                          ? "#0ea5e9"
+                          : "#ef4444",
+                      },
+                    ),
                   database.config.read_only ? "#0ea5e9" : "#ef4444",
                   () =>
                     void action(() =>
@@ -860,7 +925,7 @@ export default function App() {
         </div>
         <div className="header-actions">
           {readOnly && (
-            <button onClick={() => setChildren([])}>
+            <button onClick={() => navigateChildren()}>
               <ArrowLeft size={14} />
               Return to {occupied || activeChild.snapshot ? "run" : "workflow"}
             </button>
@@ -870,7 +935,7 @@ export default function App() {
           </button>
           <button
             onClick={() => void action(save)}
-            disabled={readOnly || !library}
+            disabled={readOnly || !library || saving}
           >
             <Save size={14} />
             Save
@@ -1017,17 +1082,13 @@ export default function App() {
         <section className="canvas-column">
           <div className="canvas-toolbar">
             <nav aria-label="Workflow breadcrumbs">
-              <button onClick={() => setChildren([])}>
+              <button onClick={() => navigateChildren()}>
                 {graph.name || "untitled"}
               </button>
               {children.map((child, index) => (
                 <span key={child.path}>
                   <ChevronRight size={13} />
-                  <button
-                    onClick={() =>
-                      setChildren((items) => items.slice(0, index + 1))
-                    }
-                  >
+                  <button onClick={() => navigateChildren(index + 1)}>
                     {child.label}
                   </button>
                 </span>
@@ -1330,7 +1391,7 @@ export default function App() {
                 : notice}
         </span>
         {readOnly && (runtime?.review || form) && (
-          <button onClick={() => setChildren([])}>
+          <button onClick={() => navigateChildren()}>
             {runtime?.review ? "Review changes" : "Return to run inputs"}
             <ChevronRight size={13} />
           </button>

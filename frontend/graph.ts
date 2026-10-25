@@ -19,25 +19,38 @@ const labels: Record<NodeType, string> = {
   file: "Write file",
 };
 
+export const NODE_COLORS: Record<NodeType, string> = {
+  input: "#06b6d4",
+  workflow: "#6366f1",
+  agent: "#8b5cf6",
+  database: "#0ea5e9",
+  script: "#f59e0b",
+  data: "#22c55e",
+  directory: "#14b8a6",
+  file: "#ef4444",
+};
+
 export function nodeLabel(node: NodeDoc): string {
   const data = typedData(node);
   return (
     node.name?.trim() ||
+    node.kind?.trim() ||
     (data
       ? data.type === "database" && !data.read_only
         ? "Database (write)"
         : labels[data.type]
-      : node.kind || "Blank node")
+      : "Blank node")
   );
 }
 
 export function nodeColor(node: NodeDoc): string {
+  if (/^#[\da-f]{6}$/i.test(node.color || "")) return node.color!;
   const data = typedData(node);
   if (data)
     return data.type === "file" || (data.type === "database" && !data.read_only)
       ? "#ef4444"
-      : "#9ca3af";
-  return /^#[\da-f]{6}$/i.test(node.color || "") ? node.color! : "#9ca3af";
+      : NODE_COLORS[data.type];
+  return "#9ca3af";
 }
 
 const fileName = (path: string) =>

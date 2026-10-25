@@ -27,6 +27,7 @@
   position: relative;
   min-height: 104px;
   border: 1px solid #41464e;
+  border-left: 3px solid var(--node-accent, #9ca3af);
   border-radius: 8px;
   background: #24272d;
   box-shadow: 0 3px 12px #0003;
@@ -34,12 +35,10 @@
 }
 .graph-card.is-selected {
   border-color: #bcc5d3;
+  border-left-color: var(--node-accent, #9ca3af);
   box-shadow:
     0 0 0 1px #bcc5d3,
     0 4px 16px #0005;
-}
-.graph-card.writes {
-  border-left: 3px solid #ef4444;
 }
 .graph-card-kind {
   display: flex;
