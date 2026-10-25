@@ -1,10 +1,16 @@
 //! The inspector: the panel to the right of the canvas that shows the selected node's
 //! content as a form and writes every change straight back into the node.
 //!
-//! A blank node offers the four content types; a typed node shows its type's fields,
-//! live validation from [`NodeData::validate`], and a row to save the config into the
-//! library (agents and databases) so it shows up in the sidebar for reuse. Agent prompts
-//! can be saved to and loaded from `prompts/` on their own.
+//! A blank node offers the content types; a typed node shows its type's fields, live
+//! validation from [`NodeData::validate`], and a row to save the config into the library
+//! (agents and databases) so it shows up in the sidebar for reuse. Agent prompts can be
+//! saved to and loaded from `prompts/` on their own.
+//!
+//! Runs start here too. The executor works on a background thread under a
+//! [`Control`]: the inspector owns the output [`Cache`] that lives across runs, the cancel
+//! flag behind the Cancel button, and a progress sink the executor writes log lines and
+//! streamed agent text into. A foreground task polls that sink a few times a second and
+//! redraws, so the log and the text appear while the run is still going.
 
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::form::{field, v_form};
@@ -15,20 +21,59 @@ use gpui_kit::component::{ActiveTheme, Disableable, IndexPath, Sizable, h_flex, 
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use crate::exec::{self, Report};
+use crate::exec::{self, Cache, Control, Progress, Report};
 use crate::graph::{Graph, GraphEvent, NodeId, data_color};
 use crate::library;
 use crate::node_data::{
     AgentConfig, Auth, DataConfig, DataFormat, DatabaseConfig, DbEngine, DirectoryConfig,
-    ModelType, NodeData, NodeType, OutputType, Provider, Runtime, ScriptConfig,
-    WRITABLE_DATABASE_LABEL,
+    FileConfig, ModelType, NodeData, NodeType, OutputType, Provider, Runtime, ScriptConfig,
+    WRITABLE_DATABASE_LABEL, WriteMode,
 };
 use crate::providers::{self, UreqHttp};
 use crate::validate::{self, Issue};
 
 /// Initial inspector width; the divider next to it resizes it.
 pub const INSPECTOR_W: f32 = 320.0;
+/// How often the panel pulls progress from a running job.
+const PROGRESS_POLL: Duration = Duration::from_millis(80);
+/// Characters of a text preview, streamed or final.
+const PREVIEW_CHARS: usize = 4000;
+
+/// What the executor's thread writes and the panel reads while a run is going.
+#[derive(Default)]
+struct Live {
+    log: Vec<String>,
+    /// The node whose text is streaming in, and the text so far.
+    stream: Option<(String, String)>,
+    /// Set once by the thread when the run is over.
+    report: Option<Report>,
+}
+
+impl Live {
+    fn take_in(&mut self, progress: Progress) {
+        match progress {
+            Progress::Log(line) => self.log.push(line),
+            Progress::Text { id, text } => match &mut self.stream {
+                Some((current, so_far)) if *current == id => so_far.push_str(&text),
+                _ => self.stream = Some((id, text)),
+            },
+        }
+    }
+}
+
+/// A run in flight: its cancel flag and the state shared with its thread.
+struct Job {
+    cancel: Arc<AtomicBool>,
+    live: Arc<Mutex<Live>>,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 pub enum InspectorEvent {
     /// A preset or prompt was written or removed; the sidebar should re-list.
@@ -54,9 +99,15 @@ pub struct Inspector {
     loading: bool,
     /// Saved outputs of the agent preset this node was made from.
     output_count: usize,
-    running: bool,
+    /// The run in flight, if any.
+    job: Option<Job>,
+    /// Log lines and streamed text of the run in flight, mirrored for rendering.
+    live_log: Vec<String>,
+    live_stream: Option<(String, String)>,
     /// Result of the last run started from this panel.
     report: Option<Report>,
+    /// Node outputs kept across runs, so a downstream run reuses upstream agents.
+    cache: Arc<Mutex<Cache>>,
     preset_name: Entity<InputState>,
     // agent
     provider: Entity<StrSelect>,
@@ -98,6 +149,10 @@ pub struct Inspector {
     dir_contents: bool,
     dir_max_files: Entity<InputState>,
     dir_max_bytes: Entity<InputState>,
+    // write file
+    file_path: Entity<InputState>,
+    file_mode: Entity<StrSelect>,
+    file_unfence: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -228,6 +283,12 @@ impl Inspector {
         let dir_exclude = text("patterns to skip", window, cx);
         let dir_max_files = text("200", window, cx);
         let dir_max_bytes = text("262144", window, cx);
+        let file_path = text(
+            "tests/generated.rs (inside the working directory)",
+            window,
+            cx,
+        );
+        let file_mode = enum_select(&WriteMode::ALL, WriteMode::label, window, cx);
 
         let mut subscriptions =
             vec![
@@ -256,6 +317,7 @@ impl Inspector {
             &dir_exclude,
             &dir_max_files,
             &dir_max_bytes,
+            &file_path,
         ] {
             subscriptions.push(cx.subscribe_in(
                 state,
@@ -298,7 +360,7 @@ impl Inspector {
             },
         ));
         // Dropdowns.
-        for state in [&output, &engine, &runtime, &format] {
+        for state in [&output, &engine, &runtime, &format, &file_mode] {
             subscriptions.push(cx.subscribe_in(
                 state,
                 window,
@@ -346,8 +408,11 @@ impl Inspector {
             issues: Vec::new(),
             loading: false,
             output_count: 0,
-            running: false,
+            job: None,
+            live_log: Vec::new(),
+            live_stream: None,
             report: None,
+            cache: Arc::new(Mutex::new(Cache::default())),
             preset_name,
             provider,
             endpoint,
@@ -383,6 +448,9 @@ impl Inspector {
             dir_contents: true,
             dir_max_files,
             dir_max_bytes,
+            file_path,
+            file_mode,
+            file_unfence: true,
             _subscriptions: subscriptions,
         };
         inspector.reload(window, cx);
@@ -487,6 +555,11 @@ impl Inspector {
                 self.dir_contents = d.contents;
                 set_text(&self.dir_max_files, d.max_files.to_string(), window, cx);
                 set_text(&self.dir_max_bytes, d.max_bytes.to_string(), window, cx);
+            }
+            NodeData::File(f) => {
+                set_text(&self.file_path, f.path.clone(), window, cx);
+                choose(&self.file_mode, &WriteMode::ALL, f.mode, window, cx);
+                self.file_unfence = f.unfence;
             }
         }
     }
@@ -635,6 +708,18 @@ impl Inspector {
                     ),
                 })
             }
+            NodeType::File => {
+                let prev = match prev {
+                    Some(NodeData::File(f)) => f,
+                    _ => FileConfig::default(),
+                };
+                NodeData::File(FileConfig {
+                    path: text_of(&self.file_path, cx),
+                    mode: chosen(&self.file_mode, &WriteMode::ALL, WriteMode::label, cx)
+                        .unwrap_or(prev.mode),
+                    unfence: self.file_unfence,
+                })
+            }
         };
         (data, issues)
     }
@@ -731,6 +816,11 @@ impl Inspector {
         self.sync(cx);
     }
 
+    fn set_file_unfence(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.file_unfence = on;
+        self.sync(cx);
+    }
+
     // ----- actions -----
 
     /// Give a blank node content, or replace a typed node's content.
@@ -780,10 +870,13 @@ impl Inspector {
         let result = match &data {
             NodeData::Agent(a) => library::save_agent(&name, a),
             NodeData::Database(d) => library::save_database(&name, d),
-            NodeData::Script(_) | NodeData::Data(_) | NodeData::Directory(_) => {
+            NodeData::Script(_)
+            | NodeData::Data(_)
+            | NodeData::Directory(_)
+            | NodeData::File(_) => {
                 self.status(
                     format!(
-                        "Scripts, data and directories are paths: put files in {}/ or {}/ and they appear in the sidebar",
+                        "Scripts, data, directories and files are paths: put files in {}/ or {}/ and they appear in the sidebar",
                         library::SCRIPTS_DIR,
                         library::DATA_DIR
                     ),
@@ -870,67 +963,159 @@ impl Inspector {
                 set_text(&self.data_path, path.to_string(), window, cx);
                 self.on_data_path_change(window, cx);
             }
-            NodeType::Agent | NodeType::Database | NodeType::Directory => return false,
+            NodeType::Agent | NodeType::Database | NodeType::Directory | NodeType::File => {
+                return false;
+            }
         }
         true
     }
 
-    /// Run the selected node and everything wired into it, off the UI thread.
-    fn run_selected(&mut self, cx: &mut Context<Self>) {
-        if self.running {
+    /// Run the selected node and everything wired into it, off the UI thread. `fresh`
+    /// ignores cached outputs. A run can start while a cancelled one is still winding
+    /// down; the old one's progress is then ignored.
+    fn run_selected(&mut self, fresh: bool, cx: &mut Context<Self>) {
+        if self
+            .job
+            .as_ref()
+            .is_some_and(|j| !j.cancel.load(Ordering::Relaxed))
+        {
             return;
         }
         let Some(id) = self.node else { return };
         let doc = self.graph.read(cx).snapshot("run");
         let node_id = format!("n{id}");
-        self.running = true;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let live = Arc::new(Mutex::new(Live::default()));
+        let sink = live.clone();
+        let control = Control {
+            cache: Some(self.cache.clone()),
+            fresh,
+            cancel: cancel.clone(),
+            progress: Some(Arc::new(move |progress| lock(&sink).take_in(progress))),
+        };
+        self.job = Some(Job {
+            cancel,
+            live: live.clone(),
+        });
+        self.live_log.clear();
+        self.live_stream = None;
         self.report = None;
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let report = cx
-                .background_spawn(async move {
-                    let http = UreqHttp::new(exec::HTTP_TIMEOUT);
-                    exec::run(
-                        &doc,
-                        &node_id,
-                        exec::Dirs::from_cwd(),
-                        &http,
-                        &exec::process_env,
-                    )
-                })
-                .await;
-            this.update(cx, |this, cx| {
-                let (text, error) = match &report.result {
-                    Ok(output) => {
-                        let saved = output
-                            .saved
-                            .as_ref()
-                            .map(|p| format!(" → {}", p.display()))
-                            .unwrap_or_default();
-                        (
-                            format!(
-                                "Run finished in {:.1}s: {}{saved}",
-                                report.elapsed.as_secs_f32(),
-                                output.label
-                            ),
-                            false,
-                        )
-                    }
-                    Err(e) => (format!("Run failed: {e}"), true),
-                };
-                this.running = false;
-                if let Ok(output) = &report.result
-                    && output.saved.is_some()
-                {
-                    this.output_count += 1;
-                }
-                this.report = Some(report);
-                this.status(text, error, cx);
-                cx.notify();
+            let worker = live.clone();
+            cx.background_spawn(async move {
+                let http = UreqHttp::new(exec::HTTP_TIMEOUT);
+                let report = exec::run_with(
+                    &doc,
+                    &node_id,
+                    exec::Dirs::from_cwd(),
+                    &http,
+                    &exec::process_env,
+                    &control,
+                );
+                lock(&worker).report = Some(report);
             })
-            .ok();
+            .detach();
+            loop {
+                cx.background_executor().timer(PROGRESS_POLL).await;
+                let finished = this
+                    .update(cx, |this, cx| this.pull_progress(&live, cx))
+                    .unwrap_or(true);
+                if finished {
+                    break;
+                }
+            }
         })
         .detach();
+    }
+
+    /// Copy what the running thread reported into the panel; true once the run is over or
+    /// this is no longer the current job.
+    fn pull_progress(&mut self, live: &Arc<Mutex<Live>>, cx: &mut Context<Self>) -> bool {
+        if !self
+            .job
+            .as_ref()
+            .is_some_and(|j| Arc::ptr_eq(&j.live, live))
+        {
+            return true;
+        }
+        let report = {
+            let mut live = lock(live);
+            if live.log.len() > self.live_log.len() {
+                self.live_log
+                    .extend(live.log[self.live_log.len()..].iter().cloned());
+            }
+            if live.stream.is_some() {
+                self.live_stream = live.stream.clone();
+            }
+            live.report.take()
+        };
+        cx.notify();
+        let Some(report) = report else { return false };
+        self.job = None;
+        self.live_log.clear();
+        self.live_stream = None;
+        let (text, error) = match &report.result {
+            Ok(output) => {
+                let saved = output
+                    .saved
+                    .as_ref()
+                    .map(|p| format!(" → {}", p.display()))
+                    .unwrap_or_default();
+                let cached = match report.cached {
+                    0 => String::new(),
+                    1 => " (1 node from the cache)".to_string(),
+                    n => format!(" ({n} nodes from the cache)"),
+                };
+                (
+                    format!(
+                        "Run finished in {:.1}s: {}{saved}{cached}",
+                        report.elapsed.as_secs_f32(),
+                        output.label
+                    ),
+                    false,
+                )
+            }
+            Err(e) if e == exec::CANCELLED => ("Run cancelled".to_string(), false),
+            Err(e) => (format!("Run failed: {e}"), true),
+        };
+        if let Ok(output) = &report.result
+            && output.saved.is_some()
+        {
+            self.output_count += 1;
+        }
+        self.report = Some(report);
+        self.status(text, error, cx);
+        cx.notify();
+        true
+    }
+
+    /// Ask the running job to stop. Scripts and database tools are killed at once; a
+    /// streaming agent stops at its next piece of text.
+    fn cancel_run(&mut self, cx: &mut Context<Self>) {
+        if let Some(job) = &self.job {
+            job.cancel.store(true, Ordering::Relaxed);
+            self.status("Cancelling…".into(), false, cx);
+            cx.notify();
+        }
+    }
+
+    fn clear_cache(&mut self, cx: &mut Context<Self>) {
+        let n = {
+            let mut cache = lock(&self.cache);
+            let n = cache.len();
+            cache.clear();
+            n
+        };
+        self.status(
+            format!(
+                "Dropped {n} cached output{}; the next run recomputes everything",
+                if n == 1 { "" } else { "s" }
+            ),
+            false,
+            cx,
+        );
+        cx.notify();
     }
 
     /// Re-list the saved generative agents for the SQL helper, keeping the pick when that
@@ -1338,6 +1523,49 @@ impl Inspector {
             )
     }
 
+    fn render_file(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let unfence = self.file_unfence;
+        let danger = cx.theme().danger;
+        v_form()
+            .small()
+            .child(
+                field()
+                    .label("File")
+                    .description(format!(
+                        "Relative to the working directory; missing directories are created. {} are off limits.",
+                        library::RESERVED_DIRS
+                            .iter()
+                            .map(|d| format!("{d}/"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                    .child(Input::new(&self.file_path).small()),
+            )
+            .child(
+                field()
+                    .label("If the file exists")
+                    .child(Select::new(&self.file_mode).small().w_full()),
+            )
+            .child(
+                field().label("Content").child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            Switch::new("file-unfence")
+                                .small()
+                                .checked(unfence)
+                                .label("Strip a surrounding code fence and end with a newline")
+                                .on_change(cx.listener(|this, on: &bool, _, cx| {
+                                    this.set_file_unfence(*on, cx)
+                                })),
+                        )
+                        .child(div().text_xs().text_color(danger).child(
+                            "Writes whatever arrives on the wire, so read an agent's answer in the preview before pointing this at a file that matters.",
+                        )),
+                ),
+            )
+    }
+
     /// One button per content type, with the writable database after the read-only one.
     fn render_type_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let choices: Vec<(&'static str, NodeData)> = NodeType::ALL
@@ -1411,13 +1639,51 @@ impl Render for Inspector {
                     .child(title),
             )
             .children((self.node.is_some() && self.kind.is_some()).then(|| {
-                Button::new("run")
-                    .primary()
-                    .xsmall()
-                    .label(if self.running { "Running…" } else { "Run" })
-                    .disabled(self.running)
-                    .loading(self.running)
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.run_selected(cx)))
+                let running = self.job.is_some();
+                let cancelling = self
+                    .job
+                    .as_ref()
+                    .is_some_and(|j| j.cancel.load(Ordering::Relaxed));
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Button::new("run")
+                            .primary()
+                            .xsmall()
+                            .label(if running { "Running…" } else { "Run" })
+                            .disabled(running)
+                            .loading(running)
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.run_selected(false, cx)
+                            })),
+                    )
+                    .when(!running, |d| {
+                        d.child(
+                            Button::new("run-fresh")
+                                .outline()
+                                .xsmall()
+                                .label("Run fresh")
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.run_selected(true, cx)
+                                })),
+                        )
+                    })
+                    .when(running, |d| {
+                        d.child(
+                            Button::new("cancel-run")
+                                .danger()
+                                .xsmall()
+                                .label(if cancelling {
+                                    "Cancelling…"
+                                } else {
+                                    "Cancel"
+                                })
+                                .disabled(cancelling)
+                                .on_click(
+                                    cx.listener(|this, _: &ClickEvent, _, cx| this.cancel_run(cx)),
+                                ),
+                        )
+                    })
             }))
             .children(self.node.map(|id| {
                 div()
@@ -1447,6 +1713,7 @@ impl Render for Inspector {
                     NodeType::Script => self.render_script(cx).into_any_element(),
                     NodeType::Data => self.render_data(cx).into_any_element(),
                     NodeType::Directory => self.render_directory(cx).into_any_element(),
+                    NodeType::File => self.render_file(cx).into_any_element(),
                 };
                 let issues: Vec<AnyElement> = if self.issues.is_empty() {
                     vec![
@@ -1504,12 +1771,48 @@ impl Render for Inspector {
                             )))
                         })
                 });
+                let preview_box = |text: String| {
+                    div()
+                        .p_2()
+                        .rounded_md()
+                        .bg(panel)
+                        .text_xs()
+                        .text_color(fg)
+                        .child(text)
+                };
+                // While a run is going: its log so far and the text streaming in, tail first
+                // so the newest words are visible.
+                let live_section = self.job.as_ref().map(|_| {
+                    let stream = self.live_stream.as_ref().map(|(id, text)| {
+                        let count = text.chars().count();
+                        let shown: String = if count > PREVIEW_CHARS {
+                            format!(
+                                "…{}",
+                                text.chars().skip(count - PREVIEW_CHARS).collect::<String>()
+                            )
+                        } else {
+                            text.clone()
+                        };
+                        v_flex()
+                            .gap_1()
+                            .child(hint(format!(
+                                "{id} is answering ({count} characters so far)"
+                            )))
+                            .child(preview_box(shown))
+                    });
+                    v_flex()
+                        .gap_1()
+                        .child(div().text_xs().text_color(muted).child("Running…"))
+                        .children(self.live_log.iter().map(|line| hint(line.clone())))
+                        .children(stream)
+                });
                 let run_section = self.report.as_ref().map(|report| {
                     let (headline, color) = match &report.result {
                         Ok(output) => (
                             format!("✓ {} in {:.1}s", output.label, report.elapsed.as_secs_f32()),
                             success,
                         ),
+                        Err(e) if e == exec::CANCELLED => ("■ Cancelled".to_string(), muted),
                         Err(e) => (format!("✗ {e}"), danger),
                     };
                     let output = report.result.as_ref().ok();
@@ -1517,20 +1820,11 @@ impl Render for Inspector {
                         .and_then(|o| o.saved.clone())
                         .map(|p| hint(format!("saved {}", p.display())));
                     let preview = output.and_then(|o| o.as_text()).map(|text| {
-                        const LIMIT: usize = 4000;
-                        let shown: String = text.chars().take(LIMIT).collect();
-                        let cut = text.chars().count() > LIMIT;
+                        let shown: String = text.chars().take(PREVIEW_CHARS).collect();
+                        let cut = text.chars().count() > PREVIEW_CHARS;
                         v_flex()
                             .gap_1()
-                            .child(
-                                div()
-                                    .p_2()
-                                    .rounded_md()
-                                    .bg(panel)
-                                    .text_xs()
-                                    .text_color(fg)
-                                    .child(shown),
-                            )
+                            .child(preview_box(shown))
                             .when(cut, |d| d.child(hint("… truncated in this preview".into())))
                     });
                     v_flex()
@@ -1540,12 +1834,33 @@ impl Render for Inspector {
                         .children(report.log.iter().map(|line| hint(line.clone())))
                         .children(preview)
                 });
+                let cached = lock(&self.cache).len();
+                let cache_row = (cached > 0).then(|| {
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(hint(format!(
+                            "{cached} node output{} cached from earlier runs; Run reuses them when nothing upstream changed.",
+                            if cached == 1 { "" } else { "s" }
+                        )))
+                        .child(
+                            Button::new("clear-cache")
+                                .ghost()
+                                .xsmall()
+                                .label("Clear")
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.clear_cache(cx)
+                                })),
+                        )
+                });
                 v_flex()
                     .gap_3()
                     .child(form)
                     .child(div().h(px(1.0)).flex_shrink_0().bg(border))
                     .child(v_flex().gap_1().children(issues))
+                    .children(live_section)
                     .children(run_section)
+                    .children(cache_row)
                     .children(save_row)
                     .child(div().h(px(1.0)).flex_shrink_0().bg(border))
                     .child(
