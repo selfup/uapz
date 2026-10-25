@@ -1,5 +1,6 @@
 //! uapz: a node graph editor built on gpui-kit.
 
+mod calls;
 mod doc;
 mod exec;
 mod graph;

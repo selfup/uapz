@@ -18,7 +18,7 @@ use crate::validate;
 pub const DIR: &str = "graphs";
 pub const VERSION: u32 = 1;
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct GraphDoc {
     #[serde(default = "version")]
     pub version: u32,
@@ -32,13 +32,13 @@ pub struct GraphDoc {
     pub edges: Vec<EdgeDoc>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct View {
     pub pan_x: f32,
     pub pan_y: f32,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NodeDoc {
     /// Mermaid-safe identifier, e.g. `n3`.
     pub id: String,
@@ -166,6 +166,12 @@ fn save_in(dir: &Path, doc: &GraphDoc) -> Result<(PathBuf, PathBuf), String> {
 /// Read a graph by name: the JSON sidecar when present, else the markdown's mermaid block.
 pub fn load(name: &str) -> Result<GraphDoc, String> {
     load_in(Path::new(DIR), name)
+}
+
+/// Load a called workflow from an ordinary managed graph directory.
+pub fn load_under(root: &Path, name: &str) -> Result<GraphDoc, String> {
+    let dir = storage::directory(root, Path::new(DIR), false)?;
+    load_in(&dir, name)
 }
 
 fn load_in(dir: &Path, name: &str) -> Result<GraphDoc, String> {

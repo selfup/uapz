@@ -23,6 +23,7 @@ pub const WRITABLE_DATABASE_LABEL: &str = "Database (write)";
 #[serde(rename_all = "lowercase")]
 pub enum NodeType {
     Input,
+    Workflow,
     Agent,
     Database,
     Script,
@@ -33,8 +34,9 @@ pub enum NodeType {
 }
 
 impl NodeType {
-    pub const ALL: [NodeType; 7] = [
+    pub const ALL: [NodeType; 8] = [
         Self::Input,
+        Self::Workflow,
         Self::Agent,
         Self::Database,
         Self::Script,
@@ -46,6 +48,7 @@ impl NodeType {
     pub fn label(self) -> &'static str {
         match self {
             Self::Input => "Run input",
+            Self::Workflow => "Workflow",
             Self::Agent => "Agent",
             Self::Database => "Database",
             Self::Script => "Script",
@@ -60,6 +63,7 @@ impl NodeType {
     pub fn color(self) -> &'static str {
         match self {
             Self::Input => "#06b6d4",
+            Self::Workflow => "#6366f1",
             Self::Agent => "#8b5cf6",
             Self::Database => "#0ea5e9",
             Self::Script => "#f59e0b",
@@ -79,6 +83,7 @@ impl NodeType {
     pub fn default_data(self) -> NodeData {
         match self {
             Self::Input => NodeData::Input(crate::workflow::InputConfig::default()),
+            Self::Workflow => NodeData::Workflow(crate::calls::Config::default()),
             Self::Agent => NodeData::Agent(AgentConfig::default()),
             Self::Database => NodeData::Database(DatabaseConfig::default()),
             Self::Script => NodeData::Script(ScriptConfig::default()),
@@ -94,6 +99,7 @@ impl NodeType {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum NodeData {
     Input(crate::workflow::InputConfig),
+    Workflow(crate::calls::Config),
     Agent(AgentConfig),
     Database(DatabaseConfig),
     Script(ScriptConfig),
@@ -106,6 +112,7 @@ impl NodeData {
     pub fn node_type(&self) -> NodeType {
         match self {
             Self::Input(_) => NodeType::Input,
+            Self::Workflow(_) => NodeType::Workflow,
             Self::Agent(_) => NodeType::Agent,
             Self::Database(_) => NodeType::Database,
             Self::Script(_) => NodeType::Script,
@@ -136,6 +143,7 @@ impl NodeData {
     pub fn summary(&self) -> String {
         match self {
             Self::Input(input) => input.summary(),
+            Self::Workflow(call) => call.summary(),
             Self::Agent(a) => a.summary(),
             Self::Database(d) => d.summary(),
             Self::Script(s) => s.summary(),
@@ -149,6 +157,7 @@ impl NodeData {
     pub fn validate(&self) -> Vec<Issue> {
         match self {
             Self::Input(input) => input.validate(),
+            Self::Workflow(call) => call.validate(),
             Self::Agent(a) => a.validate(),
             Self::Database(d) => d.validate(),
             Self::Script(s) => s.validate(),

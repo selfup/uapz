@@ -43,7 +43,7 @@
 //! [`write_sql`] is the inspector's helper: it describes the database's schema with
 //! [`describe_schema`] and asks an agent for one statement.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, Read, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -65,7 +65,7 @@ use crate::node_data::{
 use crate::providers::{self, Http};
 use crate::storage;
 use crate::validate;
-use crate::{review, workflow};
+use crate::{calls, history, review, workflow};
 
 pub const HTTP_TIMEOUT: Duration = Duration::from_secs(300);
 pub const DB_TIMEOUT: Duration = Duration::from_secs(300);
@@ -156,6 +156,8 @@ impl Output {
 
 #[derive(Debug)]
 pub struct Report {
+    /// Child runs with the exact graph snapshots used, keyed by local Workflow node id.
+    pub calls: BTreeMap<String, history::WorkflowRun>,
     /// Resolved run-form values, including defaults, for replay and history.
     pub inputs: workflow::Values,
     pub log: Vec<String>,
@@ -169,6 +171,21 @@ pub struct Report {
     /// The node whose own step failed when `result` is an error: the deepest one, not the
     /// nodes that failed only because it did.
     pub failed: Option<String>,
+}
+
+impl Report {
+    fn failure(error: String, elapsed: Duration) -> Self {
+        Self {
+            calls: BTreeMap::new(),
+            inputs: workflow::Values::new(),
+            log: Vec::new(),
+            result: Err(error),
+            elapsed,
+            reused: Vec::new(),
+            outputs: HashMap::new(),
+            failed: None,
+        }
+    }
 }
 
 /// Something that happened during a run, delivered as it happens.
@@ -495,7 +512,7 @@ pub fn content_key(node_type: NodeType, output: &Output) -> Key {
 /// One key over several byte strings, with lengths mixed in so the boundaries count.
 /// Two FNV-1a passes, one forwards and one backwards, give a stable 128-bit key that
 /// does not depend on the standard library's hasher.
-fn key_of(parts: &[&[u8]]) -> Key {
+pub(crate) fn key_of(parts: &[&[u8]]) -> Key {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
     let fnv = |mut h: u64, bytes: &mut dyn Iterator<Item = u8>| {
@@ -552,6 +569,40 @@ pub fn run_all_with(
     env: Env,
     control: &Control,
 ) -> Report {
+    let started = Instant::now();
+    let plans = calls::prepare(doc, targets, &dirs.root, &control.cancel);
+    let mut report = run_prepared(
+        doc,
+        targets,
+        dirs,
+        http,
+        env,
+        control,
+        Scope {
+            plans: &plans,
+            namespace: String::new(),
+            key: None,
+        },
+    );
+    report.elapsed = started.elapsed();
+    report
+}
+
+struct Scope<'a> {
+    plans: &'a calls::Plans,
+    namespace: String,
+    key: Option<Key>,
+}
+
+fn run_prepared(
+    doc: &GraphDoc,
+    targets: &[String],
+    dirs: Dirs,
+    http: &dyn Http,
+    env: Env,
+    control: &Control,
+    scope: Scope<'_>,
+) -> Report {
     let start = Instant::now();
     let resolved = if control.cancelled() {
         Err(CANCELLED.into())
@@ -561,19 +612,11 @@ pub fn run_all_with(
     };
     let inputs = match resolved {
         Ok(inputs) => inputs,
-        Err(error) => {
-            return Report {
-                inputs: workflow::Values::new(),
-                log: Vec::new(),
-                result: Err(error),
-                elapsed: start.elapsed(),
-                reused: Vec::new(),
-                outputs: HashMap::new(),
-                failed: None,
-            };
-        }
+        Err(error) => return Report::failure(error, start.elapsed()),
     };
     let mut runner = Runner {
+        scope,
+        calls: BTreeMap::new(),
         inputs,
         graph: GraphIndex::new(doc),
         dirs,
@@ -617,6 +660,7 @@ pub fn run_all_with(
         runner.log(format!("run all: {finished} of {} finished", targets.len()));
     }
     Report {
+        calls: runner.calls,
         inputs: runner.inputs,
         log: runner.log,
         result: result.map(Arc::unwrap_or_clone),
@@ -632,6 +676,8 @@ pub fn run_all_with(
 }
 
 struct Runner<'a> {
+    scope: Scope<'a>,
+    calls: BTreeMap<String, history::WorkflowRun>,
     inputs: workflow::Values,
     graph: GraphIndex<'a>,
     dirs: Dirs,
@@ -685,6 +731,86 @@ impl<'a> GraphIndex<'a> {
             }
         }
     }
+
+    fn order(
+        &self,
+        target: &str,
+        mut validate: impl FnMut(&str) -> Result<bool, String>,
+    ) -> Result<Vec<String>, (String, String)> {
+        let mut stack = vec![(target.to_string(), false)];
+        let mut active = HashSet::new();
+        let mut visited = HashSet::new();
+        let mut order = Vec::new();
+        while let Some((id, exiting)) = stack.pop() {
+            if exiting {
+                active.remove(&id);
+                visited.insert(id.clone());
+                order.push(id);
+                continue;
+            }
+            if visited.contains(&id) {
+                continue;
+            }
+            let skip = validate(&id).map_err(|e| (id.clone(), e))?;
+            if skip {
+                visited.insert(id.clone());
+                order.push(id);
+                continue;
+            }
+            if !active.insert(id.clone()) {
+                return Err((id.clone(), format!("{id} is wired in a cycle")));
+            }
+            stack.push((id.clone(), true));
+            for from in self.upstream(&id).iter().rev() {
+                stack.push(((*from).to_string(), false));
+            }
+        }
+        Ok(order)
+    }
+}
+
+fn validate_content(node: &NodeDoc) -> Result<(), String> {
+    let id = &node.id;
+    let data = node
+        .data
+        .as_ref()
+        .ok_or_else(|| format!("{id} is blank; give it content first"))?;
+    let issues = data.validate();
+    if let Some(first) = issues.first() {
+        return Err(format!(
+            "{id} is not valid: {}: {}",
+            first.field, first.message
+        ));
+    }
+    Ok(())
+}
+
+/// Read-only validation for a saved child, using execution's iterative dependency walk.
+pub(crate) fn preflight(doc: &GraphDoc, target: &str, cancel: &AtomicBool) -> Result<(), String> {
+    let mut ids = HashSet::new();
+    for node in &doc.nodes {
+        if !validate::is_node_id(&node.id) || !ids.insert(&node.id) {
+            return Err(format!(
+                "invalid or duplicate workflow node id: {}",
+                node.id
+            ));
+        }
+    }
+    let graph = GraphIndex::new(doc);
+    graph
+        .order(target, |id| {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(CANCELLED.into());
+            }
+            let node = graph
+                .nodes
+                .get(id)
+                .ok_or_else(|| format!("{id} is not in the graph"))?;
+            validate_content(node)?;
+            Ok(false)
+        })
+        .map(|_| ())
+        .map_err(|(_, e)| e)
 }
 
 impl Runner<'_> {
@@ -788,39 +914,17 @@ impl Runner<'_> {
     /// explicit stack avoids overflowing the thread stack on long chains. The exit
     /// marker produces the same stable upstream-first order as recursive traversal.
     fn execution_order(&self, target: &str) -> Result<Vec<String>, (String, String)> {
-        let mut stack = vec![(target.to_string(), false)];
-        let mut active = HashSet::new();
-        let mut visited = HashSet::new();
-        let mut order = Vec::new();
-        while let Some((id, exiting)) = stack.pop() {
-            self.check_cancel().map_err(|e| (id.clone(), e))?;
-            if exiting {
-                active.remove(&id);
-                visited.insert(id.clone());
-                order.push(id);
-                continue;
+        self.graph.order(target, |id| {
+            self.check_cancel()?;
+            if let Some(error) = self.errors.get(id) {
+                return Err(error.clone());
             }
-            if visited.contains(&id) {
-                continue;
+            if self.done.contains_key(id) {
+                return Ok(true);
             }
-            if let Some(error) = self.errors.get(&id) {
-                return Err((id.clone(), error.clone()));
-            }
-            if self.done.contains_key(&id) {
-                visited.insert(id.clone());
-                order.push(id);
-                continue;
-            }
-            if !active.insert(id.clone()) {
-                return Err((id.clone(), format!("{id} is wired in a cycle")));
-            }
-            self.validate_node(&id).map_err(|e| (id.clone(), e))?;
-            stack.push((id.clone(), true));
-            for from in self.graph.upstream(&id).iter().rev() {
-                stack.push(((*from).to_string(), false));
-            }
-        }
-        Ok(order)
+            self.validate_node(id)?;
+            Ok(false)
+        })
     }
 
     /// A node's name as a placeholder may use it: set and valid, else none.
@@ -831,19 +935,14 @@ impl Runner<'_> {
 
     fn validate_node(&self, id: &str) -> Result<(), String> {
         let node = self.node(id)?;
-        let Some(data) = &node.data else {
-            return Err(format!("{id} is blank; give it content first"));
-        };
-        let issues = data.validate();
-        if let Some(first) = issues.first() {
-            let more = match issues.len() {
-                1 => String::new(),
-                n => format!(" (and {} more)", n - 1),
-            };
-            return Err(format!(
-                "{id} is not valid: {}: {}{more}",
-                first.field, first.message
-            ));
+        validate_content(node)?;
+        if matches!(node.data, Some(NodeData::Workflow(_))) {
+            self.scope
+                .plans
+                .get(id)
+                .ok_or_else(|| format!("{id}: workflow was not prepared"))?
+                .as_ref()
+                .map_err(|e| format!("{id}: {e}"))?;
         }
         Ok(())
     }
@@ -868,7 +967,10 @@ impl Runner<'_> {
             upstream.len(),
             if upstream.len() == 1 { "" } else { "s" }
         ));
-        let name = node.kind.clone().unwrap_or_else(|| id.to_string());
+        let name = node
+            .kind
+            .clone()
+            .unwrap_or_else(|| format!("{}{id}", self.scope.namespace.replace('/', "-")));
 
         // Agents and scripts are the slow, costly nodes and depend only on their config,
         // their inputs and (for scripts) the file itself, so those make the key. The rest
@@ -906,15 +1008,25 @@ impl Runner<'_> {
                 Some(cache_key(&config_json, &source, &upstream_keys))
             }
             NodeData::Data(_)
+            | NodeData::Workflow(_)
             | NodeData::Input(_)
             | NodeData::Database(_)
             | NodeData::Directory(_)
             | NodeData::File(_) => None,
         };
+        let cache_key = cache_key.map(|key| match self.scope.key {
+            Some(scope) => key_of(&[
+                b"workflow-cache-v1",
+                &scope.to_le_bytes(),
+                &key.to_le_bytes(),
+            ]),
+            None => key,
+        });
+        let cache_id = format!("{}{id}", self.scope.namespace);
         if let Some(key) = cache_key
             && !self.control.fresh
             && let Some(cache) = &self.control.cache
-            && let Some(output) = lock(cache).lookup(id, key)
+            && let Some(output) = lock(cache).lookup(&cache_id, key)
         {
             self.log(format!("{id}: reused the cached {}", output.label));
             self.reused.push(id.to_string());
@@ -927,8 +1039,36 @@ impl Runner<'_> {
 
         self.check_cancel()?;
         self.state(id, NodeState::Running);
+        if let NodeData::Workflow(config) = data {
+            let start = Instant::now();
+            let result = self.run_workflow(id, config, &inputs);
+            // A bad dynamic mapping can fail before the child runner starts. Retain
+            // its snapshot and reason too, with no claim that any child node ran.
+            if let Err(error) = &result
+                && !self.calls.contains_key(id)
+                && let Some(Ok(prepared)) = self.scope.plans.get(id)
+            {
+                let report = Report::failure(error.clone(), start.elapsed());
+                self.calls.insert(
+                    id.to_string(),
+                    history::WorkflowRun {
+                        graph: prepared.graph.as_ref().clone(),
+                        run: history::record(
+                            &prepared.graph,
+                            std::slice::from_ref(&config.output),
+                            &report,
+                            self.control.cache.as_deref(),
+                        ),
+                    },
+                );
+            }
+            let done = result?;
+            self.state(id, NodeState::Done);
+            return Ok(done);
+        }
         let outputs: Vec<Arc<Output>> = inputs.into_iter().map(|(_, done)| done.output).collect();
         let output = match data {
+            NodeData::Workflow(_) => unreachable!("workflow handled above"),
             NodeData::Input(config) => {
                 let field = node.name.as_deref().unwrap_or_default().trim();
                 let value = self
@@ -987,7 +1127,7 @@ impl Runner<'_> {
             },
         }?;
         if let (Some(key), Some(cache)) = (cache_key, &self.control.cache) {
-            lock(cache).store(id, key, output.clone());
+            lock(cache).store(&cache_id, key, output.clone());
         }
         self.state(id, NodeState::Done);
         let key = if let NodeData::Input(_) = data {
@@ -1009,6 +1149,123 @@ impl Runner<'_> {
         };
         Ok(Done {
             key,
+            output: Arc::new(output),
+        })
+    }
+
+    fn run_workflow(
+        &mut self,
+        id: &str,
+        config: &calls::Config,
+        inputs: &[(String, Done)],
+    ) -> Result<Done, String> {
+        let prepared = self
+            .scope
+            .plans
+            .get(id)
+            .ok_or("workflow was not prepared")?
+            .as_ref()
+            .map_err(Clone::clone)?
+            .clone();
+        let mut supplied = workflow::Values::new();
+        let mut bytes = 0usize;
+        for (name, binding) in &config.inputs {
+            let value = match binding {
+                calls::Binding::Value { value } => value.as_str(),
+                calls::Binding::Output { node } => {
+                    let output = &inputs
+                        .iter()
+                        .find(|(from, _)| from == node)
+                        .ok_or_else(|| format!("{name}: {node} is not wired into {id}"))?
+                        .1
+                        .output;
+                    output.as_text().ok_or_else(|| format!("{name}: {node} produced binary data; workflow inputs require text or a data/ file path"))?
+                }
+            };
+            // Check before copying large upstream outputs into run values.
+            validate::text(name, value, workflow::MAX_VALUE_BYTES)?;
+            bytes = bytes.saturating_add(value.len());
+            if bytes > workflow::MAX_VALUES_BYTES {
+                return Err("workflow inputs exceed the 1 MB combined limit".into());
+            }
+            supplied.insert(name.clone(), value.to_string());
+        }
+        let values = workflow::resolve(&prepared.fields, &supplied, &self.dirs.data)?;
+        let encoded = serde_json::to_vec(&values).map_err(|e| e.to_string())?;
+        let upstream: Vec<Key> = inputs.iter().map(|(_, done)| done.key).collect();
+        let binding = serde_json::to_vec(&(config, upstream)).map_err(|e| e.to_string())?;
+        let scope_key = key_of(&[
+            b"workflow-run-v1",
+            &prepared.key.to_le_bytes(),
+            &self.scope.key.unwrap_or_default().to_le_bytes(),
+            &binding,
+            &encoded,
+        ]);
+        let mut control = self.control.clone();
+        control.inputs = values;
+        if let Some(progress) = control.progress.clone() {
+            let prefix = id.to_string();
+            control.progress = Some(Arc::new(move |event| {
+                progress(match event {
+                    Progress::Log(line) => Progress::Log(format!("{prefix}/{line}")),
+                    Progress::Node { id, state } => Progress::Node {
+                        id: format!("{prefix}/{id}"),
+                        state,
+                    },
+                    Progress::Text { id, text } => Progress::Text {
+                        id: format!("{prefix}/{id}"),
+                        text,
+                    },
+                })
+            }));
+        }
+        if let Some(review) = control.review.clone() {
+            let prefix = id.to_string();
+            control.review = Some(Arc::new(move |request| {
+                review(Arc::new(review::Request {
+                    node: format!("{prefix}/{}", request.node),
+                    files: request.files.clone(),
+                }))
+            }));
+        }
+        let targets = [config.output.clone()];
+        let report = run_prepared(
+            &prepared.graph,
+            &targets,
+            self.dirs.clone(),
+            self.http,
+            self.env,
+            &control,
+            Scope {
+                plans: &prepared.calls,
+                namespace: format!("{}{id}/", self.scope.namespace),
+                key: Some(scope_key),
+            },
+        );
+        let run = history::record(&prepared.graph, &targets, &report, control.cache.as_deref());
+        self.calls.insert(
+            id.to_string(),
+            history::WorkflowRun {
+                graph: prepared.graph.as_ref().clone(),
+                run,
+            },
+        );
+        self.log
+            .extend(report.log.into_iter().map(|line| format!("{id}/{line}")));
+        self.check_cancel()?;
+        let output = report.result.map_err(|e| {
+            if e == CANCELLED {
+                e
+            } else {
+                format!("{id} ({}): {e}", config.graph)
+            }
+        })?;
+        Ok(Done {
+            key: key_of(&[
+                b"workflow-output-v1",
+                &scope_key.to_le_bytes(),
+                &output.bytes,
+            ]),
             output: Arc::new(output),
         })
     }

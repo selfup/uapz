@@ -33,7 +33,7 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{ActiveTheme, Disableable, IndexPath, Sizable, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -53,7 +53,7 @@ use crate::node_data::{
 use crate::providers::{self, UreqHttp};
 use crate::validate::{self, Issue};
 use crate::{
-    review,
+    calls, review,
     workflow::{self, InputConfig, InputType},
 };
 
@@ -141,7 +141,20 @@ struct RunForm {
     _subscriptions: Vec<Subscription>,
 }
 
+struct CallField {
+    field: workflow::Field,
+    source: Entity<StrSelect>,
+    value: Entity<TextareaState>,
+}
+
 pub struct Inspector {
+    workflow_graph: Entity<StrSelect>,
+    workflow_output: Entity<StrSelect>,
+    workflow_fields: Vec<CallField>,
+    workflow_problem: Option<String>,
+    workflow_subscriptions: Vec<Subscription>,
+    workflow_details: bool,
+    child_states: BTreeMap<String, NodeState>,
     scroll: ScrollHandle,
     run_form: Option<RunForm>,
     run_values: workflow::Values,
@@ -284,6 +297,23 @@ fn set_textarea(state: &Entity<TextareaState>, value: String, window: &mut Windo
     state.update(cx, |state, cx| state.set_value(value, window, cx));
 }
 
+fn set_picker(
+    state: &Entity<StrSelect>,
+    items: Vec<String>,
+    selected: Option<usize>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    state.update(cx, |state, cx| {
+        state.set_items(
+            items.into_iter().map(SharedString::from).collect(),
+            window,
+            cx,
+        );
+        state.set_selected_index(selected.map(IndexPath::new), window, cx);
+    });
+}
+
 /// What the endpoint field suggests for a provider.
 fn endpoint_placeholder(provider: Provider) -> String {
     match provider.default_endpoint() {
@@ -338,6 +368,10 @@ impl Inspector {
         let preset_name = text("preset name", window, cx);
         let input_kind = enum_select(&InputType::ALL, InputType::label, window, cx);
         let input_default = area("Optional default for the Run form", 3, window, cx);
+        let workflow_graph =
+            cx.new(|cx| SelectState::new(Vec::<SharedString>::new(), None, window, cx));
+        let workflow_output =
+            cx.new(|cx| SelectState::new(Vec::<SharedString>::new(), None, window, cx));
         let provider = enum_select(&Provider::ALL, Provider::label, window, cx);
         let endpoint = text(Provider::Ollama.default_endpoint(), window, cx);
         let model_type = enum_select(&ModelType::ALL, ModelType::label, window, cx);
@@ -473,6 +507,20 @@ impl Inspector {
             ));
         }
         subscriptions.push(cx.subscribe_in(
+            &workflow_graph,
+            window,
+            |this, _, _: &SelectEvent<Vec<SharedString>>, window, cx| {
+                this.change_workflow(true, window, cx)
+            },
+        ));
+        subscriptions.push(cx.subscribe_in(
+            &workflow_output,
+            window,
+            |this, _, _: &SelectEvent<Vec<SharedString>>, window, cx| {
+                this.change_workflow(false, window, cx)
+            },
+        ));
+        subscriptions.push(cx.subscribe_in(
             &provider,
             window,
             |this, _, _: &SelectEvent<Vec<SharedString>>, window, cx| {
@@ -507,6 +555,13 @@ impl Inspector {
         ));
 
         let mut inspector = Self {
+            workflow_graph,
+            workflow_output,
+            workflow_fields: Vec::new(),
+            workflow_problem: None,
+            workflow_subscriptions: Vec::new(),
+            workflow_details: false,
+            child_states: BTreeMap::new(),
             scroll: ScrollHandle::new(),
             run_form: None,
             run_values: workflow::Values::new(),
@@ -588,6 +643,7 @@ impl Inspector {
 
     /// A different graph is loaded: node ids mean other nodes now.
     fn forget_results(&mut self, cx: &mut Context<Self>) {
+        self.child_states.clear();
         if let Some(job) = self.job.take() {
             job.cancel.store(true, Ordering::Relaxed);
         }
@@ -704,6 +760,7 @@ impl Inspector {
 
     fn fill(&mut self, data: &NodeData, window: &mut Window, cx: &mut Context<Self>) {
         match data {
+            NodeData::Workflow(config) => self.fill_workflow(config, window, cx),
             NodeData::Input(input) => {
                 choose(&self.input_kind, &InputType::ALL, input.kind, window, cx);
                 set_textarea(&self.input_default, input.default.clone(), window, cx);
@@ -784,6 +841,49 @@ impl Inspector {
     fn collect(&self, kind: NodeType, prev: Option<NodeData>, cx: &App) -> (NodeData, Vec<Issue>) {
         let mut issues = Vec::new();
         let data = match kind {
+            NodeType::Workflow => {
+                let inputs = self
+                    .workflow_fields
+                    .iter()
+                    .filter_map(|field| {
+                        let source = field.source.read(cx).selected_value()?;
+                        let binding = match source.as_ref() {
+                            "Use default" => return None,
+                            "Value" => calls::Binding::Value {
+                                value: field.value.read(cx).value().to_string(),
+                            },
+                            label => calls::Binding::Output {
+                                node: label.split(" · ").next().unwrap_or(label).to_string(),
+                            },
+                        };
+                        Some((field.field.name.clone(), binding))
+                    })
+                    .collect();
+                // Preserve mappings when a saved graph is temporarily missing/unreadable.
+                let inputs = if self.workflow_problem.is_some() {
+                    match prev {
+                        Some(NodeData::Workflow(config)) => config.inputs,
+                        _ => inputs,
+                    }
+                } else {
+                    inputs
+                };
+                NodeData::Workflow(calls::Config {
+                    graph: self
+                        .workflow_graph
+                        .read(cx)
+                        .selected_value()
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
+                    output: self
+                        .workflow_output
+                        .read(cx)
+                        .selected_value()
+                        .map(|s| s.split(" · ").next().unwrap_or_default().to_string())
+                        .unwrap_or_default(),
+                    inputs,
+                })
+            }
             NodeType::Input => NodeData::Input(InputConfig {
                 kind: chosen(&self.input_kind, &InputType::ALL, InputType::label, cx)
                     .unwrap_or_default(),
@@ -931,6 +1031,339 @@ impl Inspector {
         (data, issues)
     }
 
+    fn fill_workflow(
+        &mut self,
+        config: &calls::Config,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let loading = self.loading;
+        self.loading = true;
+        self.workflow_fields.clear();
+        self.workflow_subscriptions.clear();
+        self.workflow_problem = None;
+        let mut names = crate::doc::list();
+        if !config.graph.is_empty() && !names.contains(&config.graph) {
+            names.push(config.graph.clone());
+        }
+        let selected = names.iter().position(|n| n == &config.graph);
+        set_picker(&self.workflow_graph, names, selected, window, cx);
+        set_picker(
+            &self.workflow_output,
+            if config.output.is_empty() {
+                Vec::new()
+            } else {
+                vec![format!("{} · saved output", config.output)]
+            },
+            (!config.output.is_empty()).then_some(0),
+            window,
+            cx,
+        );
+        let loaded = crate::doc::load_under(Path::new("."), &config.graph);
+        let result = loaded.and_then(|doc| {
+            let mut outputs: Vec<_> = doc
+                .nodes
+                .iter()
+                .filter(|n| n.data.is_some())
+                .map(|n| {
+                    format!(
+                        "{} · {}",
+                        n.id,
+                        n.name.as_deref().unwrap_or_else(|| n
+                            .data
+                            .as_ref()
+                            .map(NodeData::label)
+                            .unwrap_or("node"))
+                    )
+                })
+                .collect();
+            let mut selected = doc
+                .nodes
+                .iter()
+                .filter(|n| n.data.is_some())
+                .position(|n| n.id == config.output);
+            if selected.is_none() && !config.output.is_empty() {
+                selected = Some(outputs.len());
+                outputs.push(format!("{} · missing node", config.output));
+            }
+            set_picker(&self.workflow_output, outputs, selected, window, cx);
+            let node = doc
+                .nodes
+                .iter()
+                .find(|n| n.id == config.output)
+                .ok_or("choose an output node")?;
+            if node.data.is_none() {
+                return Err("the output node is blank".into());
+            }
+            workflow::fields(&doc, std::slice::from_ref(&config.output))
+        });
+        match result {
+            Err(error) => {
+                if config.graph.is_empty() {
+                    set_picker(&self.workflow_output, Vec::new(), None, window, cx);
+                }
+                self.workflow_problem = Some(error);
+            }
+            Ok(fields) => {
+                let graph = self.graph.read(cx);
+                let upstream = self.node.map(|id| graph.inputs(id)).unwrap_or_default();
+                let wire_labels: Vec<_> = upstream
+                    .iter()
+                    .map(|id| format!("n{id} · {}", graph.node_name(*id).unwrap_or("wired output")))
+                    .collect();
+                for field in fields {
+                    let binding = config.inputs.get(&field.name);
+                    let mut sources = vec!["Use default".to_string(), "Value".to_string()];
+                    sources.extend(wire_labels.clone());
+                    let index = match binding {
+                        None => 0,
+                        Some(calls::Binding::Value { .. }) => 1,
+                        Some(calls::Binding::Output { node }) => sources
+                            .iter()
+                            .position(|s| s.split(" · ").next() == Some(node))
+                            .unwrap_or_else(|| {
+                                sources.push(format!("{node} · wire missing"));
+                                sources.len() - 1
+                            }),
+                    };
+                    let value = match binding {
+                        Some(calls::Binding::Value { value }) => value.clone(),
+                        _ => field.config.default.clone(),
+                    };
+                    let source = cx.new(|cx| {
+                        SelectState::new(
+                            sources
+                                .into_iter()
+                                .map(SharedString::from)
+                                .collect::<Vec<_>>(),
+                            Some(IndexPath::new(index)),
+                            window,
+                            cx,
+                        )
+                    });
+                    let value =
+                        cx.new(|cx| TextareaState::new(window, cx).rows(3).default_value(value));
+                    self.workflow_subscriptions.push(cx.subscribe_in(
+                        &source,
+                        window,
+                        |this, _, _: &SelectEvent<Vec<SharedString>>, _, cx| this.sync(cx),
+                    ));
+                    self.workflow_subscriptions.push(cx.subscribe_in(
+                        &value,
+                        window,
+                        |this, _, event: &InputEvent, _, cx| {
+                            if matches!(event, InputEvent::Change) {
+                                this.sync(cx);
+                            }
+                        },
+                    ));
+                    self.workflow_fields.push(CallField {
+                        field,
+                        source,
+                        value,
+                    });
+                }
+            }
+        }
+        self.loading = loading;
+    }
+
+    fn change_workflow(
+        &mut self,
+        changed_graph: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.loading || self.kind != Some(NodeType::Workflow) {
+            return;
+        }
+        let Some(id) = self.node else {
+            return;
+        };
+        let Some(NodeData::Workflow(mut config)) = self.graph.read(cx).node_data(id).cloned()
+        else {
+            return;
+        };
+        if changed_graph {
+            let name = self
+                .workflow_graph
+                .read(cx)
+                .selected_value()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            if config.graph == name {
+                return;
+            }
+            config.graph = name;
+            config.inputs.clear();
+            config.output = crate::doc::load_under(Path::new("."), &config.graph)
+                .ok()
+                .and_then(|doc| exec::sinks(&doc).into_iter().next())
+                .unwrap_or_default();
+        } else {
+            let output = self
+                .workflow_output
+                .read(cx)
+                .selected_value()
+                .map(|s| s.split(" · ").next().unwrap_or_default().to_string())
+                .unwrap_or_default();
+            if config.output == output {
+                return;
+            }
+            config.output = output;
+        }
+        self.graph.update(cx, |graph, cx| {
+            graph.set_node_data(id, Some(NodeData::Workflow(config.clone())), cx)
+        });
+        self.fill_workflow(&config, window, cx);
+        self.sync(cx);
+    }
+
+    fn render_workflow(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        v_form()
+            .small()
+            .child(
+                field()
+                    .label("Saved workflow")
+                    .child(Select::new(&self.workflow_graph).small()),
+            )
+            .child(
+                field()
+                    .label("Return output")
+                    .description("Runs this node and its dependencies in the saved graph.")
+                    .child(Select::new(&self.workflow_output).small()),
+            )
+            .child(
+                field().child(
+                    Button::new("refresh-workflows")
+                        .outline()
+                        .small()
+                        .label("Refresh workflows and wires")
+                        .on_click(
+                            cx.listener(|this, _: &ClickEvent, window, cx| this.reload(window, cx)),
+                        ),
+                ),
+            )
+            .children(self.workflow_fields.iter().map(|item| {
+                let literal = item
+                    .source
+                    .read(cx)
+                    .selected_value()
+                    .is_some_and(|s| s == "Value");
+                let default = item
+                    .source
+                    .read(cx)
+                    .selected_value()
+                    .is_some_and(|s| s == "Use default");
+                let description = format!(
+                    "{} · {}",
+                    item.field.config.kind.label(),
+                    if item.field.config.required {
+                        "required"
+                    } else {
+                        "optional"
+                    }
+                );
+                field()
+                    .label(item.field.name.clone())
+                    .description(description)
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(Select::new(&item.source).small())
+                            .when(literal, |d| d.child(Textarea::new(&item.value).small()))
+                            .when(default, |d| {
+                                d.child(div().text_xs().child(
+                                    if item.field.config.default.is_empty() {
+                                        "No default value".to_string()
+                                    } else {
+                                        format!(
+                                            "Default: {}",
+                                            item.field
+                                                .config
+                                                .default
+                                                .chars()
+                                                .take(200)
+                                                .collect::<String>()
+                                        )
+                                    },
+                                ))
+                            }),
+                    )
+            }))
+    }
+
+    fn render_workflow_details(&self, id: NodeId, cx: &mut Context<Self>) -> AnyElement {
+        let prefix = format!("n{id}/");
+        let mut lines = Vec::new();
+        if self.workflow_details {
+            if self.job.is_some() {
+                for (node, state) in &self.child_states {
+                    if node.starts_with(&prefix) {
+                        lines.push(format!("{node}: {state:?}"));
+                    }
+                }
+                lines.extend(
+                    self.live_log
+                        .iter()
+                        .filter(|line| line.starts_with(&prefix))
+                        .cloned(),
+                );
+            } else if let Some(call) = self
+                .report
+                .as_ref()
+                .and_then(|(_, report)| report.calls.get(&format!("n{id}")))
+            {
+                fn describe(prefix: &str, call: &history::WorkflowRun, lines: &mut Vec<String>) {
+                    lines.push(format!(
+                        "{prefix}{} · {:?}",
+                        call.graph.name, call.run.outcome
+                    ));
+                    for (id, node) in &call.run.nodes {
+                        lines.push(format!(
+                            "{prefix}{id}: {:?} · {}",
+                            node.state,
+                            node.error
+                                .as_ref()
+                                .or(node.label.as_ref())
+                                .map(String::as_str)
+                                .unwrap_or("no output")
+                        ));
+                        if !node.preview.is_empty() {
+                            lines.push(node.preview.chars().take(500).collect());
+                        }
+                    }
+                    for (id, nested) in &call.run.calls {
+                        describe(&format!("{prefix}{id}/"), nested, lines);
+                    }
+                }
+                describe(&prefix, call, &mut lines);
+                lines.extend(call.run.log.iter().map(|line| format!("{prefix}{line}")));
+            }
+            if lines.is_empty() {
+                lines.push("No child execution to show yet.".into());
+            }
+        }
+        v_flex()
+            .gap_1()
+            .child(
+                Button::new("workflow-details")
+                    .outline()
+                    .small()
+                    .label(if self.workflow_details {
+                        "Hide child execution"
+                    } else {
+                        "Show child execution"
+                    })
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.workflow_details = !this.workflow_details;
+                        cx.notify();
+                    })),
+            )
+            .children(lines.into_iter().map(|line| div().text_xs().child(line)))
+            .into_any_element()
+    }
+
     // ----- field reactions -----
 
     /// The name lives on the node itself, not in its content, so it is written to the
@@ -952,6 +1385,24 @@ impl Inspector {
     fn wiring_issues(&self, id: NodeId, data: Option<&NodeData>, cx: &App) -> Vec<Issue> {
         let graph = self.graph.read(cx);
         let mut issues = Vec::new();
+        if let Some(NodeData::Workflow(config)) = data {
+            if let Some(problem) = &self.workflow_problem {
+                issues.push(Issue::new("workflow", problem.clone()));
+            } else {
+                let fields: Vec<_> = self
+                    .workflow_fields
+                    .iter()
+                    .map(|f| f.field.clone())
+                    .collect();
+                let upstream: Vec<_> = graph.inputs(id).iter().map(|n| format!("n{n}")).collect();
+                let upstream: Vec<_> = upstream.iter().map(String::as_str).collect();
+                if let Err(error) =
+                    config.validate_bindings(&fields, &upstream, &exec::Dirs::from_cwd().data)
+                {
+                    issues.push(Issue::new("inputs", error));
+                }
+            }
+        }
         if matches!(data, Some(NodeData::Input(_))) {
             if graph.node_name(id).is_none() {
                 issues.push(Issue::new(
@@ -1161,6 +1612,7 @@ impl Inspector {
             NodeData::Agent(a) => library::save_agent(&name, a),
             NodeData::Database(d) => library::save_database(&name, d),
             NodeData::Input(_)
+            | NodeData::Workflow(_)
             | NodeData::Script(_)
             | NodeData::Data(_)
             | NodeData::Directory(_)
@@ -1255,6 +1707,7 @@ impl Inspector {
                 self.on_data_path_change(window, cx);
             }
             NodeType::Input
+            | NodeType::Workflow
             | NodeType::Agent
             | NodeType::Database
             | NodeType::Directory
@@ -1467,6 +1920,7 @@ impl Inspector {
             doc: doc.clone(),
         });
         self.live_log.clear();
+        self.child_states.clear();
         self.live_stream = None;
         self.pending_review = None;
         self.live_states = 0;
@@ -1548,6 +2002,9 @@ impl Inspector {
             }
             let mut moved = false;
             for (id, state) in &live.states[self.live_states..] {
+                if id.contains('/') {
+                    self.child_states.insert(id.clone(), *state);
+                }
                 if let Some(node) = node_id(id) {
                     let mark = match state {
                         NodeState::Running => Mark::Running,
@@ -2703,6 +3160,7 @@ impl Render for Inspector {
                 .into_any_element(),
             (Some(id), Some(ty)) => {
                 let form: AnyElement = match ty {
+                    NodeType::Workflow => self.render_workflow(cx).into_any_element(),
                     NodeType::Input => self.render_input_config(cx).into_any_element(),
                     NodeType::Agent => self.render_agent(cx).into_any_element(),
                     NodeType::Database => self.render_database(cx).into_any_element(),
@@ -2956,6 +3414,9 @@ impl Render for Inspector {
                     .children(live_section)
                     .children(run_section)
                     .children(output_section)
+                    .children(
+                        (ty == NodeType::Workflow).then(|| self.render_workflow_details(id, cx)),
+                    )
                     .children(cache_row)
                     .children(save_row)
                     .child(div().h(px(1.0)).flex_shrink_0().bg(border))
