@@ -72,6 +72,8 @@ pub const DB_TIMEOUT: Duration = Duration::from_secs(300);
 pub const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 /// Largest stdout a child process may produce.
 pub const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+/// Largest combined text input a node may consume, including separators.
+pub const MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
 /// Environment variables child processes inherit. Nothing else leaks in.
 pub const INHERITED_ENV: &[&str] = &["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "TERM"];
 const POLL: Duration = Duration::from_millis(25);
@@ -471,7 +473,7 @@ impl Control {
 /// nodes after it put into their own keys.
 #[derive(Clone, Debug)]
 struct Done {
-    output: Output,
+    output: Arc<Output>,
     key: Key,
 }
 
@@ -547,7 +549,7 @@ pub fn run_all_with(
 ) -> Report {
     let start = Instant::now();
     let mut runner = Runner {
-        doc,
+        graph: GraphIndex::new(doc),
         dirs,
         http,
         env,
@@ -555,7 +557,6 @@ pub fn run_all_with(
         log: Vec::new(),
         done: HashMap::new(),
         errors: HashMap::new(),
-        active: HashSet::new(),
         reused: Vec::new(),
         failed: None,
     };
@@ -563,17 +564,19 @@ pub fn run_all_with(
     if all {
         runner.log(format!("run all: {}", targets.join(", ")));
     }
-    let mut result: Result<Output, String> = Err("nothing to run: no node has content".to_string());
+    let mut result: Result<Arc<Output>, String> =
+        Err("nothing to run: no node has content".to_string());
     let mut first_error: Option<String> = None;
     for target in targets {
         match runner.run_node(target) {
             Ok(done) => result = Ok(done.output),
             Err(e) => {
                 let cancelled = e == CANCELLED;
-                first_error.get_or_insert(e);
                 if cancelled {
+                    first_error = Some(e);
                     break;
                 }
+                first_error.get_or_insert(e);
             }
         }
     }
@@ -589,20 +592,20 @@ pub fn run_all_with(
     }
     Report {
         log: runner.log,
-        result,
+        result: result.map(Arc::unwrap_or_clone),
         elapsed: start.elapsed(),
         reused: runner.reused,
         outputs: runner
             .done
             .into_iter()
-            .map(|(id, done)| (id, done.output))
+            .map(|(id, done)| (id, Arc::unwrap_or_clone(done.output)))
             .collect(),
         failed: runner.failed,
     }
 }
 
 struct Runner<'a> {
-    doc: &'a GraphDoc,
+    graph: GraphIndex<'a>,
     dirs: Dirs,
     http: &'a dyn Http,
     env: Env<'a>,
@@ -613,12 +616,47 @@ struct Runner<'a> {
     /// Nodes that failed this time (or could not run because an input did), so a later
     /// target does not try them again.
     errors: HashMap<String, String>,
-    /// Nodes on the current path, for cycle detection.
-    active: HashSet<String>,
     /// Nodes served from the cache.
     reused: Vec<String>,
     /// The first node whose own step failed.
     failed: Option<String>,
+}
+
+/// Index once so walking a deep graph does not rescan every node and edge at each step.
+struct GraphIndex<'a> {
+    nodes: HashMap<&'a str, &'a NodeDoc>,
+    upstream: HashMap<&'a str, Vec<&'a str>>,
+}
+
+impl<'a> GraphIndex<'a> {
+    fn new(doc: &'a GraphDoc) -> Self {
+        let mut nodes = HashMap::new();
+        for node in &doc.nodes {
+            nodes.entry(node.id.as_str()).or_insert(node);
+        }
+        let mut upstream: HashMap<&str, Vec<&str>> = HashMap::new();
+        for edge in &doc.edges {
+            upstream.entry(&edge.to).or_default().push(&edge.from);
+        }
+        for inputs in upstream.values_mut() {
+            inputs.sort_unstable();
+            inputs.dedup();
+        }
+        Self { nodes, upstream }
+    }
+
+    fn upstream(&self, id: &str) -> &[&'a str] {
+        self.upstream.get(id).map(Vec::as_slice).unwrap_or_default()
+    }
+
+    fn cover_upstream(&self, id: &'a str, covered: &mut HashSet<&'a str>) {
+        let mut pending = vec![id];
+        while let Some(id) = pending.pop() {
+            if covered.insert(id) {
+                pending.extend(self.upstream(id));
+            }
+        }
+    }
 }
 
 impl Runner<'_> {
@@ -648,25 +686,20 @@ impl Runner<'_> {
     }
 
     fn node(&self, id: &str) -> Result<&NodeDoc, String> {
-        self.doc
+        self.graph
             .nodes
-            .iter()
-            .find(|n| n.id == id)
+            .get(id)
+            .copied()
             .ok_or_else(|| format!("{id} is not in the graph"))
     }
 
     /// Ids of the nodes wired into `id`, in a stable order.
     fn upstream(&self, id: &str) -> Vec<String> {
-        let mut from: Vec<String> = self
-            .doc
-            .edges
+        self.graph
+            .upstream(id)
             .iter()
-            .filter(|e| e.to == id)
-            .map(|e| e.from.clone())
-            .collect();
-        from.sort();
-        from.dedup();
-        from
+            .map(|id| (*id).to_string())
+            .collect()
     }
 
     fn secret(&self, name: &str) -> Result<String, String> {
@@ -681,27 +714,85 @@ impl Runner<'_> {
         if let Some(e) = self.errors.get(id) {
             return Err(e.clone());
         }
-        if !self.active.insert(id.to_string()) {
-            return Err(format!("{id} is wired in a cycle"));
-        }
-        let result = self.run_fresh(id);
-        self.active.remove(id);
-        match &result {
-            Ok(done) => {
-                self.done.insert(id.to_string(), done.clone());
-            }
-            Err(e) => {
+        let order = match self.execution_order(id) {
+            Ok(order) => order,
+            Err((from, e)) => {
+                self.record_failure(&from, &e);
                 self.errors.insert(id.to_string(), e.clone());
-                // An upstream failure arrives here already attributed to its node.
-                if self.failed.is_none() {
-                    self.failed = Some(id.to_string());
-                    if e != CANCELLED {
-                        self.state(id, NodeState::Failed);
-                    }
+                return Err(e);
+            }
+        };
+        for step in order {
+            self.check_cancel()?;
+            if self.done.contains_key(&step) {
+                continue;
+            }
+            if let Some(e) = self.errors.get(&step).cloned() {
+                self.errors.insert(id.to_string(), e.clone());
+                return Err(e);
+            }
+            match self.run_fresh(&step) {
+                Ok(done) => {
+                    self.done.insert(step, done);
+                }
+                Err(e) => {
+                    self.record_failure(&step, &e);
+                    self.errors.insert(id.to_string(), e.clone());
+                    return Err(e);
                 }
             }
         }
-        result
+        self.done
+            .get(id)
+            .cloned()
+            .ok_or_else(|| format!("{id} did not run"))
+    }
+
+    fn record_failure(&mut self, id: &str, error: &str) {
+        if error != CANCELLED && !self.errors.contains_key(id) {
+            self.failed.get_or_insert_with(|| id.to_string());
+            self.state(id, NodeState::Failed);
+        }
+        self.errors.insert(id.to_string(), error.to_string());
+    }
+
+    /// Preflight the target's entire dependency graph before performing any step. An
+    /// explicit stack avoids overflowing the thread stack on long chains. The exit
+    /// marker produces the same stable upstream-first order as recursive traversal.
+    fn execution_order(&self, target: &str) -> Result<Vec<String>, (String, String)> {
+        let mut stack = vec![(target.to_string(), false)];
+        let mut active = HashSet::new();
+        let mut visited = HashSet::new();
+        let mut order = Vec::new();
+        while let Some((id, exiting)) = stack.pop() {
+            self.check_cancel().map_err(|e| (id.clone(), e))?;
+            if exiting {
+                active.remove(&id);
+                visited.insert(id.clone());
+                order.push(id);
+                continue;
+            }
+            if visited.contains(&id) {
+                continue;
+            }
+            if let Some(error) = self.errors.get(&id) {
+                return Err((id.clone(), error.clone()));
+            }
+            if self.done.contains_key(&id) {
+                visited.insert(id.clone());
+                order.push(id);
+                continue;
+            }
+            if !active.insert(id.clone()) {
+                return Err((id.clone(), format!("{id} is wired in a cycle")));
+            }
+            self.validate_node(&id).map_err(|e| (id.clone(), e))?;
+            stack.push((id.clone(), true));
+            for from in self.graph.upstream(&id).iter().rev() {
+                stack.push(((*from).to_string(), false));
+            }
+        }
+        Ok(order)
     }
 
     /// A node's name as a placeholder may use it: set and valid, else none.
@@ -710,8 +801,8 @@ impl Runner<'_> {
         validate::node_name(name).ok().map(|()| name.to_string())
     }
 
-    fn run_fresh(&mut self, id: &str) -> Result<Done, String> {
-        let node = self.node(id)?.clone();
+    fn validate_node(&self, id: &str) -> Result<(), String> {
+        let node = self.node(id)?;
         let Some(data) = &node.data else {
             return Err(format!("{id} is blank; give it content first"));
         };
@@ -726,11 +817,21 @@ impl Runner<'_> {
                 first.field, first.message
             ));
         }
+        Ok(())
+    }
 
+    fn run_fresh(&mut self, id: &str) -> Result<Done, String> {
+        let node = self.node(id)?.clone();
+        let data = node.data.as_ref().ok_or_else(|| format!("{id} is blank"))?;
         let upstream = self.upstream(id);
         let mut inputs = Vec::with_capacity(upstream.len());
         for from in &upstream {
-            inputs.push((from.clone(), self.run_node(from)?));
+            let done = self
+                .done
+                .get(from)
+                .cloned()
+                .ok_or_else(|| format!("{from} did not run"))?;
+            inputs.push((from.clone(), done));
         }
         self.log(format!(
             "{id}: {} ({}) with {} input{}",
@@ -791,13 +892,13 @@ impl Runner<'_> {
             self.state(id, NodeState::Reused);
             return Ok(Done {
                 key: content_key(data.node_type(), &output),
-                output,
+                output: Arc::new(output),
             });
         }
 
         self.check_cancel()?;
         self.state(id, NodeState::Running);
-        let outputs: Vec<Output> = inputs.into_iter().map(|(_, done)| done.output).collect();
+        let outputs: Vec<Arc<Output>> = inputs.into_iter().map(|(_, done)| done.output).collect();
         let output = match data {
             NodeData::Data(config) => self.run_data(config),
             NodeData::Script(config) => {
@@ -842,7 +943,7 @@ impl Runner<'_> {
         self.state(id, NodeState::Done);
         Ok(Done {
             key: content_key(data.node_type(), &output),
-            output,
+            output: Arc::new(output),
         })
     }
 
@@ -1281,21 +1382,47 @@ fn write_file_bytes(path: &Path, bytes: &[u8], mode: WriteMode) -> Result<(), St
         .map_err(|e| format!("write {}: {e}", path.display()))
 }
 
-/// What Run all starts from: every node with content that feeds no other node with
-/// content, in id order. Running them runs the whole graph.
+/// Start at every content sink, plus representatives of cyclic components that have
+/// no sink. Those representatives let Run all report cycles instead of omitting them.
 pub fn sinks(doc: &GraphDoc) -> Vec<String> {
-    let has_content = |id: &str| doc.nodes.iter().any(|n| n.id == id && n.data.is_some());
-    let mut sinks: Vec<&str> = doc
+    let graph = GraphIndex::new(doc);
+    let content: HashSet<&str> = doc
         .nodes
         .iter()
         .filter(|n| n.data.is_some())
-        .filter(|n| {
-            !doc.edges
-                .iter()
-                .any(|e| e.from == n.id && has_content(&e.to))
-        })
         .map(|n| n.id.as_str())
         .collect();
+    let mut next: HashMap<&str, &str> = HashMap::new();
+    for edge in &doc.edges {
+        if content.contains(edge.from.as_str()) && content.contains(edge.to.as_str()) {
+            let to = next.entry(&edge.from).or_insert(&edge.to);
+            *to = (*to).min(&edge.to);
+        }
+    }
+    let mut sinks: Vec<&str> = content
+        .iter()
+        .copied()
+        .filter(|id| !next.contains_key(id))
+        .collect();
+    let mut covered = HashSet::new();
+    for &sink in &sinks {
+        graph.cover_upstream(sink, &mut covered);
+    }
+    let mut remaining: Vec<&str> = content.into_iter().collect();
+    remaining.sort_by_key(|id| id_order(id));
+    for mut id in remaining {
+        if covered.contains(id) {
+            continue;
+        }
+        // Every uncovered node has a successor; follow it to a cycle, then cover
+        // everything feeding that cycle without turning its ancestors into targets.
+        let mut path = HashSet::new();
+        while path.insert(id) {
+            id = next[id];
+        }
+        sinks.push(id);
+        graph.cover_upstream(id, &mut covered);
+    }
     sinks.sort_by_key(|id| id_order(id));
     sinks.dedup();
     sinks.into_iter().map(str::to_string).collect()
@@ -1318,7 +1445,7 @@ struct Input {
     id: String,
     /// The node's name, when it has a valid one.
     name: Option<String>,
-    output: Output,
+    output: Arc<Output>,
 }
 
 /// An agent's prompt and message with their placeholders filled.
@@ -1338,7 +1465,7 @@ struct Filled {
 /// text.
 fn fill_agent(id: &str, config: &AgentConfig, inputs: &[Input]) -> Result<Filled, String> {
     let mut used: Vec<usize> = Vec::new();
-    let mut lookup = |hole: &str| -> Result<String, String> {
+    let mut lookup = |hole: &str| -> Result<&str, String> {
         let by_name: Vec<usize> = inputs
             .iter()
             .enumerate()
@@ -1382,10 +1509,26 @@ fn fill_agent(id: &str, config: &AgentConfig, inputs: &[Input]) -> Result<Filled
         if !used.contains(&index) {
             used.push(index);
         }
-        Ok(text.to_string())
+        Ok(text)
     };
-    let prompt = validate::render(&config.prompt, &mut lookup)?;
-    let message = validate::render(&config.message, &mut lookup)?;
+    let limit = context_bytes(config);
+    let over_context = |e: String| {
+        format!(
+            "{id}: {e}; prompt and input are over the context size of {}",
+            config.context_size
+        )
+    };
+    // Preserve lookup diagnostics; only size errors need the context explanation.
+    let render_error = |e| match e {
+        validate::RenderError::Limit(limit) => {
+            over_context(format!("text exceeds the {limit}-byte limit"))
+        }
+        validate::RenderError::Lookup(error) => error,
+    };
+    let prompt = validate::render(&config.prompt, limit, &mut lookup).map_err(render_error)?;
+    let remaining = limit - prompt.len();
+    let message =
+        validate::render(&config.message, remaining, &mut lookup).map_err(render_error)?;
 
     let mut rest: Vec<&str> = Vec::with_capacity(inputs.len());
     for (n, input) in inputs.iter().enumerate() {
@@ -1399,13 +1542,18 @@ fn fill_agent(id: &str, config: &AgentConfig, inputs: &[Input]) -> Result<Filled
             )
         })?);
     }
-    let rest = rest.join("\n\n");
+    let message = if message.trim().is_empty() {
+        String::new()
+    } else {
+        message
+    };
+    let rest = join_bounded(&rest, remaining - message.len()).map_err(over_context)?;
     let input = if message.trim().is_empty() {
         rest
     } else if rest.is_empty() {
         message
     } else {
-        format!("{message}\n\n{rest}")
+        join_bounded(&[&message, &rest], remaining).map_err(over_context)?
     };
     let note = (!used.is_empty()).then(|| {
         let parts: Vec<String> = inputs
@@ -1437,7 +1585,7 @@ fn fill_agent(id: &str, config: &AgentConfig, inputs: &[Input]) -> Result<Filled
 
 /// The upstream outputs as one text, blank-line separated. Binary output is an error:
 /// only a write-file node can take it, and only alone.
-fn join_text(id: &str, upstream: &[String], outputs: &[Output]) -> Result<String, String> {
+fn join_text(id: &str, upstream: &[String], outputs: &[Arc<Output>]) -> Result<String, String> {
     let mut texts = Vec::with_capacity(outputs.len());
     for (from, output) in upstream.iter().zip(outputs) {
         match output.as_text() {
@@ -1448,6 +1596,18 @@ fn join_text(id: &str, upstream: &[String], outputs: &[Output]) -> Result<String
                     output.label
                 ));
             }
+        }
+    }
+    join_bounded(&texts, MAX_INPUT_BYTES).map_err(|e| format!("{id}: combined input {e}"))
+}
+
+/// Count the complete join before allocating, including blank lines between empty inputs.
+fn join_bounded(texts: &[&str], limit: usize) -> Result<String, String> {
+    let mut len = texts.len().saturating_sub(1).saturating_mul(2);
+    for text in texts {
+        len = len.saturating_add(text.len());
+        if len > limit {
+            return Err(format!("text exceeds the {limit}-byte limit"));
         }
     }
     Ok(texts.join("\n\n"))
@@ -1614,10 +1774,14 @@ fn read_prefix(path: &Path, max: usize) -> Result<(Vec<u8>, bool), String> {
     Ok((bytes, cut))
 }
 
-/// Refuse to send a prompt and input that can't fit the agent's context window, at four
-/// characters per token.
+/// The byte budget used by the approximate four-bytes-per-token context check.
+fn context_bytes(config: &AgentConfig) -> usize {
+    (config.context_size as usize).saturating_mul(4)
+}
+
+/// Refuse to send a prompt and input that can't fit the agent's estimated context window.
 fn fits_context(config: &AgentConfig, input: &str) -> Result<(), String> {
-    let estimate = (config.prompt.len() + input.len()) / 4;
+    let estimate = config.prompt.len().saturating_add(input.len()).div_ceil(4);
     if estimate as u64 > u64::from(config.context_size) {
         return Err(format!(
             "prompt and input are about {estimate} tokens, over the context size of {}",
@@ -3862,6 +4026,80 @@ mod tests {
     }
 
     #[test]
+    fn expanded_prompts_messages_and_unclaimed_inputs_share_one_budget() {
+        let input = |id: &str, text: &str| Input {
+            id: id.into(),
+            name: None,
+            output: Arc::new(Output::new(text.as_bytes().to_vec(), true, "text")),
+        };
+        let mut config = AgentConfig {
+            prompt: "{{n0}}".into(),
+            message: "{{n1}}".into(),
+            context_size: 2,
+            ..fake_agent()
+        };
+        let inputs = [input("n0", "abcd"), input("n1", "efgh")];
+        let filled = fill_agent("n2", &config, &inputs).unwrap();
+        assert_eq!(filled.config.prompt, "abcd");
+        assert_eq!(filled.input, "efgh");
+        config.message.push('x');
+        assert!(
+            fill_agent("n2", &config, &inputs)
+                .err()
+                .unwrap()
+                .contains("context size")
+        );
+        config.prompt = "{{n0}}{{n0}}{{n0}}".into();
+        config.message.clear();
+        assert!(fill_agent("n2", &config, &inputs).is_err());
+
+        config.prompt.clear();
+        let inputs = [input("n0", "abcd"), input("n1", "ef")];
+        assert_eq!(
+            fill_agent("n2", &config, &inputs).unwrap().input,
+            "abcd\n\nef"
+        );
+        config.message = "x".into();
+        assert!(fill_agent("n2", &config, &inputs).is_err());
+
+        // A nonempty message needs its own separator before unclaimed inputs.
+        config.message = "abcdef".into();
+        assert!(fill_agent("n2", &config, &[input("n0", "x")]).is_err());
+        config.message = "abcde".into();
+        assert_eq!(
+            fill_agent("n2", &config, &[input("n0", "x")])
+                .unwrap()
+                .input,
+            "abcde\n\nx"
+        );
+        config.prompt = "12345678".into();
+        assert!(fits_context(&config, "").is_ok());
+        assert!(
+            fits_context(&config, "x").is_err(),
+            "round partial tokens up"
+        );
+    }
+
+    #[test]
+    fn combined_inputs_include_separators_in_the_limit() {
+        assert_eq!(join_bounded(&["", ""], 2).unwrap(), "\n\n");
+        assert!(join_bounded(&["", ""], 1).is_err());
+        assert_eq!(join_bounded(&["ab", "cd"], 6).unwrap(), "ab\n\ncd");
+        assert!(join_bounded(&["ab", "cd"], 5).is_err());
+        assert_eq!(join_bounded(&[], 0).unwrap(), "");
+
+        // One allocation is shared by both wires. Their aggregate would exceed the
+        // real limit even though each upstream output is individually within bounds.
+        let output = Arc::new(Output::new(vec![b'a'; MAX_INPUT_BYTES / 2], true, "text"));
+        let err =
+            join_text("n2", &["n0".into(), "n1".into()], &[output.clone(), output]).unwrap_err();
+        assert!(
+            err.contains("combined input") && err.contains("limit"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn agents_place_named_inputs_where_their_templates_say() {
         let root = scratch("named");
         fs::write(root.join("data/schema.txt"), "CREATE TABLE t(a)").unwrap();
@@ -4038,6 +4276,179 @@ mod tests {
         );
         assert!(report.reused.is_empty());
         assert_eq!(http.seen.lock().unwrap().len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn graph_preflight_rejects_cycles_and_invalid_dependencies_before_effects() {
+        let root = scratch("preflight");
+        fs::write(root.join("data/a.txt"), "payload").unwrap();
+        let http = FakeHttp::new(200, "{}");
+        let mut doc = graph(
+            vec![
+                node("n0", data("a.txt", DataFormat::Text)),
+                node(
+                    "n1",
+                    Some(NodeData::File(FileConfig {
+                        path: "written.txt".into(),
+                        ..FileConfig::default()
+                    })),
+                ),
+                node("n2", Some(NodeData::Agent(fake_agent()))),
+                node("n3", Some(NodeData::Agent(fake_agent()))),
+                node("n4", Some(NodeData::Agent(fake_agent()))),
+            ],
+            &[
+                ("n0", "n1"),
+                ("n1", "n4"),
+                ("n2", "n3"),
+                ("n3", "n2"),
+                ("n3", "n4"),
+            ],
+        );
+        for expected in ["cycle", "not valid", "not in the graph"] {
+            let report = run(&doc, "n4", Dirs::under(&root), &http, &with_key);
+            let error = report.result.unwrap_err();
+            assert!(error.contains(expected), "{error}");
+            assert!(report.outputs.is_empty());
+            assert!(!root.join("written.txt").exists());
+            assert!(http.seen.lock().unwrap().is_empty());
+            if expected == "cycle" {
+                doc.nodes[2].data = data("../outside.txt", DataFormat::Text);
+            } else {
+                doc.nodes.retain(|node| node.id != "n2");
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deep_graphs_run_without_recursive_stack_growth() {
+        let root = scratch("deep");
+        fs::write(root.join("data/a.txt"), "x").unwrap();
+        let mut doc = graph(Vec::new(), &[]);
+        for i in 0..4096 {
+            doc.nodes
+                .push(node(&format!("n{i}"), data("a.txt", DataFormat::Text)));
+            if i > 0 {
+                doc.edges.push(EdgeDoc {
+                    from: format!("n{}", i - 1),
+                    to: format!("n{i}"),
+                });
+            }
+        }
+        assert_eq!(sinks(&doc), ["n4095"]);
+        let http = FakeHttp::new(200, "{}");
+        let report = run(&doc, "n4095", Dirs::under(&root), &http, &no_env);
+        assert_eq!(report.result.unwrap().as_text(), Some("x"));
+        assert_eq!(report.outputs.len(), 4096);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn run_all_includes_components_without_sinks() {
+        let root = scratch("cycle-sinks");
+        fs::write(root.join("data/a.txt"), "x").unwrap();
+        let http = FakeHttp::new(200, "{}");
+        let doc = graph(
+            ["n0", "n1", "n2", "n3", "n9"]
+                .iter()
+                .map(|id| node(id, data("a.txt", DataFormat::Text)))
+                .collect(),
+            &[("n0", "n1"), ("n1", "n2"), ("n2", "n1"), ("n3", "n3")],
+        );
+        assert_eq!(sinks(&doc), ["n1", "n3", "n9"]);
+        let report = run_all_with(
+            &doc,
+            &sinks(&doc),
+            Dirs::under(&root),
+            &http,
+            &no_env,
+            &Control::default(),
+        );
+        assert!(report.result.unwrap_err().contains("cycle"));
+        assert_eq!(report.outputs.len(), 1);
+        assert!(report.outputs.contains_key("n9"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn independent_failures_each_get_a_failed_state() {
+        let root = scratch("failure-states");
+        let doc = graph(
+            ["n0", "n1"]
+                .iter()
+                .map(|id| node(id, data("missing.txt", DataFormat::Text)))
+                .collect(),
+            &[],
+        );
+        let http = FakeHttp::new(200, "{}");
+        let (control, seen) = recording_control();
+        let report = run_all_with(
+            &doc,
+            &sinks(&doc),
+            Dirs::under(&root),
+            &http,
+            &no_env,
+            &control,
+        );
+        assert!(report.result.is_err());
+        assert_eq!(report.failed.as_deref(), Some("n0"));
+        let failed: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|p| match p {
+                Progress::Node {
+                    id,
+                    state: NodeState::Failed,
+                } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(failed, ["n0", "n1"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cancellation_takes_precedence_over_an_earlier_target_failure() {
+        let root = scratch("failure-cancel");
+        let doc = graph(
+            ["n0", "n1"]
+                .iter()
+                .map(|id| node(id, data("missing.txt", DataFormat::Text)))
+                .collect(),
+            &[],
+        );
+        let http = FakeHttp::new(200, "{}");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let control = Control {
+            cancel,
+            progress: Some(Arc::new(move |p| {
+                if matches!(
+                    p,
+                    Progress::Node {
+                        state: NodeState::Failed,
+                        ..
+                    }
+                ) {
+                    flag.store(true, Ordering::Relaxed);
+                }
+            })),
+            ..Control::default()
+        };
+        let report = run_all_with(
+            &doc,
+            &sinks(&doc),
+            Dirs::under(&root),
+            &http,
+            &no_env,
+            &control,
+        );
+        assert_eq!(report.result.unwrap_err(), CANCELLED);
+        assert!(report.outputs.is_empty());
+        assert!(!report.log.iter().any(|line| line.starts_with("n1:")));
         fs::remove_dir_all(root).unwrap();
     }
 

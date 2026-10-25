@@ -230,9 +230,13 @@ initial check. The output lists what was written.
 
 ## Running nodes
 
-Press **Run** in the inspector. The executor runs the selected node's upstream nodes first
-(each once, in a stable order, refusing cycles), joins their text outputs with blank lines,
-and hands that to the node:
+Press **Run** in the inspector. The executor checks the target's complete dependency graph
+for cycles, missing nodes and invalid configurations before executing any of its steps.
+It then runs upstream nodes first (each once, in a stable order), joins their text outputs
+with blank lines, and hands that to the node. Combined text input is limited to 64 MB,
+including separators. Traversal uses an explicit stack so long chains do not exhaust the
+thread stack. Run all also checks cyclic components with no terminal node, and continues
+with independent targets after a failure:
 
 | Node | What runs | Takes from the wire | Produces |
 | --- | --- | --- | --- |
@@ -258,9 +262,11 @@ the upstream node ids in the key, so rewiring an input cannot reuse an answer wi
 different or missing placeholder binding.
 
 **Run all and the run history.** **Run all** picks every node with content that feeds no
-other node with content (the end nodes, in id order) and runs them in one pass: a node two
-of them share runs once, a failed node is not tried again for the next target, and a
-failed target does not stop the others. Every finished run is written to
+other node with content, plus a representative of each otherwise uncovered cyclic
+component. It runs these targets in id order in one pass: a node two of them share runs
+once, a failed node is not tried again for the next target, and a failed target does not
+stop the others. Cancellation stops the pass even after an earlier failure. Every
+finished run is written to
 `runs/<graph>/<timestamp>.json` with its log, outcome, targets, and for every node its
 state, its content at the time, the label and a 4000-character preview of its output, and
 the content key under which `cache/` holds the full bytes (outputs over 8 MB keep only the
@@ -306,8 +312,10 @@ this repository does.
 
 Agents send the prompt as the system message and the wire text as the user message; with
 nothing on the wire the prompt is the user message. Prompt plus input must fit the context
-size (estimated at four characters per token) or the run is refused before anything is
-sent. JSON output adds an instruction to the system prompt on every provider and is also
+size (estimated at four bytes per token, rounding up) or the run is refused before anything
+is sent. Template expansion checks that shared budget before copying each substitution;
+repeated placeholders and appended inputs count toward the same limit. JSON output adds
+an instruction to the system prompt on every provider and is also
 requested natively where the API has a flag (OpenAI-style `response_format`, which LM
 Studio only accepts in its `json_schema` form; Ollama `format`; Google
 `responseMimeType`). It is always validated and pretty-printed; fenced or chatty replies

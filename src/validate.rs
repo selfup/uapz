@@ -193,18 +193,29 @@ pub fn placeholders(template: &str) -> Vec<String> {
     found
 }
 
-/// The template with every placeholder replaced by what `lookup` returns for its name.
-/// The first lookup error ends the rendering.
-pub fn render(
+#[derive(Debug, PartialEq)]
+pub enum RenderError {
+    Lookup(String),
+    Limit(usize),
+}
+
+/// The template with every placeholder replaced by borrowed input text. Check the
+/// budget before copying each piece, including repeated placeholders.
+pub fn render<'a>(
     template: &str,
-    lookup: &mut dyn FnMut(&str) -> Result<String, String>,
-) -> Result<String, String> {
-    let mut out = String::with_capacity(template.len());
+    limit: usize,
+    lookup: &mut dyn FnMut(&str) -> Result<&'a str, String>,
+) -> Result<String, RenderError> {
+    let mut out = String::with_capacity(template.len().min(limit));
     for piece in pieces(template) {
-        match piece {
-            Piece::Text(text) => out.push_str(text),
-            Piece::Hole(name) => out.push_str(&lookup(name)?),
+        let text = match piece {
+            Piece::Text(text) => text,
+            Piece::Hole(name) => lookup(name).map_err(RenderError::Lookup)?,
+        };
+        if text.len() > limit.saturating_sub(out.len()) {
+            return Err(RenderError::Limit(limit));
         }
+        out.push_str(text);
     }
     Ok(out)
 }
@@ -1239,23 +1250,43 @@ mod tests {
 
         let filled = render(
             "A: {{a}}, B: {{ b }}, {{not a name}}, {{a}}",
+            100,
             &mut |name| match name {
-                "a" => Ok("1".into()),
-                "b" => Ok("2".into()),
+                "a" => Ok("1"),
+                "b" => Ok("2"),
                 other => Err(format!("no {other}")),
             },
         )
         .unwrap();
         assert_eq!(filled, "A: 1, B: 2, {{not a name}}, 1");
         assert_eq!(
-            render("x {{missing}}", &mut |n| Err(format!("no {n}"))).unwrap_err(),
-            "no missing"
+            render("x {{missing}}", 100, &mut |n| Err(format!("no {n}"))).unwrap_err(),
+            RenderError::Lookup("no missing".into())
         );
         assert_eq!(
-            render("plain {{ text", &mut |_| Ok(String::new())).unwrap(),
+            render("plain {{ text", 100, &mut |_| Ok("")).unwrap(),
             "plain {{ text"
         );
-        assert_eq!(render("", &mut |_| Ok(String::new())).unwrap(), "");
+        assert_eq!(render("", 0, &mut |_| Ok("")).unwrap(), "");
+    }
+
+    #[test]
+    fn template_expansion_stops_at_the_byte_budget() {
+        let mut calls = 0;
+        let err = render("{{x}}{{x}}{{x}}{{unreached}}", 8, &mut |_| {
+            calls += 1;
+            Ok("abcd")
+        })
+        .unwrap_err();
+        assert_eq!(err, RenderError::Limit(8));
+        assert_eq!(calls, 3, "stop as soon as another substitution cannot fit");
+        assert_eq!(
+            render("{{x}}{{x}}", 8, &mut |_| Ok("abcd")).unwrap(),
+            "abcdabcd"
+        );
+        assert!(render("é", 1, &mut |_| Ok("")).is_err());
+        assert!(render("plain", 4, &mut |_| Ok("")).is_err());
+        assert_eq!(render("{{empty}}", 0, &mut |_| Ok("")).unwrap(), "");
     }
 
     #[test]
