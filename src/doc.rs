@@ -305,10 +305,16 @@ const KEYWORDS: &[&str] = &[
 ];
 
 /// Build a document from the first mermaid block in `text`. Only node ids and `-->`
-/// style edges are read; positions come from a simple left-to-right layering.
+/// style edges are read, plus the label a node was drawn with; positions come from a
+/// simple left-to-right layering. The diagram is the fallback for a missing sidecar, so
+/// it carries no positions, pan or node data — those live in the `.json` next to it, and
+/// a file rebuilt from its diagram alone comes back laid out and blank.
 pub fn parse_markdown(text: &str) -> GraphDoc {
     let mut ids: Vec<String> = Vec::new();
     let mut edges: Vec<EdgeDoc> = Vec::new();
+    // The label each node was last drawn with, so a fallback load keeps the kind names
+    // the diagram already carries instead of dropping them.
+    let mut kinds: Vec<Option<String>> = Vec::new();
     let mut in_mermaid = false;
 
     for raw in text.lines() {
@@ -320,12 +326,16 @@ pub fn parse_markdown(text: &str) -> GraphDoc {
         if !in_mermaid {
             continue;
         }
-        let Some((from, to)) = parse_statement(line) else {
+        let Some((from, label, to)) = parse_statement(line) else {
             continue;
         };
-        push_unique(&mut ids, &from);
+        if push_unique(&mut ids, &from) {
+            kinds.push(label.filter(|label| !label.trim().is_empty()));
+        }
         if let Some(to) = to {
-            push_unique(&mut ids, &to);
+            if push_unique(&mut ids, &to) {
+                kinds.push(None);
+            }
             let edge = EdgeDoc { from, to };
             if !edges.contains(&edge) {
                 edges.push(edge);
@@ -341,34 +351,42 @@ pub fn parse_markdown(text: &str) -> GraphDoc {
         nodes: ids
             .into_iter()
             .zip(positions)
-            .map(|(id, (x, y))| NodeDoc {
+            .zip(kinds)
+            .map(|((id, (x, y)), kind)| NodeDoc {
                 id,
                 x,
                 y,
-                kind: None,
                 color: None,
                 data: None,
+                kind,
             })
             .collect(),
         edges,
     }
 }
 
-fn push_unique(ids: &mut Vec<String>, id: &str) {
+/// Add `id` if it is new; returns whether it was.
+fn push_unique(ids: &mut Vec<String>, id: &str) -> bool {
     if !ids.iter().any(|existing| existing == id) {
         ids.push(id.to_string());
+        true
+    } else {
+        false
     }
 }
 
-/// `a` or `a --> b`, tolerating node shapes like `a[" "]` and edge labels like `-->|yes|`.
-fn parse_statement(line: &str) -> Option<(String, Option<String>)> {
+/// `a` or `a[" "] --> b`, tolerating node shapes and edge labels like `-->|yes|`. The
+/// label is the quoted text inside the node's shape, if it has one.
+fn parse_statement(line: &str) -> Option<(String, Option<String>, Option<String>)> {
     if line.is_empty() || KEYWORDS.iter().any(|k| line.starts_with(k)) {
         return None;
     }
     let (from, rest) = take_ident(line)?;
-    let rest = skip_shape(rest.trim_start()).trim_start();
+    let shaped = rest.trim_start();
+    let (label, rest) = shape_label(shaped);
+    let rest = rest.trim_start();
     if !rest.starts_with(['-', '=', '.']) {
-        return Some((from, None));
+        return Some((from, label, None));
     }
     let rest = rest.trim_start_matches(['-', '=', '.', '>']).trim_start();
     // Arrow heads `--x` / `--o`, then an optional `|label|`.
@@ -381,7 +399,31 @@ fn parse_statement(line: &str) -> Option<(String, Option<String>)> {
         None => rest,
     };
     let (to, _) = take_ident(rest.trim_start())?;
-    Some((from, Some(to)))
+    Some((from, label, Some(to)))
+}
+
+/// The label a node's shape carries and the text after the shape. `a[" "]` is a blank
+/// node, `a["Agent"]` a labelled one, and a shape without quotes (`a[x]`) is no label.
+fn shape_label(s: &str) -> (Option<String>, &str) {
+    let rest = skip_shape(s);
+    // `skip_shape` hands back `s` itself only when there was no shape to skip.
+    if rest.len() == s.len() {
+        return (None, s);
+    }
+    // Everything from the first quote to the matching one is the label.
+    let Some(open) = s.find('"') else {
+        return (None, rest);
+    };
+    let body = &s[open + 1..];
+    let Some(close) = body.find('"') else {
+        return (None, rest);
+    };
+    (Some(mermaid_unquote(&body[..close])), rest)
+}
+
+/// `#quot;` back to `"`, the escape [`mermaid_label`] writes.
+fn mermaid_unquote(label: &str) -> String {
+    label.replace("#quot;", "\"")
 }
 
 fn take_ident(s: &str) -> Option<(String, &str)> {
@@ -580,6 +622,94 @@ mod tests {
         let md = "```mermaid\nflowchart LR\n    a --> b\n    b --> a\n```";
         let doc = parse_markdown(md);
         assert_eq!(doc.nodes.len(), 2);
+    }
+
+    #[test]
+    fn the_diagram_round_trips_through_its_own_parser() {
+        // What `save` writes is what a sidecar-less load reads back. Ids, edges and the
+        // kind labels have to survive; positions and pan do not, and are documented as
+        // living in the sidecar.
+        let doc = GraphDoc {
+            version: VERSION,
+            name: "demo".into(),
+            view: View {
+                pan_x: 123.0,
+                pan_y: 456.0,
+            },
+            nodes: vec![
+                NodeDoc {
+                    id: "n0".into(),
+                    x: 400.0,
+                    y: 250.0,
+                    kind: Some("My Agent".into()),
+                    color: None,
+                    data: None,
+                },
+                NodeDoc {
+                    id: "n1".into(),
+                    x: 900.0,
+                    y: 600.0,
+                    kind: None,
+                    color: None,
+                    data: None,
+                },
+            ],
+            edges: vec![EdgeDoc {
+                from: "n0".into(),
+                to: "n1".into(),
+            }],
+        };
+        let back = parse_markdown(&doc.markdown());
+        let ids: Vec<&str> = back.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, ["n0", "n1"], "ids survive the diagram");
+        assert_eq!(back.edges, doc.edges, "edges survive the diagram");
+        assert_eq!(
+            back.nodes[0].kind.as_deref(),
+            Some("My Agent"),
+            "the label a node was drawn with survives"
+        );
+        // A blank node carries no label, and does not gain one.
+        assert_eq!(back.nodes[1].kind, None);
+        // The layout is the fallback's own, not the saved canvas positions.
+        assert_ne!(back.nodes[0].x, doc.nodes[0].x);
+        assert_eq!(back.nodes[0].y, back.nodes[1].y, "laid out in one row");
+    }
+
+    #[test]
+    fn kind_labels_round_trip_through_their_escaping() {
+        // `mermaid()` escapes a quote as `#quot;`; the reader must undo it, or a kind
+        // named with a quote would come back with the escape left in its name.
+        let doc = GraphDoc {
+            version: VERSION,
+            name: "q".into(),
+            view: View::default(),
+            nodes: vec![NodeDoc {
+                id: "n0".into(),
+                x: 0.0,
+                y: 0.0,
+                kind: Some(r#"a "quoted" name"#.into()),
+                color: None,
+                data: None,
+            }],
+            edges: vec![],
+        };
+        let text = doc.markdown();
+        assert!(text.contains("a #quot;quoted#quot; name"), "{text}");
+        let back = parse_markdown(&text);
+        assert_eq!(back.nodes[0].kind.as_deref(), Some(r#"a "quoted" name"#));
+    }
+
+    #[test]
+    fn unquoted_shapes_and_shapes_without_labels_are_tolerated() {
+        let doc = parse_markdown(
+            "```mermaid\nflowchart LR\n    a[x]\n    b((round))\n    c{\"c\"}\n    a --> b\n```",
+        );
+        let ids: Vec<&str> = doc.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b", "c"]);
+        // Only the quoted one is a label.
+        assert_eq!(doc.nodes[2].kind.as_deref(), Some("c"));
+        assert_eq!(doc.nodes[0].kind, None);
+        assert_eq!(doc.nodes[1].kind, None);
     }
 
     #[test]

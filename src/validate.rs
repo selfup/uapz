@@ -283,20 +283,25 @@ pub fn resolve_directory_inside(root: &Path, raw: &str) -> Result<PathBuf, Strin
 /// agent, prompt, database preset, kind or graph. Pure: the file need not exist.
 pub fn writable_path(raw: &str) -> Result<PathBuf, String> {
     let rel = relative_path(raw)?;
+    reserved_dir(&rel).map_or(Ok(rel), |reserved| {
+        Err(format!(
+            "`{reserved}/` is managed by the app; nodes can't write into it"
+        ))
+    })
+}
+
+/// The first component of `rel` when it names a directory the app owns, compared without
+/// case so a case-insensitive filesystem can't be talked around.
+fn reserved_dir(rel: &Path) -> Option<&'static str> {
     let first = rel
         .components()
         .next()
         .and_then(|c| c.as_os_str().to_str())
         .unwrap_or_default();
-    if let Some(reserved) = crate::library::RESERVED_DIRS
+    crate::library::RESERVED_DIRS
         .iter()
+        .copied()
         .find(|d| d.eq_ignore_ascii_case(first))
-    {
-        return Err(format!(
-            "`{reserved}/` is managed by the app; nodes can't write into it"
-        ));
-    }
-    Ok(rel)
 }
 
 /// Resolve a file that may not exist yet inside `root`: the deepest existing ancestor is
@@ -309,9 +314,20 @@ pub fn resolve_new_inside(root: &Path, rel: &Path) -> Result<PathBuf, String> {
         .map_err(|e| format!("{}: {e}", root.display()))?;
     let path = root.join(rel);
     if path.symlink_metadata().is_ok() {
-        let real = path
-            .canonicalize()
-            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let real = path.canonicalize().map_err(|e| {
+            // A link whose target is missing: what would be written is the target, and
+            // that can't be proven to stay inside the root, so it is refused. Writing to
+            // the target directly is the way through.
+            if path.is_symlink() {
+                format!(
+                    "{} is a symlink whose target does not exist; write to the target instead \
+                     ({e})",
+                    rel.display()
+                )
+            } else {
+                format!("{}: {e}", path.display())
+            }
+        })?;
         if !real.starts_with(&root) {
             return Err(format!(
                 "{} resolves to {}, outside {}",
@@ -683,9 +699,36 @@ enum Tok {
     Other,
 }
 
+/// Commands the MySQL client reads from a statement's first line before SQL: they reach
+/// the filesystem, another server or this machine, exactly like the backslash commands of
+/// `psql` and the dot commands of `sqlite3`.
+const MYSQL_CLIENT_COMMANDS: &[&str] = &[
+    "system",
+    "source",
+    "tee",
+    "notee",
+    "pager",
+    "nopager",
+    "edit",
+    "connect",
+    "charset",
+    "delimiter",
+    "prompt",
+    "rehash",
+    "warnings",
+    "status",
+    "ego",
+    "print",
+    "help",
+    "clear",
+    "exit",
+    "quit",
+];
+
 /// Check a SQL query before it reaches an engine. Always: non-empty, bounded, exactly one
-/// statement, no MySQL executable comments, no words from [`BLOCKED_WORDS`]. With
-/// `read_only`: must start with a read statement and contain no [`WRITE_WORDS`].
+/// statement, no MySQL executable comments, no words from [`BLOCKED_WORDS`], and no client
+/// meta-command ([`shell_metacharacters`]). With `read_only`: must start with a read
+/// statement and contain no [`WRITE_WORDS`].
 ///
 /// Quoted identifiers are scanned like bare ones because `"pg_read_file"(...)` is a valid
 /// call, and `/* */` comments end at the first `*/` because that is what the engines that
@@ -701,6 +744,16 @@ pub fn sql(query: &str, read_only: bool) -> Result<(), String> {
     if q.contains('\0') {
         return Err("query contains a NUL byte".into());
     }
+    if let Some(bad) = q
+        .chars()
+        .find(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+    {
+        return Err(format!(
+            "query contains the control character U+{:04X}",
+            bad as u32
+        ));
+    }
+    shell_metacharacters(q)?;
     let toks = tokenize(q)?;
     if let Some(i) = toks.iter().position(|t| *t == Tok::Semicolon)
         && i + 1 != toks.len()
@@ -736,6 +789,91 @@ pub fn sql(query: &str, read_only: bool) -> Result<(), String> {
             "`{}` is not allowed: it reaches outside the database",
             w.to_uppercase()
         ));
+    }
+    // Client commands begin a line, so `SELECT source FROM t` stays legal while a line of
+    // its own naming one reaches the shell instead of the engine.
+    for line in q.lines() {
+        let first = line.split_whitespace().next().unwrap_or_default();
+        if let Some(command) = MYSQL_CLIENT_COMMANDS
+            .iter()
+            .find(|c| first.eq_ignore_ascii_case(c))
+        {
+            return Err(format!(
+                "`{}` is not allowed: the client runs it on this machine, not the database",
+                command.to_uppercase()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Reject what a database client would read as its own command instead of SQL: `psql`
+/// takes `\` anywhere on a line (`SELECT 1 \! rm -rf ~` runs a shell), `sqlite3` takes a
+/// dot command at the start of one, and both are fed the query as stdin. Strings,
+/// identifiers and comments are stepped over, so `'\d'` and `-- .help` stay legal.
+fn shell_metacharacters(q: &str) -> Result<(), String> {
+    let chars: Vec<char> = q.chars().collect();
+    let mut i = 0;
+    // Whether everything before `i` on this line is whitespace, which is where `sqlite3`
+    // reads a dot command.
+    let mut line_start = true;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        match c {
+            '\'' => {
+                line_start = false;
+                i = skip_string(&chars, i + 1)?;
+            }
+            '"' | '`' | '[' => {
+                line_start = false;
+                let close = if c == '[' { ']' } else { c };
+                let (_, end) = take_quoted_ident(&chars, i + 1, close)?;
+                i = end;
+            }
+            '-' if next == Some('-') => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '/' if next == Some('*') => {
+                i += 2;
+                loop {
+                    match (chars.get(i), chars.get(i + 1)) {
+                        (None, _) => return Err("unterminated comment".into()),
+                        (Some('*'), Some('/')) => {
+                            i += 2;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                line_start = false;
+            }
+            '\n' | '\r' => {
+                line_start = true;
+                i += 1;
+            }
+            c if c.is_whitespace() => i += 1,
+            '\\' => {
+                return Err(
+                    "query contains `\\`, which the database client runs as its own command; \
+                     use the query, not a client command"
+                        .into(),
+                );
+            }
+            '.' if line_start => {
+                return Err(
+                    "query has a line starting with `.`, which the database client runs as its \
+                     own command"
+                        .into(),
+                );
+            }
+            _ => {
+                line_start = false;
+                i += 1;
+            }
+        }
     }
     Ok(())
 }
@@ -1044,6 +1182,78 @@ mod tests {
         assert!(sql("SELECT * FROM read_parquet('x')", false).is_err());
         assert!(sql("LOAD httpfs", false).is_err());
         assert!(sql("GRANT ALL ON t TO u", false).is_err());
+    }
+
+    #[test]
+    fn client_commands_never_reach_the_shell() {
+        // Every one of these is fed to the client as stdin, and each client runs its own
+        // commands from there: psql takes `\` anywhere on a line, sqlite3 a dot command at
+        // the start of one, mysql a word on the first line. All are refused either way.
+        for bad in [
+            // psql: mid-line backslash, before and after the statement is complete.
+            "SELECT 1 \\! touch /tmp/pwned",
+            "SELECT 1\n\\! touch /tmp/pwned",
+            "SELECT 1 \n\\! id",
+            "SELECT * FROM t \\gset",
+            "SELECT 1 \\x",
+            "SELECT 1 \\o /tmp/out",
+            "SELECT 1 \\q",
+            "WITH x AS (SELECT 1) SELECT * FROM x \n\\! id",
+            // sqlite3: dot commands, including after a finished statement.
+            "SELECT 1\n.shell touch /tmp/pwned",
+            "SELECT 1;\n.shell touch /tmp/pwned;\n",
+            "SELECT 1\n.read /etc/passwd",
+            "SELECT 1\n.output /tmp/out",
+            "SELECT 1\n.import /etc/passwd x",
+            "SELECT 1\n.once /tmp/x",
+            "SELECT 1\n.log /tmp/x",
+            // mysql client commands.
+            "SELECT 1;\nsystem touch /tmp/pwned",
+            "source /etc/passwd",
+            "tee /tmp/out",
+            // A NUL and stray control characters are never part of a statement.
+            "SELECT 1\x07",
+            "SELECT\x1b[31m 1",
+        ] {
+            assert!(sql(bad, true).is_err(), "{bad:?} should be rejected");
+            assert!(
+                sql(bad, false).is_err(),
+                "{bad:?} must be refused even unsigned"
+            );
+        }
+    }
+
+    #[test]
+    fn client_command_lookalikes_inside_sql_stay_legal() {
+        for ok in [
+            // A backslash or a dot inside a literal, identifier or comment is inert.
+            r"SELECT '\d' AS slash",
+            "SELECT 'a.b' FROM t",
+            "SELECT * FROM t -- .help and \\! are not commands in a comment",
+            "SELECT * FROM t /* \\! .shell */",
+            "SELECT \"weird.name\" FROM t",
+            // A column or table that happens to be called like a command, mid-statement.
+            "SELECT source FROM t",
+            "SELECT tee FROM t",
+            "SELECT system FROM t",
+            // A dot that starts neither a line nor a command.
+            "SELECT t.x FROM t",
+            "SELECT .5 + 1.5",
+        ] {
+            assert!(sql(ok, true).is_ok(), "{ok}: {:?}", sql(ok, true));
+        }
+    }
+
+    #[test]
+    fn shell_metacharacters_step_over_quotes_and_comments() {
+        assert!(shell_metacharacters("SELECT 1").is_ok());
+        assert!(shell_metacharacters("SELECT 'it''s' , \"a\\b\"").is_ok());
+        assert!(shell_metacharacters("SELECT 1 \\").is_err());
+        assert!(shell_metacharacters(".x").is_err());
+        assert!(shell_metacharacters("  .x").is_err());
+        assert!(shell_metacharacters("SELECT 1\r\\.x").is_err());
+        assert!(shell_metacharacters("SELECT 1.5").is_ok());
+        assert!(shell_metacharacters("SELECT 'unterminated").is_err());
     }
 
     #[test]
