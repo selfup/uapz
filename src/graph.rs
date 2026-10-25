@@ -34,6 +34,23 @@ pub type NodeId = usize;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GraphEvent {
     SelectionChanged,
+    /// The whole graph was replaced or cleared; anything remembered per node id is stale.
+    Replaced,
+}
+
+/// Where a node stands in the latest run, shown as a dot in its corner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mark {
+    /// Part of the run, waiting for its inputs.
+    Pending,
+    /// Its own step is going on now.
+    Running,
+    /// Ran and produced output.
+    Ran,
+    /// Served from the cache.
+    Reused,
+    /// Its own step failed.
+    Failed,
 }
 
 impl EventEmitter<GraphEvent> for Graph {}
@@ -140,6 +157,9 @@ struct Palette {
     port_ring: Hsla,
     wire: Hsla,
     text: Hsla,
+    ran: Hsla,
+    reused: Hsla,
+    failed: Hsla,
 }
 
 pub struct Graph {
@@ -153,6 +173,8 @@ pub struct Graph {
     canvas: Bounds<Pixels>,
     /// Custom blank node kinds by name, for resolving node colors.
     kinds: HashMap<String, Hsla>,
+    /// Run outcomes per node, drawn as a dot in the node's corner.
+    marks: HashMap<NodeId, Mark>,
     current: Current,
     next_id: NodeId,
     pub(crate) focus_handle: FocusHandle,
@@ -168,6 +190,7 @@ impl Graph {
             pan: Point::default(),
             canvas: Bounds::default(),
             kinds: HashMap::new(),
+            marks: HashMap::new(),
             current: Current::Blank,
             next_id: 0,
             focus_handle: cx.focus_handle(),
@@ -404,6 +427,12 @@ impl Graph {
         cx.notify();
     }
 
+    /// Replace the run marks: the dots describe one run, the latest.
+    pub fn set_marks(&mut self, marks: HashMap<NodeId, Mark>, cx: &mut Context<Self>) {
+        self.marks = marks;
+        cx.notify();
+    }
+
     /// Choose what Add node, cmd-n and double-click create.
     pub fn set_current(&mut self, current: Current, cx: &mut Context<Self>) {
         self.current = current;
@@ -541,6 +570,8 @@ impl Graph {
         self.pan = point(px(doc.view.pan_x), px(doc.view.pan_y));
         self.selection = None;
         self.drag = None;
+        self.marks.clear();
+        cx.emit(GraphEvent::Replaced);
         cx.emit(GraphEvent::SelectionChanged);
         cx.notify();
     }
@@ -551,6 +582,8 @@ impl Graph {
         self.selection = None;
         self.drag = None;
         self.pan = Point::default();
+        self.marks.clear();
+        cx.emit(GraphEvent::Replaced);
         cx.emit(GraphEvent::SelectionChanged);
         cx.notify();
     }
@@ -700,6 +733,26 @@ impl Graph {
                 )
             });
 
+        // The latest run's state, as a dot in the top-right corner: hollow while waiting,
+        // the accent while running, then green ran, grey reused or red failed.
+        let mark = self.marks.get(&id).map(|mark| {
+            let dot = div()
+                .absolute()
+                .top(px(5.0))
+                .right(px(5.0))
+                .w(px(9.0))
+                .h(px(9.0))
+                .rounded_full()
+                .border_1();
+            match mark {
+                Mark::Pending => dot.border_color(c.reused).bg(c.port_ring),
+                Mark::Running => dot.border_color(c.port_ring).bg(c.accent),
+                Mark::Ran => dot.border_color(c.port_ring).bg(c.ran),
+                Mark::Reused => dot.border_color(c.port_ring).bg(c.reused),
+                Mark::Failed => dot.border_color(c.port_ring).bg(c.failed),
+            }
+        });
+
         div()
             .id(("node", id))
             .absolute()
@@ -716,6 +769,7 @@ impl Graph {
                 }),
             )
             .child(body)
+            .children(mark)
             // Input port: a drop target, so it only needs to look right.
             .child(port(is_target).left(px(-PORT_R)))
             // Output port: where wires start.
@@ -746,6 +800,9 @@ impl Render for Graph {
             port_ring: theme.background,
             wire: theme.muted_foreground,
             text: theme.muted_foreground,
+            ran: theme.success,
+            reused: theme.muted_foreground,
+            failed: theme.danger,
         };
         let panning = matches!(self.drag, Some(Drag::Pan { .. }));
 

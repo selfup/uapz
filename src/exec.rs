@@ -30,13 +30,14 @@
 //! their inputs' outputs and (for scripts) the script file itself; data, directory,
 //! database and write-file nodes always run, since they read or change live state. Every
 //! node's output is hashed for the nodes after it, so an edit that leaves an output the
-//! same leaves everything downstream cached.
+//! same leaves everything downstream cached. A persistent cache also keeps every entry
+//! under `cache/` as `<key>.json` + `<key>.bin`, so a restart does not re-call anything;
+//! keys are content hashes, stable across runs and builds.
 //!
 //! [`write_sql`] is the inspector's helper: it describes the database's schema with
 //! [`describe_schema`] and asks an agent for one statement.
 
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 use std::io::{BufRead, Read, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -46,6 +47,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
 
 use crate::doc::{GraphDoc, NodeDoc};
 use crate::library;
@@ -71,15 +74,21 @@ const MAX_DIRECTORY_DEPTH: usize = 32;
 pub const CANCELLED: &str = "the run was cancelled";
 /// For callers that have no cancel flag.
 static NEVER: AtomicBool = AtomicBool::new(false);
+/// The on-disk cache is pruned, oldest first, past this many bytes.
+pub const MAX_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
+/// Most files one bundled write-file answer may create.
+pub const MAX_BUNDLE_FILES: usize = 500;
 
 /// Where the executor looks for files and writes outputs. `root` is the working
-/// directory, which directory nodes read.
+/// directory, which directory nodes read and write-file nodes write under.
 #[derive(Clone, Debug)]
 pub struct Dirs {
     pub root: PathBuf,
     pub data: PathBuf,
     pub scripts: PathBuf,
     pub agents: PathBuf,
+    /// Where a persistent [`Cache`] keeps its entries.
+    pub cache: PathBuf,
 }
 
 impl Dirs {
@@ -94,6 +103,7 @@ impl Dirs {
             data: root.join(library::DATA_DIR),
             scripts: root.join(library::SCRIPTS_DIR),
             agents: root.join(library::AGENTS_DIR),
+            cache: root.join(library::CACHE_DIR),
         }
     }
 }
@@ -136,8 +146,14 @@ pub struct Report {
     pub log: Vec<String>,
     pub result: Result<Output, String>,
     pub elapsed: Duration,
-    /// How many nodes were served from the cache instead of running.
-    pub cached: usize,
+    /// The nodes served from the cache instead of running, by document id.
+    pub reused: Vec<String>,
+    /// The output of every node that ran or was found in the cache, by document id, so
+    /// the UI can show upstream outputs and not only the target's.
+    pub outputs: HashMap<String, Output>,
+    /// The node whose own step failed when `result` is an error: the deepest one, not the
+    /// nodes that failed only because it did.
+    pub failed: Option<String>,
 }
 
 /// Something that happened during a run, delivered as it happens.
@@ -147,41 +163,215 @@ pub enum Progress {
     Log(String),
     /// A piece of text an agent streamed back. `id` is the node producing it.
     Text { id: String, text: String },
+    /// A node changed state, so a canvas can show the run moving.
+    Node { id: String, state: NodeState },
 }
 
-/// Outputs from earlier runs, by node id. An entry is reused only when its key, built
-/// from the node's configuration and everything upstream, still matches.
-#[derive(Clone, Debug, Default)]
+/// Where a node is in the run. A node that is never reached (an upstream failure, a
+/// cancel) gets no state at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeState {
+    /// Its inputs are ready and its own step has started.
+    Running,
+    /// Its own step finished with output.
+    Done,
+    /// Its output came from the cache; it never ran.
+    Reused,
+    /// Its own step failed (not a cancel).
+    Failed,
+}
+
+/// A content hash: the key an agent's or script's output is cached under, and what a
+/// node's output contributes to the keys of the nodes after it.
+pub type Key = u128;
+
+/// Outputs from earlier runs. In memory they are kept by node id and reused only when the
+/// key, built from the node's configuration and everything upstream, still matches. A
+/// persistent cache also keeps every entry on disk by key alone, so another graph or a
+/// later session asking the same question of the same inputs gets the same answer back.
+#[derive(Debug, Default)]
 pub struct Cache {
     entries: HashMap<String, Entry>,
+    /// Where entries also live on disk.
+    dir: Option<PathBuf>,
+    /// Entries on disk, counted when the cache opens and kept current after.
+    on_disk: usize,
 }
 
 #[derive(Clone, Debug)]
 struct Entry {
-    key: u64,
+    key: Key,
     output: Output,
+}
+
+/// The sidecar of an on-disk entry; the bytes are in the `.bin` next to it.
+#[derive(Serialize, Deserialize)]
+struct Meta {
+    label: String,
+    text: bool,
+    saved: Option<PathBuf>,
+    /// When it was stored, for people reading the directory.
+    stored: String,
 }
 
 #[allow(clippy::len_without_is_empty)]
 impl Cache {
+    /// A cache that also keeps its entries under `dir`, created on first store.
+    pub fn persistent(dir: PathBuf) -> Self {
+        let on_disk = std::fs::read_dir(&dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+                    .count()
+            })
+            .unwrap_or(0);
+        Self {
+            entries: HashMap::new(),
+            dir: Some(dir),
+            on_disk,
+        }
+    }
+
+    /// How many outputs are kept: on disk for a persistent cache, else in memory.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        match &self.dir {
+            Some(_) => self.on_disk,
+            None => self.entries.len(),
+        }
     }
 
     pub fn clear(&mut self) {
         self.entries.clear();
+        if let Some(dir) = &self.dir
+            && let Ok(entries) = std::fs::read_dir(dir)
+        {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path
+                    .extension()
+                    .is_some_and(|x| x == "json" || x == "bin" || x == "tmp")
+                {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+        self.on_disk = 0;
     }
 
-    fn lookup(&self, id: &str, key: u64) -> Option<Output> {
-        self.entries
+    fn lookup(&mut self, id: &str, key: Key) -> Option<Output> {
+        if let Some(output) = self
+            .entries
             .get(id)
             .filter(|e| e.key == key)
             .map(|e| e.output.clone())
+        {
+            return Some(output);
+        }
+        let output = self.read(key)?;
+        self.entries.insert(
+            id.to_string(),
+            Entry {
+                key,
+                output: output.clone(),
+            },
+        );
+        Some(output)
     }
 
-    fn store(&mut self, id: &str, key: u64, output: Output) {
+    fn store(&mut self, id: &str, key: Key, output: Output) {
+        if let Err(e) = self.write(key, &output) {
+            // A full or read-only disk costs persistence, not the run.
+            eprintln!("cache: {e}");
+        }
         self.entries.insert(id.to_string(), Entry { key, output });
     }
+
+    fn paths(&self, key: Key) -> Option<(PathBuf, PathBuf)> {
+        let dir = self.dir.as_ref()?;
+        Some((
+            dir.join(format!("{key:032x}.json")),
+            dir.join(format!("{key:032x}.bin")),
+        ))
+    }
+
+    fn read(&self, key: Key) -> Option<Output> {
+        let (meta_path, bin_path) = self.paths(key)?;
+        let meta: Meta = serde_json::from_slice(&std::fs::read(meta_path).ok()?).ok()?;
+        let bytes = std::fs::read(bin_path).ok()?;
+        Some(Output {
+            text: meta.text && std::str::from_utf8(&bytes).is_ok(),
+            bytes,
+            label: meta.label,
+            saved: meta.saved,
+        })
+    }
+
+    fn write(&mut self, key: Key, output: &Output) -> Result<(), String> {
+        let Some((meta_path, bin_path)) = self.paths(key) else {
+            return Ok(());
+        };
+        let dir = self.dir.clone().unwrap_or_default();
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        let fresh = !meta_path.exists();
+        write_atomically(&bin_path, &output.bytes)?;
+        let meta = Meta {
+            label: output.label.clone(),
+            text: output.text,
+            saved: output.saved.clone(),
+            stored: library::timestamp(),
+        };
+        let json = serde_json::to_vec_pretty(&meta).map_err(|e| e.to_string())?;
+        write_atomically(&meta_path, &json)?;
+        if fresh {
+            self.on_disk += 1;
+        }
+        self.prune(&dir);
+        Ok(())
+    }
+
+    /// Drop the oldest entries while the directory is over [`MAX_CACHE_BYTES`].
+    fn prune(&mut self, dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        // (modified, key stem, size) per `.bin`.
+        let mut bins: Vec<(std::time::SystemTime, PathBuf, u64)> = entries
+            .flatten()
+            .filter_map(|e| {
+                let path = e.path();
+                (path.extension()? == "bin").then_some(())?;
+                let meta = e.metadata().ok()?;
+                Some((
+                    meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+                    path,
+                    meta.len(),
+                ))
+            })
+            .collect();
+        let mut total: u64 = bins.iter().map(|b| b.2).sum();
+        if total <= MAX_CACHE_BYTES {
+            return;
+        }
+        bins.sort_by_key(|b| b.0);
+        for (_, path, size) in bins {
+            if total <= MAX_CACHE_BYTES {
+                break;
+            }
+            let _ = std::fs::remove_file(path.with_extension("json"));
+            let _ = std::fs::remove_file(&path);
+            total = total.saturating_sub(size);
+            self.on_disk = self.on_disk.saturating_sub(1);
+        }
+        // Memory entries whose files went away are still correct outputs; keep them.
+    }
+}
+
+/// Write through a temporary file and rename, so a reader never sees half a file.
+fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename {}: {e}", path.display()))
 }
 
 /// What the caller holds while a run is in flight. The default caches nothing, is never
@@ -209,7 +399,7 @@ impl Control {
 #[derive(Clone, Debug)]
 struct Done {
     output: Output,
-    key: u64,
+    key: Key,
 }
 
 fn lock(cache: &Mutex<Cache>) -> std::sync::MutexGuard<'_, Cache> {
@@ -217,13 +407,32 @@ fn lock(cache: &Mutex<Cache>) -> std::sync::MutexGuard<'_, Cache> {
 }
 
 /// One key over several byte strings, with lengths mixed in so the boundaries count.
-fn key_of(parts: &[&[u8]]) -> u64 {
-    let mut hasher = std::hash::DefaultHasher::new();
-    for part in parts {
-        part.len().hash(&mut hasher);
-        hasher.write(part);
-    }
-    hasher.finish()
+/// Two FNV-1a passes, one forwards and one backwards, give a stable 128-bit key that
+/// does not depend on the standard library's hasher.
+fn key_of(parts: &[&[u8]]) -> Key {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let fnv = |mut h: u64, bytes: &mut dyn Iterator<Item = u8>| {
+        for byte in bytes {
+            h = (h ^ u64::from(byte)).wrapping_mul(PRIME);
+        }
+        h
+    };
+    let forwards = parts.iter().flat_map(|p| {
+        (p.len() as u64)
+            .to_le_bytes()
+            .into_iter()
+            .chain(p.iter().copied())
+    });
+    let backwards = parts.iter().rev().flat_map(|p| {
+        p.iter()
+            .rev()
+            .copied()
+            .chain((p.len() as u64).to_le_bytes())
+    });
+    let a = fnv(OFFSET, &mut { forwards });
+    let b = fnv(OFFSET ^ 0x9e37_79b9_7f4a_7c15, &mut { backwards });
+    (Key::from(a) << 64) | Key::from(b)
 }
 
 /// Looks up an environment variable. The real one is [`process_env`]; tests inject keys.
@@ -252,14 +461,21 @@ pub fn run_with(
         log: Vec::new(),
         done: HashMap::new(),
         active: HashSet::new(),
-        cached: 0,
+        reused: Vec::new(),
+        failed: None,
     };
     let result = runner.run_node(id).map(|done| done.output);
     Report {
         log: runner.log,
         result,
         elapsed: start.elapsed(),
-        cached: runner.cached,
+        reused: runner.reused,
+        outputs: runner
+            .done
+            .into_iter()
+            .map(|(id, done)| (id, done.output))
+            .collect(),
+        failed: runner.failed,
     }
 }
 
@@ -274,7 +490,10 @@ struct Runner<'a> {
     done: HashMap<String, Done>,
     /// Nodes on the current path, for cycle detection.
     active: HashSet<String>,
-    cached: usize,
+    /// Nodes served from the cache.
+    reused: Vec<String>,
+    /// The first node whose own step failed.
+    failed: Option<String>,
 }
 
 impl Runner<'_> {
@@ -291,6 +510,15 @@ impl Runner<'_> {
             Err(CANCELLED.into())
         } else {
             Ok(())
+        }
+    }
+
+    fn state(&self, id: &str, state: NodeState) {
+        if let Some(progress) = &self.control.progress {
+            progress(Progress::Node {
+                id: id.to_string(),
+                state,
+            });
         }
     }
 
@@ -330,8 +558,18 @@ impl Runner<'_> {
         }
         let result = self.run_fresh(id);
         self.active.remove(id);
-        if let Ok(done) = &result {
-            self.done.insert(id.to_string(), done.clone());
+        match &result {
+            Ok(done) => {
+                self.done.insert(id.to_string(), done.clone());
+            }
+            // An upstream failure arrives here already attributed to its node.
+            Err(e) if self.failed.is_none() => {
+                self.failed = Some(id.to_string());
+                if e != CANCELLED {
+                    self.state(id, NodeState::Failed);
+                }
+            }
+            Err(_) => {}
         }
         result
     }
@@ -376,7 +614,7 @@ impl Runner<'_> {
             .map(|(_, done)| done.key.to_le_bytes().to_vec())
             .collect();
         let cache_key = match data {
-            NodeData::Agent(_) => Some(cache_key(&config_json, name.as_bytes(), &upstream_keys)),
+            NodeData::Agent(_) => Some(cache_key(&config_json, b"", &upstream_keys)),
             NodeData::Script(config) => {
                 let path = validate::resolve_inside(&self.dirs.scripts, &config.path)?;
                 let source = read_bounded(&path, MAX_FILE_BYTES)?;
@@ -393,13 +631,16 @@ impl Runner<'_> {
             && let Some(output) = lock(cache).lookup(id, key)
         {
             self.log(format!("{id}: reused the cached {}", output.label));
-            self.cached += 1;
+            self.reused.push(id.to_string());
+            self.state(id, NodeState::Reused);
             return Ok(Done {
                 key: key_of(&[data.node_type().label().as_bytes(), &output.bytes]),
                 output,
             });
         }
 
+        self.check_cancel()?;
+        self.state(id, NodeState::Running);
         let outputs: Vec<Output> = inputs.into_iter().map(|(_, done)| done.output).collect();
         let output = match data {
             NodeData::Data(config) => self.run_data(config),
@@ -413,6 +654,9 @@ impl Runner<'_> {
                 self.run_agent(config, id, &name, &join_text(id, &upstream, &outputs)?)
             }
             NodeData::Directory(config) => self.run_directory(config),
+            NodeData::File(config) if config.bundle => {
+                self.run_bundle(config, &join_text(id, &upstream, &outputs)?)
+            }
             NodeData::File(config) => match outputs.as_slice() {
                 // A single binary input (an image from an agent) is written as it is.
                 [only] if !only.text => self.run_file(config, only.bytes.clone(), false),
@@ -426,6 +670,7 @@ impl Runner<'_> {
         if let (Some(key), Some(cache)) = (cache_key, &self.control.cache) {
             lock(cache).store(id, key, output.clone());
         }
+        self.state(id, NodeState::Done);
         Ok(Done {
             key: key_of(&[data.node_type().label().as_bytes(), &output.bytes]),
             output,
@@ -492,6 +737,102 @@ impl Runner<'_> {
         let mut output = Output::new(bytes, textual, &format!("Wrote {}", config.path));
         output.saved = Some(path);
         Ok(output)
+    }
+
+    /// Write every `=== path ===` section of the wire's text to its own file under the
+    /// node's directory: the format a directory node emits, so an agent asked to answer
+    /// in it can change or add several files at once. Every path is checked and resolved
+    /// before anything is written; in Create mode one existing file stops the whole
+    /// write. The output lists what was written.
+    fn run_bundle(&mut self, config: &FileConfig, text: &str) -> Result<Output, String> {
+        let base = validate::directory_path(&config.path)?;
+        let sections = split_sections(text);
+        if sections.is_empty() {
+            return Err(
+                "no `=== path ===` sections in the input; ask the agent to answer with one \
+                 per file, or turn the sections switch off to write one file"
+                    .into(),
+            );
+        }
+        if sections.len() > MAX_BUNDLE_FILES {
+            return Err(format!(
+                "{} sections, over the {MAX_BUNDLE_FILES} files one answer may write",
+                sections.len()
+            ));
+        }
+        let mut plan: Vec<(String, PathBuf, Vec<u8>, bool)> = Vec::new();
+        for (rel, content) in sections {
+            let joined = base.join(validate::relative_path(&rel)?);
+            let shown = joined.to_string_lossy().replace('\\', "/");
+            if plan.iter().any(|(p, ..)| *p == shown) {
+                return Err(format!("{shown} appears twice in the answer"));
+            }
+            let rel_path = validate::writable_path(&shown)?;
+            let real = validate::resolve_new_inside(&self.dirs.root, &rel_path)?;
+            let exists = real.exists();
+            if exists && config.mode == WriteMode::Create {
+                return Err(format!(
+                    "{shown} exists; nothing was written. Set the mode to Overwrite or Append"
+                ));
+            }
+            let mut bytes = if config.unfence {
+                let mut text = validate::unfenced(&content);
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.into_bytes()
+            } else {
+                content.into_bytes()
+            };
+            if bytes.is_empty() {
+                bytes.clear();
+            }
+            plan.push((shown, real, bytes, exists));
+        }
+        let mut summary = format!(
+            "Wrote {} file{} under {}/\n",
+            plan.len(),
+            if plan.len() == 1 { "" } else { "s" },
+            config.display_path()
+        );
+        let mut total = 0;
+        for (shown, real, bytes, exists) in &plan {
+            if let Some(parent) = real.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("create {}: {e}", parent.display()))?;
+            }
+            match config.mode {
+                WriteMode::Append if *exists => {
+                    let mut file = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(real)
+                        .map_err(|e| format!("open {}: {e}", real.display()))?;
+                    file.write_all(bytes)
+                        .map_err(|e| format!("write {}: {e}", real.display()))?;
+                }
+                _ => std::fs::write(real, bytes)
+                    .map_err(|e| format!("write {}: {e}", real.display()))?,
+            }
+            let verb = match (config.mode, exists) {
+                (WriteMode::Append, true) => "appended to",
+                (_, true) => "replaced",
+                _ => "created",
+            };
+            self.log(format!("{verb} {shown} ({})", size(bytes.len())));
+            summary.push_str(&format!("  {shown} ({}) {verb}\n", size(bytes.len())));
+            total += bytes.len();
+        }
+        Ok(Output {
+            bytes: summary.into_bytes(),
+            text: true,
+            label: format!(
+                "Wrote {} file{} · {}",
+                plan.len(),
+                if plan.len() == 1 { "" } else { "s" },
+                size(total)
+            ),
+            saved: validate::resolve_directory_inside(&self.dirs.root, &config.path).ok(),
+        })
     }
 
     // ----- directories -----
@@ -733,6 +1074,32 @@ fn substituted_model(config: &AgentConfig, answered: Option<&str>) -> Option<Str
     (!answered_bare.starts_with(requested)).then(|| answered.to_string())
 }
 
+/// The `=== path ===` sections of a text, in order: each path with the lines up to the
+/// next header. Text before the first header (an agent's preamble) is dropped. A fenced
+/// answer is unwrapped first, since models like to fence the whole thing.
+fn split_sections(text: &str) -> Vec<(String, String)> {
+    let text = validate::unfenced(text);
+    let mut sections: Vec<(String, String)> = Vec::new();
+    for line in text.lines() {
+        let header = line
+            .trim()
+            .strip_prefix("===")
+            .and_then(|rest| rest.strip_suffix("==="))
+            .map(str::trim)
+            .filter(|path| !path.is_empty());
+        match header {
+            Some(path) => sections.push((path.to_string(), String::new())),
+            None => {
+                if let Some((_, content)) = sections.last_mut() {
+                    content.push_str(line);
+                    content.push('\n');
+                }
+            }
+        }
+    }
+    sections
+}
+
 /// The upstream outputs as one text, blank-line separated. Binary output is an error:
 /// only a write-file node can take it, and only alone.
 fn join_text(id: &str, upstream: &[String], outputs: &[Output]) -> Result<String, String> {
@@ -751,9 +1118,10 @@ fn join_text(id: &str, upstream: &[String], outputs: &[Output]) -> Result<String
     Ok(texts.join("\n\n"))
 }
 
-/// The cache key of an agent or script: its configuration, one extra (the agent's name,
-/// which decides where its output is saved, or the script's source) and its inputs' keys.
-fn cache_key(config_json: &[u8], extra: &[u8], upstream_keys: &[Vec<u8>]) -> u64 {
+/// The cache key of an agent or script: its configuration, one extra (the script's
+/// source; nothing for an agent, whose name only decides where the output is saved) and
+/// its inputs' keys.
+fn cache_key(config_json: &[u8], extra: &[u8], upstream_keys: &[Vec<u8>]) -> Key {
     let mut parts: Vec<&[u8]> = vec![config_json, extra];
     parts.extend(upstream_keys.iter().map(Vec::as_slice));
     key_of(&parts)
@@ -1771,6 +2139,12 @@ mod tests {
             "{:?}",
             report.log
         );
+        // Every node's output is in the report, not only the target's.
+        let mut ids: Vec<&String> = report.outputs.keys().collect();
+        ids.sort();
+        assert_eq!(ids, ["n0", "n1", "n2"]);
+        assert_eq!(report.outputs["n1"].as_text(), Some("note"));
+        assert_eq!(report.failed, None);
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1879,10 +2253,27 @@ mod tests {
             "killed promptly"
         );
 
-        let err = run(&doc, "n3", Dirs::under(&root), &http, &no_env)
-            .result
-            .unwrap_err();
+        let report = run(&doc, "n3", Dirs::under(&root), &http, &no_env);
+        let err = report.result.unwrap_err();
         assert!(err.contains("code 3") && err.contains("boom"), "{err}");
+        assert_eq!(report.failed.as_deref(), Some("n3"));
+
+        // A failure upstream is attributed to the node that failed, and the outputs made
+        // before it are still reported.
+        let doc = graph(
+            vec![
+                node("n0", data("in.txt", DataFormat::Text)),
+                node("n1", shell("fail.sh", &[], 10)),
+                node("n2", shell("echo.sh", &[], 10)),
+            ],
+            &[("n0", "n1"), ("n1", "n2")],
+        );
+        let report = run(&doc, "n2", Dirs::under(&root), &http, &no_env);
+        assert!(report.result.is_err());
+        assert_eq!(report.failed.as_deref(), Some("n1"));
+        let mut ids: Vec<&String> = report.outputs.keys().collect();
+        ids.sort();
+        assert_eq!(ids, ["n0"]);
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -2831,11 +3222,12 @@ mod tests {
 
         let first = go(&control);
         assert_eq!(first.result.as_ref().unwrap().as_text(), Some("ok"));
-        assert_eq!((first.cached, calls()), (0, 1));
+        assert_eq!((first.reused.len(), calls()), (0, 1));
 
         // Nothing changed: the script and the agent come from the cache.
         let again = go(&control);
-        assert_eq!((again.cached, calls()), (2, 1));
+        assert_eq!((again.reused.len(), calls()), (2, 1));
+        assert_eq!(again.reused, ["n1", "n2"]);
         assert!(
             again
                 .log
@@ -2848,7 +3240,7 @@ mod tests {
 
         // The data changed, so the script output changes and the agent runs again.
         fs::write(root.join("data/a.txt"), "v222").unwrap();
-        assert_eq!((go(&control).cached, calls()), (0, 2));
+        assert_eq!((go(&control).reused.len(), calls()), (0, 2));
 
         // The script file changed but its output did not: only the script reruns.
         fs::write(
@@ -2856,20 +3248,288 @@ mod tests {
             "# counts bytes\nwc -c | tr -d ' '\n",
         )
         .unwrap();
-        assert_eq!((go(&control).cached, calls()), (1, 2));
+        assert_eq!((go(&control).reused.len(), calls()), (1, 2));
 
         // Fresh ignores the cache and refills it.
         let fresh = Control {
             fresh: true,
             ..control.clone()
         };
-        assert_eq!((go(&fresh).cached, calls()), (0, 3));
-        assert_eq!((go(&control).cached, calls()), (2, 3));
+        assert_eq!((go(&fresh).reused.len(), calls()), (0, 3));
+        assert_eq!((go(&control).reused.len(), calls()), (2, 3));
 
         // Clearing it, or running with no cache at all, runs everything.
         lock(control.cache.as_ref().unwrap()).clear();
-        assert_eq!((go(&control).cached, calls()), (0, 4));
-        assert_eq!((go(&Control::default()).cached, calls()), (0, 5));
+        assert_eq!((go(&control).reused.len(), calls()), (0, 4));
+        assert_eq!((go(&Control::default()).reused.len(), calls()), (0, 5));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn progress_reports_each_nodes_state() {
+        let root = scratch("states");
+        fs::write(root.join("data/a.txt"), "v1").unwrap();
+        fs::write(root.join("scripts/count.sh"), "wc -c | tr -d ' '\n").unwrap();
+        fs::write(root.join("scripts/fail.sh"), "exit 2\n").unwrap();
+        let http = FakeHttp::new(200, r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+        let doc = graph(
+            vec![
+                node("n0", data("a.txt", DataFormat::Text)),
+                node("n1", shell("count.sh", &[], 10)),
+                node("n2", Some(NodeData::Agent(fake_agent()))),
+                node("n3", shell("fail.sh", &[], 10)),
+                node("n4", shell("count.sh", &[], 10)),
+            ],
+            &[("n0", "n1"), ("n1", "n2"), ("n0", "n3"), ("n3", "n4")],
+        );
+        let states = |seen: &Arc<Mutex<Vec<Progress>>>| -> Vec<(String, NodeState)> {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter_map(|p| match p {
+                    Progress::Node { id, state } => Some((id.clone(), *state)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let s = |id: &str, state: NodeState| (id.to_string(), state);
+        use NodeState::*;
+
+        let (control, seen) = recording_control();
+        run_with(&doc, "n2", Dirs::under(&root), &http, &with_key, &control)
+            .result
+            .unwrap();
+        assert_eq!(
+            states(&seen),
+            [
+                s("n0", Running),
+                s("n0", Done),
+                s("n1", Running),
+                s("n1", Done),
+                s("n2", Running),
+                s("n2", Done)
+            ]
+        );
+
+        // Second time: the data node runs, the rest is reused and never starts.
+        seen.lock().unwrap().clear();
+        run_with(&doc, "n2", Dirs::under(&root), &http, &with_key, &control)
+            .result
+            .unwrap();
+        assert_eq!(
+            states(&seen),
+            [
+                s("n0", Running),
+                s("n0", Done),
+                s("n1", Reused),
+                s("n2", Reused)
+            ]
+        );
+
+        // A failing node is marked once; the node after it is never reached.
+        seen.lock().unwrap().clear();
+        let report = run_with(&doc, "n4", Dirs::under(&root), &http, &with_key, &control);
+        assert!(report.result.is_err());
+        assert_eq!(
+            states(&seen),
+            [
+                s("n0", Running),
+                s("n0", Done),
+                s("n3", Running),
+                s("n3", Failed)
+            ]
+        );
+
+        // A cancel is not a failure.
+        let cancelled = Control {
+            cancel: Arc::new(AtomicBool::new(true)),
+            ..control.clone()
+        };
+        seen.lock().unwrap().clear();
+        run_with(&doc, "n2", Dirs::under(&root), &http, &with_key, &cancelled)
+            .result
+            .unwrap_err();
+        assert!(states(&seen).is_empty(), "{:?}", states(&seen));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn persistent_cache_survives_a_restart_and_clears_its_files() {
+        let root = scratch("disk-cache");
+        fs::write(root.join("data/a.txt"), "v1").unwrap();
+        let http = FakeHttp::new(200, r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+        let doc = graph(
+            vec![
+                node("n0", data("a.txt", DataFormat::Text)),
+                node("n1", Some(NodeData::Agent(fake_agent()))),
+            ],
+            &[("n0", "n1")],
+        );
+        let dirs = Dirs::under(&root);
+        let calls = || http.seen.lock().unwrap().len();
+        let open = || Control {
+            cache: Some(Arc::new(Mutex::new(Cache::persistent(dirs.cache.clone())))),
+            ..Control::default()
+        };
+
+        let first = open();
+        let report = run_with(&doc, "n1", dirs.clone(), &http, &with_key, &first);
+        report.result.as_ref().unwrap();
+        assert_eq!((report.reused.len(), calls()), (0, 1));
+        let files: Vec<String> = fs::read_dir(&dirs.cache)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files.len(), 2, "{files:?}");
+        assert!(
+            files
+                .iter()
+                .any(|f| f.len() == 32 + 5 && f.ends_with(".json")),
+            "{files:?}"
+        );
+        assert!(files.iter().any(|f| f.ends_with(".bin")), "{files:?}");
+        assert_eq!(lock(first.cache.as_ref().unwrap()).len(), 1);
+
+        // A new cache over the same directory, as after a restart, has the entry.
+        let second = open();
+        assert_eq!(lock(second.cache.as_ref().unwrap()).len(), 1);
+        let report = run_with(&doc, "n1", dirs.clone(), &http, &with_key, &second);
+        assert_eq!(report.result.unwrap().as_text(), Some("ok"));
+        assert_eq!((report.reused, calls()), (vec!["n1".to_string()], 1));
+
+        // Another node id with the same question hits too: entries are by content.
+        let mut moved = doc.clone();
+        moved.nodes[1].id = "n9".into();
+        moved.edges[0].to = "n9".into();
+        let report = run_with(&moved, "n9", dirs.clone(), &http, &with_key, &open());
+        assert_eq!((report.reused, calls()), (vec!["n9".to_string()], 1));
+
+        // A broken sidecar is a miss, not a crash.
+        for file in files.iter().filter(|f| f.ends_with(".json")) {
+            fs::write(dirs.cache.join(file), "{not json").unwrap();
+        }
+        let report = run_with(&doc, "n1", dirs.clone(), &http, &with_key, &open());
+        assert_eq!((report.reused.len(), calls()), (0, 2));
+
+        // Clear removes the files.
+        let control = open();
+        lock(control.cache.as_ref().unwrap()).clear();
+        assert_eq!(fs::read_dir(&dirs.cache).unwrap().count(), 0);
+        assert_eq!(lock(control.cache.as_ref().unwrap()).len(), 0);
+
+        // Keys are stable values, not whatever the standard hasher does this build.
+        assert_eq!(
+            format!("{:032x}", key_of(&[b"agent", b"x"])),
+            "c2c0d39782eaa908e9c9d98fcd63a797"
+        );
+        assert_ne!(key_of(&[b"ab", b"c"]), key_of(&[b"a", b"bc"]));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn bundled_file_nodes_write_each_section_under_their_directory() {
+        let root = scratch("bundle");
+        fs::write(
+            root.join("data/answer.md"),
+            "Here are the files.\n\n=== src/add_test.rs ===\n```rust\n#[test]\nfn t() {}\n```\n\n=== notes/README.md ===\n# notes\n",
+        )
+        .unwrap();
+        fs::write(root.join("data/escape.md"), "=== ../out.rs ===\nx\n").unwrap();
+        fs::write(root.join("data/plain.md"), "no sections here\n").unwrap();
+        fs::write(
+            root.join("data/dupe.md"),
+            "=== a.txt ===\n1\n=== a.txt ===\n2\n",
+        )
+        .unwrap();
+        let http = FakeHttp::new(200, "{}");
+        let bundle = |path: &str, mode: WriteMode| {
+            Some(NodeData::File(FileConfig {
+                path: path.into(),
+                mode,
+                unfence: true,
+                bundle: true,
+            }))
+        };
+        let doc = graph(
+            vec![
+                node("n0", data("answer.md", DataFormat::Markdown)),
+                node("n1", bundle("tests/generated", WriteMode::Create)),
+                node("n2", data("escape.md", DataFormat::Markdown)),
+                node("n3", bundle("tests/generated", WriteMode::Overwrite)),
+                node("n4", data("plain.md", DataFormat::Markdown)),
+                node("n5", bundle("tests/generated", WriteMode::Overwrite)),
+                node("n6", data("dupe.md", DataFormat::Markdown)),
+                node("n7", bundle(".", WriteMode::Overwrite)),
+                node("n8", bundle("scripts", WriteMode::Overwrite)),
+            ],
+            &[
+                ("n0", "n1"),
+                ("n2", "n3"),
+                ("n4", "n5"),
+                ("n6", "n7"),
+                ("n0", "n8"),
+            ],
+        );
+        let go = |id: &str| run(&doc, id, Dirs::under(&root), &http, &no_env);
+
+        let report = go("n1");
+        let out = report.result.expect("bundle");
+        assert_eq!(
+            fs::read_to_string(root.join("tests/generated/src/add_test.rs")).unwrap(),
+            "#[test]\nfn t() {}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("tests/generated/notes/README.md")).unwrap(),
+            "# notes\n"
+        );
+        let text = out.as_text().unwrap();
+        assert!(
+            text.starts_with("Wrote 2 files under tests/generated/\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("tests/generated/src/add_test.rs (18 B) created"),
+            "{text}"
+        );
+        assert_eq!(out.label, "Wrote 2 files · 26 B");
+        assert_eq!(
+            out.saved.as_deref(),
+            Some(
+                root.canonicalize()
+                    .unwrap()
+                    .join("tests/generated")
+                    .as_path()
+            )
+        );
+        // Create only: an existing file stops the whole write.
+        let err = go("n1").result.unwrap_err();
+        assert!(err.contains("exists; nothing was written"), "{err}");
+
+        // Section paths can't leave the directory; nothing is written.
+        let err = go("n3").result.unwrap_err();
+        assert!(err.contains(".."), "{err}");
+        assert!(!root.join("out.rs").exists());
+        // No sections: say so.
+        let err = go("n5").result.unwrap_err();
+        assert!(err.contains("no `=== path ===` sections"), "{err}");
+        // The same path twice is refused before anything is written.
+        let err = go("n7").result.unwrap_err();
+        assert!(err.contains("appears twice"), "{err}");
+        assert!(!root.join("a.txt").exists());
+        // The directory itself is checked against the app's directories.
+        let err = go("n8").result.unwrap_err();
+        assert!(err.contains("managed by the app"), "{err}");
+        assert!(!root.join("scripts/src").exists());
+
+        assert_eq!(
+            split_sections("```\n=== a ===\nx\n===  b/c.txt ===\ny\nz\n```"),
+            [
+                ("a".to_string(), "x\n".to_string()),
+                ("b/c.txt".to_string(), "y\nz\n".to_string())
+            ]
+        );
+        assert!(split_sections("=== ===\nx").is_empty());
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -3000,6 +3660,7 @@ mod tests {
                 path: path.into(),
                 mode,
                 unfence,
+                bundle: false,
             }))
         };
         let doc = graph(
@@ -3211,6 +3872,7 @@ mod tests {
                 path: "tests/generated.rs".into(),
                 mode: WriteMode::Overwrite,
                 unfence: true,
+                bundle: false,
             })),
         ));
         doc.edges.push(EdgeDoc {
@@ -3240,7 +3902,7 @@ mod tests {
             &control,
         );
         second.result.expect("second run");
-        assert_eq!(second.cached, 1, "{:?}", second.log);
+        assert_eq!(second.reused, ["n1"], "{:?}", second.log);
         fs::remove_dir_all(&root).unwrap();
     }
 }
