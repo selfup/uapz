@@ -8,9 +8,11 @@ mod inspector;
 mod library;
 mod node_data;
 mod providers;
+mod review;
 mod sidebar;
 mod storage;
 mod validate;
+mod workflow;
 
 use gpui_kit::*;
 use graph::{AddNode, Cancel, DeleteSelection};
