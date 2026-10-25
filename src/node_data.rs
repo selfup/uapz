@@ -1,5 +1,5 @@
-//! Typed per-node content: what an agent, database, script or data node is configured
-//! with. This is the `data` object in the graph's JSON sidecar; a blank node has none.
+//! Typed per-node content: what an agent, database, script, data, directory or write-file
+//! node is configured with. This is the `data` object in the graph's JSON sidecar; a blank node has none.
 //!
 //! Every config validates itself with [`NodeData::validate`], which the inspector shows
 //! live and the library refuses to save over. Nothing here touches the filesystem or the
@@ -12,12 +12,13 @@ use serde_json::Value;
 use crate::library::{DATA_DIR, SCRIPTS_DIR};
 use crate::validate::{self, Issue, MAX_PROMPT_LEN};
 
-/// Fill color of a database node that may write, as `#rrggbb`: red, unlike any type.
+/// Fill color of every node that writes outside the app's own output folders, as
+/// `#rrggbb`: a database allowed to write and a write-file node. Red, so it stands out.
 pub const WRITE_COLOR: &str = "#ef4444";
 /// Picker label for a database node created with its read-only flag off.
 pub const WRITABLE_DATABASE_LABEL: &str = "Database (write)";
 
-/// The five kinds of content a node can carry.
+/// The six kinds of content a node can carry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NodeType {
@@ -26,15 +27,18 @@ pub enum NodeType {
     Script,
     Data,
     Directory,
+    /// Writes the text arriving on its wire to a file in the working directory.
+    File,
 }
 
 impl NodeType {
-    pub const ALL: [NodeType; 5] = [
+    pub const ALL: [NodeType; 6] = [
         Self::Agent,
         Self::Database,
         Self::Script,
         Self::Data,
         Self::Directory,
+        Self::File,
     ];
 
     pub fn label(self) -> &'static str {
@@ -44,10 +48,12 @@ impl NodeType {
             Self::Script => "Script",
             Self::Data => "Data",
             Self::Directory => "Directory",
+            Self::File => "Write file",
         }
     }
 
-    /// Fill color for nodes of this type, as `#rrggbb`.
+    /// Fill color for nodes of this type, as `#rrggbb`. Write-file nodes are red like a
+    /// writable database: red means the node changes something outside `agents/`.
     pub fn color(self) -> &'static str {
         match self {
             Self::Agent => "#8b5cf6",
@@ -55,6 +61,7 @@ impl NodeType {
             Self::Script => "#f59e0b",
             Self::Data => "#22c55e",
             Self::Directory => "#14b8a6",
+            Self::File => WRITE_COLOR,
         }
     }
 
@@ -72,6 +79,7 @@ impl NodeType {
             Self::Script => NodeData::Script(ScriptConfig::default()),
             Self::Data => NodeData::Data(DataConfig::default()),
             Self::Directory => NodeData::Directory(DirectoryConfig::default()),
+            Self::File => NodeData::File(FileConfig::default()),
         }
     }
 }
@@ -85,6 +93,7 @@ pub enum NodeData {
     Script(ScriptConfig),
     Data(DataConfig),
     Directory(DirectoryConfig),
+    File(FileConfig),
 }
 
 impl NodeData {
@@ -95,6 +104,7 @@ impl NodeData {
             Self::Script(_) => NodeType::Script,
             Self::Data(_) => NodeType::Data,
             Self::Directory(_) => NodeType::Directory,
+            Self::File(_) => NodeType::File,
         }
     }
 
@@ -123,6 +133,7 @@ impl NodeData {
             Self::Script(s) => s.summary(),
             Self::Data(d) => d.summary(),
             Self::Directory(d) => d.summary(),
+            Self::File(f) => f.summary(),
         }
     }
 
@@ -134,6 +145,7 @@ impl NodeData {
             Self::Script(s) => s.validate(),
             Self::Data(d) => d.validate(),
             Self::Directory(d) => d.validate(),
+            Self::File(f) => f.validate(),
         }
     }
 }
@@ -951,6 +963,73 @@ impl DirectoryConfig {
     }
 }
 
+// ----- write file -----
+
+/// What a write-file node does when its file already exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WriteMode {
+    /// Refuse to touch an existing file. The safe default.
+    Create,
+    Overwrite,
+    Append,
+}
+
+impl WriteMode {
+    pub const ALL: [WriteMode; 3] = [Self::Create, Self::Overwrite, Self::Append];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Create => "Create only",
+            Self::Overwrite => "Overwrite",
+            Self::Append => "Append",
+        }
+    }
+}
+
+/// A file under the working directory that receives the text arriving on the wire: how
+/// an agent's answer lands in the repository as a test, a document or a data file.
+/// Missing directories on the way are created. The path is the node's own setting, never
+/// the model's, and the app's directories (`scripts/`, `agents/`, …) are off limits.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FileConfig {
+    /// Relative to the working directory.
+    pub path: String,
+    pub mode: WriteMode,
+    /// Strip a surrounding Markdown code fence and end the text with a newline, which is
+    /// what a model's answer usually needs to become a source file.
+    pub unfence: bool,
+}
+
+impl Default for FileConfig {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            mode: WriteMode::Create,
+            unfence: true,
+        }
+    }
+}
+
+impl FileConfig {
+    pub fn summary(&self) -> String {
+        format!(
+            "{} · {}",
+            file_name(&self.path).unwrap_or("no file"),
+            self.mode.label().to_lowercase()
+        )
+    }
+
+    pub fn validate(&self) -> Vec<Issue> {
+        let mut issues = Vec::new();
+        if let Err(e) = validate::writable_path(&self.path) {
+            issues.push(Issue::new("path", e));
+        }
+        issues
+    }
+}
+
 /// The last component of a relative path, for summaries.
 fn file_name(path: &str) -> Option<&str> {
     let name = path.trim().rsplit('/').next()?.trim();
@@ -1209,6 +1288,56 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<NodeData>(&json).unwrap(),
             NodeData::Directory(filtered)
+        );
+    }
+
+    #[test]
+    fn file_nodes_are_red_and_keep_out_of_app_directories() {
+        let blank = FileConfig::default();
+        assert_eq!(blank.mode, WriteMode::Create);
+        assert!(blank.unfence);
+        assert_eq!(blank.validate()[0].field, "path");
+        assert_eq!(blank.summary(), "no file · create only");
+
+        let file = FileConfig {
+            path: "tests/generated/math.rs".into(),
+            mode: WriteMode::Overwrite,
+            ..FileConfig::default()
+        };
+        assert!(file.validate().is_empty(), "{:?}", file.validate());
+        assert_eq!(file.summary(), "math.rs · overwrite");
+        let data = NodeData::File(file.clone());
+        assert_eq!(data.color(), WRITE_COLOR);
+        assert_eq!(data.label(), "Write file");
+        let json = serde_json::to_string(&data).unwrap();
+        assert!(json.starts_with(r#"{"type":"file""#), "{json}");
+        assert_eq!(serde_json::from_str::<NodeData>(&json).unwrap(), data);
+
+        for path in [
+            "scripts/run.sh",
+            "Agents/x/agent.json",
+            "graphs/g.json",
+            "nodes/k.json",
+            "prompts/p.md",
+            "databases/d.json",
+            "../out.txt",
+            ".hidden",
+        ] {
+            let issues = FileConfig {
+                path: path.into(),
+                ..FileConfig::default()
+            }
+            .validate();
+            assert_eq!(issues.len(), 1, "{path}: {issues:?}");
+            assert_eq!(issues[0].field, "path");
+        }
+        assert!(
+            FileConfig {
+                path: "data/out.csv".into(),
+                ..FileConfig::default()
+            }
+            .validate()
+            .is_empty()
         );
     }
 }

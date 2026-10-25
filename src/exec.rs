@@ -1,8 +1,8 @@
 //! Running nodes.
 //!
-//! [`run`] executes one node of a [`GraphDoc`] after running everything wired into it and
-//! returns a [`Report`]: the output plus a log of what happened. The contract with the rest
-//! of the app:
+//! [`run_with`] executes one node of a [`GraphDoc`] after running everything wired into it
+//! and returns a [`Report`]: the output plus a log of what happened. The contract with the
+//! rest of the app:
 //!
 //! - every config is validated again here, whatever the inspector showed;
 //! - every file path goes through [`validate::resolve_inside`] right before it is opened,
@@ -13,29 +13,45 @@
 //! - secrets (API keys, connection URLs) are read from the environment at the last moment
 //!   and handed only to the request or child process that needs them, never to argv, logs
 //!   or disk;
-//! - agent results are written with [`library::write_agent_output`].
+//! - agent results are written with [`library::write_agent_output`];
+//! - write-file nodes only touch paths that pass [`validate::writable_path`], resolved
+//!   with [`validate::resolve_new_inside`], so they stay in the working directory and out
+//!   of the app's own folders.
 //!
 //! Text flows along the wires: a node's upstream outputs are joined and become a script's
-//! stdin or an agent's user message. Database nodes take data from their input file; the
-//! wire can only supply their SQL, and only when the node's own query is empty.
+//! stdin, an agent's user message or a write-file node's content. Database nodes take data
+//! from their input file; the wire can only supply their SQL, and only when the node's own
+//! query is empty.
+//!
+//! The [`Control`] carries a [`Cache`] of earlier outputs so a downstream run does not
+//! re-call every upstream agent, a cancel flag checked between steps and inside
+//! child-process and streaming waits, and a progress sink that receives log lines and
+//! agent text as it streams in. Agents and scripts are looked up by their configuration,
+//! their inputs' outputs and (for scripts) the script file itself; data, directory,
+//! database and write-file nodes always run, since they read or change live state. Every
+//! node's output is hashed for the nodes after it, so an edit that leaves an output the
+//! same leaves everything downstream cached.
 //!
 //! [`write_sql`] is the inspector's helper: it describes the database's schema with
 //! [`describe_schema`] and asks an agent for one statement.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, Read, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::doc::{GraphDoc, NodeDoc};
 use crate::library;
 use crate::node_data::{
-    AgentConfig, Auth, DataConfig, DatabaseConfig, DbEngine, DirectoryConfig, ModelType, NodeData,
-    OutputType, Runtime, ScriptConfig,
+    AgentConfig, Auth, DataConfig, DatabaseConfig, DbEngine, DirectoryConfig, FileConfig,
+    ModelType, NodeData, OutputType, Runtime, ScriptConfig, WriteMode,
 };
 use crate::providers::{self, Http};
 use crate::validate;
@@ -51,6 +67,10 @@ pub const INHERITED_ENV: &[&str] = &["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL",
 const POLL: Duration = Duration::from_millis(25);
 /// How deep a directory node descends.
 const MAX_DIRECTORY_DEPTH: usize = 32;
+/// The error a cancelled run ends with.
+pub const CANCELLED: &str = "the run was cancelled";
+/// For callers that have no cancel flag.
+static NEVER: AtomicBool = AtomicBool::new(false);
 
 /// Where the executor looks for files and writes outputs. `root` is the working
 /// directory, which directory nodes read.
@@ -116,6 +136,94 @@ pub struct Report {
     pub log: Vec<String>,
     pub result: Result<Output, String>,
     pub elapsed: Duration,
+    /// How many nodes were served from the cache instead of running.
+    pub cached: usize,
+}
+
+/// Something that happened during a run, delivered as it happens.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Progress {
+    /// A log line; the same line ends up in the [`Report`].
+    Log(String),
+    /// A piece of text an agent streamed back. `id` is the node producing it.
+    Text { id: String, text: String },
+}
+
+/// Outputs from earlier runs, by node id. An entry is reused only when its key, built
+/// from the node's configuration and everything upstream, still matches.
+#[derive(Clone, Debug, Default)]
+pub struct Cache {
+    entries: HashMap<String, Entry>,
+}
+
+#[derive(Clone, Debug)]
+struct Entry {
+    key: u64,
+    output: Output,
+}
+
+#[allow(clippy::len_without_is_empty)]
+impl Cache {
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    fn lookup(&self, id: &str, key: u64) -> Option<Output> {
+        self.entries
+            .get(id)
+            .filter(|e| e.key == key)
+            .map(|e| e.output.clone())
+    }
+
+    fn store(&mut self, id: &str, key: u64, output: Output) {
+        self.entries.insert(id.to_string(), Entry { key, output });
+    }
+}
+
+/// What the caller holds while a run is in flight. The default caches nothing, is never
+/// cancelled and reports nothing.
+#[derive(Clone, Default)]
+pub struct Control {
+    /// Outputs of earlier runs. `None` runs every node.
+    pub cache: Option<Arc<Mutex<Cache>>>,
+    /// Run every node even when the cache has its output; the cache is still updated.
+    pub fresh: bool,
+    /// Set to true to stop the run at its next check.
+    pub cancel: Arc<AtomicBool>,
+    /// Receives progress from the thread running the graph.
+    pub progress: Option<Arc<dyn Fn(Progress) + Send + Sync>>,
+}
+
+impl Control {
+    pub fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+}
+
+/// A node that has run (or been found in the cache) and a hash of its output, which the
+/// nodes after it put into their own keys.
+#[derive(Clone, Debug)]
+struct Done {
+    output: Output,
+    key: u64,
+}
+
+fn lock(cache: &Mutex<Cache>) -> std::sync::MutexGuard<'_, Cache> {
+    cache.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// One key over several byte strings, with lengths mixed in so the boundaries count.
+fn key_of(parts: &[&[u8]]) -> u64 {
+    let mut hasher = std::hash::DefaultHasher::new();
+    for part in parts {
+        part.len().hash(&mut hasher);
+        hasher.write(part);
+    }
+    hasher.finish()
 }
 
 /// Looks up an environment variable. The real one is [`process_env`]; tests inject keys.
@@ -126,22 +234,32 @@ pub fn process_env(name: &str) -> Option<String> {
 }
 
 /// Run node `id` (a document id such as `n3`) and everything wired into it.
-pub fn run(doc: &GraphDoc, id: &str, dirs: Dirs, http: &dyn Http, env: Env) -> Report {
+pub fn run_with(
+    doc: &GraphDoc,
+    id: &str,
+    dirs: Dirs,
+    http: &dyn Http,
+    env: Env,
+    control: &Control,
+) -> Report {
     let start = Instant::now();
     let mut runner = Runner {
         doc,
         dirs,
         http,
         env,
+        control,
         log: Vec::new(),
         done: HashMap::new(),
         active: HashSet::new(),
+        cached: 0,
     };
-    let result = runner.run_node(id);
+    let result = runner.run_node(id).map(|done| done.output);
     Report {
         log: runner.log,
         result,
         elapsed: start.elapsed(),
+        cached: runner.cached,
     }
 }
 
@@ -150,16 +268,30 @@ struct Runner<'a> {
     dirs: Dirs,
     http: &'a dyn Http,
     env: Env<'a>,
+    control: &'a Control,
     log: Vec<String>,
-    /// Outputs of nodes already run, so a node feeding two others runs once.
-    done: HashMap<String, Output>,
+    /// Nodes already run this time, so a node feeding two others runs once.
+    done: HashMap<String, Done>,
     /// Nodes on the current path, for cycle detection.
     active: HashSet<String>,
+    cached: usize,
 }
 
 impl Runner<'_> {
     fn log(&mut self, line: impl Into<String>) {
-        self.log.push(line.into());
+        let line = line.into();
+        if let Some(progress) = &self.control.progress {
+            progress(Progress::Log(line.clone()));
+        }
+        self.log.push(line);
+    }
+
+    fn check_cancel(&self) -> Result<(), String> {
+        if self.control.cancelled() {
+            Err(CANCELLED.into())
+        } else {
+            Ok(())
+        }
     }
 
     fn node(&self, id: &str) -> Result<&NodeDoc, String> {
@@ -188,7 +320,8 @@ impl Runner<'_> {
         (self.env)(name).ok_or_else(|| format!("environment variable {name} is not set"))
     }
 
-    fn run_node(&mut self, id: &str) -> Result<Output, String> {
+    fn run_node(&mut self, id: &str) -> Result<Done, String> {
+        self.check_cancel()?;
         if let Some(done) = self.done.get(id) {
             return Ok(done.clone());
         }
@@ -197,13 +330,13 @@ impl Runner<'_> {
         }
         let result = self.run_fresh(id);
         self.active.remove(id);
-        if let Ok(output) = &result {
-            self.done.insert(id.to_string(), output.clone());
+        if let Ok(done) = &result {
+            self.done.insert(id.to_string(), done.clone());
         }
         result
     }
 
-    fn run_fresh(&mut self, id: &str) -> Result<Output, String> {
+    fn run_fresh(&mut self, id: &str) -> Result<Done, String> {
         let node = self.node(id)?.clone();
         let Some(data) = &node.data else {
             return Err(format!("{id} is blank; give it content first"));
@@ -221,20 +354,10 @@ impl Runner<'_> {
         }
 
         let upstream = self.upstream(id);
-        let mut texts = Vec::with_capacity(upstream.len());
+        let mut inputs = Vec::with_capacity(upstream.len());
         for from in &upstream {
-            let output = self.run_node(from)?;
-            match output.as_text() {
-                Some(text) => texts.push(text.to_string()),
-                None => {
-                    return Err(format!(
-                        "{from} produced binary output ({}), which {id} can't take as text",
-                        output.label
-                    ));
-                }
-            }
+            inputs.push((from.clone(), self.run_node(from)?));
         }
-        let input = texts.join("\n\n");
         self.log(format!(
             "{id}: {} ({}) with {} input{}",
             data.node_type().label().to_lowercase(),
@@ -242,15 +365,133 @@ impl Runner<'_> {
             upstream.len(),
             if upstream.len() == 1 { "" } else { "s" }
         ));
-
         let name = node.kind.clone().unwrap_or_else(|| id.to_string());
-        match data {
-            NodeData::Data(config) => self.run_data(config),
-            NodeData::Script(config) => self.run_script(config, &input),
-            NodeData::Database(config) => self.run_database(config, &input),
-            NodeData::Agent(config) => self.run_agent(config, &name, &input),
-            NodeData::Directory(config) => self.run_directory(config),
+
+        // Agents and scripts are the slow, costly nodes and depend only on their config,
+        // their inputs and (for scripts) the file itself, so those make the key. The rest
+        // read or change live state and always run.
+        let config_json = serde_json::to_vec(data).unwrap_or_default();
+        let upstream_keys: Vec<Vec<u8>> = inputs
+            .iter()
+            .map(|(_, done)| done.key.to_le_bytes().to_vec())
+            .collect();
+        let cache_key = match data {
+            NodeData::Agent(_) => Some(cache_key(&config_json, name.as_bytes(), &upstream_keys)),
+            NodeData::Script(config) => {
+                let path = validate::resolve_inside(&self.dirs.scripts, &config.path)?;
+                let source = read_bounded(&path, MAX_FILE_BYTES)?;
+                Some(cache_key(&config_json, &source, &upstream_keys))
+            }
+            NodeData::Data(_)
+            | NodeData::Database(_)
+            | NodeData::Directory(_)
+            | NodeData::File(_) => None,
+        };
+        if let Some(key) = cache_key
+            && !self.control.fresh
+            && let Some(cache) = &self.control.cache
+            && let Some(output) = lock(cache).lookup(id, key)
+        {
+            self.log(format!("{id}: reused the cached {}", output.label));
+            self.cached += 1;
+            return Ok(Done {
+                key: key_of(&[data.node_type().label().as_bytes(), &output.bytes]),
+                output,
+            });
         }
+
+        let outputs: Vec<Output> = inputs.into_iter().map(|(_, done)| done.output).collect();
+        let output = match data {
+            NodeData::Data(config) => self.run_data(config),
+            NodeData::Script(config) => {
+                self.run_script(config, &join_text(id, &upstream, &outputs)?)
+            }
+            NodeData::Database(config) => {
+                self.run_database(config, &join_text(id, &upstream, &outputs)?)
+            }
+            NodeData::Agent(config) => {
+                self.run_agent(config, id, &name, &join_text(id, &upstream, &outputs)?)
+            }
+            NodeData::Directory(config) => self.run_directory(config),
+            NodeData::File(config) => match outputs.as_slice() {
+                // A single binary input (an image from an agent) is written as it is.
+                [only] if !only.text => self.run_file(config, only.bytes.clone(), false),
+                _ => self.run_file(
+                    config,
+                    join_text(id, &upstream, &outputs)?.into_bytes(),
+                    true,
+                ),
+            },
+        }?;
+        if let (Some(key), Some(cache)) = (cache_key, &self.control.cache) {
+            lock(cache).store(id, key, output.clone());
+        }
+        Ok(Done {
+            key: key_of(&[data.node_type().label().as_bytes(), &output.bytes]),
+            output,
+        })
+    }
+
+    // ----- files -----
+
+    /// Write the wire's text (or a lone binary input) to the node's file, creating the
+    /// directories on the way. The path is checked again here and resolved after symlinks.
+    fn run_file(
+        &mut self,
+        config: &FileConfig,
+        bytes: Vec<u8>,
+        textual: bool,
+    ) -> Result<Output, String> {
+        let rel = validate::writable_path(&config.path)?;
+        let path = validate::resolve_new_inside(&self.dirs.root, &rel)?;
+        let bytes = if textual && config.unfence {
+            let mut text = validate::unfenced(&String::from_utf8_lossy(&bytes));
+            if text.is_empty() {
+                return Err("nothing to write: the text arriving on the wire is empty".into());
+            }
+            text.push('\n');
+            text.into_bytes()
+        } else if bytes.is_empty() {
+            return Err("nothing to write: the input is empty".into());
+        } else {
+            bytes
+        };
+        let exists = path.exists();
+        if exists && config.mode == WriteMode::Create {
+            return Err(format!(
+                "{} exists; set the mode to Overwrite or Append to change it",
+                config.path
+            ));
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create {}: {e}", parent.display()))?;
+        }
+        match config.mode {
+            WriteMode::Append if exists => {
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .map_err(|e| format!("open {}: {e}", path.display()))?;
+                file.write_all(&bytes)
+                    .map_err(|e| format!("write {}: {e}", path.display()))?;
+            }
+            _ => std::fs::write(&path, &bytes)
+                .map_err(|e| format!("write {}: {e}", path.display()))?,
+        }
+        self.log(format!(
+            "{} {} ({})",
+            match (config.mode, exists) {
+                (WriteMode::Append, true) => "appended to",
+                (_, true) => "replaced",
+                _ => "created",
+            },
+            config.path,
+            size(bytes.len())
+        ));
+        let mut output = Output::new(bytes, textual, &format!("Wrote {}", config.path));
+        output.saved = Some(path);
+        Ok(output)
     }
 
     // ----- directories -----
@@ -310,7 +551,15 @@ impl Runner<'_> {
         args.extend(config.args.iter().cloned());
         self.log(format!("$ {program} {}", args.join(" ")));
         let timeout = Duration::from_secs(u64::from(config.timeout_secs));
-        let run = run_process(&program, &args, &cwd, &[], input.as_bytes(), timeout)?;
+        let run = run_process(
+            &program,
+            &args,
+            &cwd,
+            &[],
+            input.as_bytes(),
+            timeout,
+            &self.control.cancel,
+        )?;
         if run.timed_out {
             return Err(format!(
                 "{} timed out after {}s and was killed",
@@ -364,11 +613,11 @@ impl Runner<'_> {
         };
         let plan = match config.engine {
             DbEngine::Sqlite => {
-                let db = validate::resolve_inside(&self.dirs.data, &config.path)?;
+                let db = database_file(&self.dirs, config)?;
                 sqlite_plan(config, &db, file.as_deref())?
             }
             DbEngine::DuckDb => {
-                let db = validate::resolve_inside(&self.dirs.data, &config.path)?;
+                let db = database_file(&self.dirs, config)?;
                 duckdb_plan(config, &db, file.as_deref())?
             }
             DbEngine::Postgres => postgres_plan(config, &self.secret(&config.url_env)?)?,
@@ -383,6 +632,7 @@ impl Runner<'_> {
             &plan.env,
             plan.stdin.as_bytes(),
             DB_TIMEOUT,
+            &self.control.cancel,
         )?;
         if run.timed_out {
             return Err(format!(
@@ -408,9 +658,12 @@ impl Runner<'_> {
 
     // ----- agents -----
 
+    /// One provider call. Generative replies stream in: each piece goes to the progress
+    /// sink and the cancel flag is checked between pieces.
     fn run_agent(
         &mut self,
         config: &AgentConfig,
+        id: &str,
         name: &str,
         input: &str,
     ) -> Result<Output, String> {
@@ -425,7 +678,37 @@ impl Runner<'_> {
             config.model.trim(),
             config.endpoint_url()
         ));
-        let bytes = providers::generate(self.http, config, key.as_deref(), input)?;
+        let progress = self.control.progress.clone();
+        let cancel = self.control.cancel.clone();
+        let mut on_text = |text: &str| {
+            if let Some(progress) = &progress {
+                progress(Progress::Text {
+                    id: id.to_string(),
+                    text: text.to_string(),
+                });
+            }
+            !cancel.load(Ordering::Relaxed)
+        };
+        let streamed = match providers::generate_streaming(
+            self.http,
+            config,
+            key.as_deref(),
+            input,
+            &mut on_text,
+        ) {
+            Ok(streamed) => streamed,
+            Err(e) => {
+                self.check_cancel()?;
+                return Err(e);
+            }
+        };
+        if let Some(answered) = substituted_model(config, streamed.model.as_deref()) {
+            self.log(format!(
+                "⚠ answered by {answered}, not {}: the server substituted a model",
+                config.model.trim()
+            ));
+        }
+        let bytes = streamed.bytes;
         let saved = library::write_agent_output(&self.dirs.agents, name, config.output, &bytes)?;
         self.log(format!("saved {}", saved.display()));
         let mut output = Output::new(
@@ -435,6 +718,62 @@ impl Runner<'_> {
         );
         output.saved = Some(saved);
         Ok(output)
+    }
+}
+
+/// The model that answered when it is not the one asked for. Servers name snapshots
+/// (`gpt-4o-2024-08-06` for `gpt-4o`) and tags (`llama3.1:latest` for `llama3.1`), so a
+/// longer name with the requested one as prefix is the same model; a different name
+/// (LM Studio answering an unknown model id with whatever is loaded) is reported.
+fn substituted_model(config: &AgentConfig, answered: Option<&str>) -> Option<String> {
+    let answered = answered?.trim();
+    let requested = config.model.trim();
+    let requested = requested.strip_prefix("models/").unwrap_or(requested);
+    let answered_bare = answered.strip_prefix("models/").unwrap_or(answered);
+    (!answered_bare.starts_with(requested)).then(|| answered.to_string())
+}
+
+/// The upstream outputs as one text, blank-line separated. Binary output is an error:
+/// only a write-file node can take it, and only alone.
+fn join_text(id: &str, upstream: &[String], outputs: &[Output]) -> Result<String, String> {
+    let mut texts = Vec::with_capacity(outputs.len());
+    for (from, output) in upstream.iter().zip(outputs) {
+        match output.as_text() {
+            Some(text) => texts.push(text),
+            None => {
+                return Err(format!(
+                    "{from} produced binary output ({}), which {id} can't take as text",
+                    output.label
+                ));
+            }
+        }
+    }
+    Ok(texts.join("\n\n"))
+}
+
+/// The cache key of an agent or script: its configuration, one extra (the agent's name,
+/// which decides where its output is saved, or the script's source) and its inputs' keys.
+fn cache_key(config_json: &[u8], extra: &[u8], upstream_keys: &[Vec<u8>]) -> u64 {
+    let mut parts: Vec<&[u8]> = vec![config_json, extra];
+    parts.extend(upstream_keys.iter().map(Vec::as_slice));
+    key_of(&parts)
+}
+
+/// The file of a file-based database node. A read-only node needs an existing file; a
+/// writable one may name a new file in an existing directory, which the engine creates.
+fn database_file(dirs: &Dirs, config: &DatabaseConfig) -> Result<PathBuf, String> {
+    if config.read_only {
+        return validate::resolve_inside(&dirs.data, &config.path);
+    }
+    let rel = validate::relative_path(&config.path)?;
+    let path = validate::resolve_new_inside(&dirs.data, &rel)?;
+    match path.parent() {
+        Some(parent) if parent.is_dir() => Ok(path),
+        Some(parent) => Err(format!(
+            "{} does not exist; create the directory first",
+            parent.display()
+        )),
+        None => Err(format!("{} has no parent directory", path.display())),
     }
 }
 
@@ -601,7 +940,10 @@ const MYSQL_SCHEMA_SQL: &str = "SELECT table_name, column_name, data_type \
 pub fn describe_schema(config: &DatabaseConfig, dirs: &Dirs, env: Env) -> Result<String, String> {
     let plan = match config.engine {
         DbEngine::Sqlite | DbEngine::DuckDb => {
-            let db = validate::resolve_inside(&dirs.data, &config.path)?;
+            let db = database_file(dirs, config)?;
+            if !db.exists() {
+                return Ok("(new database, no tables yet)".to_string());
+            }
             let program = match config.engine {
                 DbEngine::Sqlite => "sqlite3",
                 _ => "duckdb",
@@ -634,6 +976,7 @@ pub fn describe_schema(config: &DatabaseConfig, dirs: &Dirs, env: Env) -> Result
         &plan.env,
         plan.stdin.as_bytes(),
         DB_TIMEOUT,
+        &NEVER,
     )?;
     if run.timed_out {
         return Err(format!(
@@ -820,7 +1163,8 @@ struct Finished {
 }
 
 /// Run a program with a clean environment ([`INHERITED_ENV`] plus `env`), feeding `stdin`
-/// and collecting both output streams, killing it when `timeout` passes.
+/// and collecting both output streams, killing it when `timeout` passes or `cancel` is
+/// set (which ends in [`CANCELLED`]).
 fn run_process(
     program: &str,
     args: &[String],
@@ -828,6 +1172,7 @@ fn run_process(
     env: &[(String, String)],
     stdin: &[u8],
     timeout: Duration,
+    cancel: &AtomicBool,
 ) -> Result<Finished, String> {
     let mut command = Command::new(program);
     command.args(args).current_dir(cwd).env_clear();
@@ -869,6 +1214,7 @@ fn run_process(
 
     let start = Instant::now();
     let mut timed_out = false;
+    let mut cancelled = false;
     let status = loop {
         if let Some(status) = child
             .try_wait()
@@ -876,8 +1222,9 @@ fn run_process(
         {
             break status;
         }
-        if start.elapsed() >= timeout {
-            timed_out = true;
+        cancelled = cancel.load(Ordering::Relaxed);
+        if cancelled || start.elapsed() >= timeout {
+            timed_out = !cancelled;
             kill_group(child.id());
             let _ = child.kill();
             break child
@@ -886,6 +1233,9 @@ fn run_process(
         }
         thread::sleep(POLL);
     };
+    if cancelled {
+        return Err(CANCELLED.into());
+    }
     let _ = writer.join();
     let stdout = stdout.join().unwrap_or_default();
     let stderr = stderr.join().unwrap_or_default();
@@ -1283,6 +1633,36 @@ mod tests {
 
     fn no_env(_: &str) -> Option<String> {
         None
+    }
+
+    /// [`run_with`] under the default control: no cache, no cancel, no progress.
+    fn run(doc: &GraphDoc, id: &str, dirs: Dirs, http: &dyn Http, env: Env) -> Report {
+        run_with(doc, id, dirs, http, env, &Control::default())
+    }
+
+    /// A control that records progress and caches, with its cancel flag to hand.
+    fn recording_control() -> (Control, Arc<Mutex<Vec<Progress>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let control = Control {
+            cache: Some(Arc::new(Mutex::new(Cache::default()))),
+            fresh: false,
+            cancel: Arc::new(AtomicBool::new(false)),
+            progress: Some(Arc::new(move |p| sink.lock().unwrap().push(p))),
+        };
+        (control, seen)
+    }
+
+    fn sse(pieces: &[&str]) -> String {
+        let mut body = String::new();
+        for piece in pieces {
+            body.push_str(&format!(
+                "data: {}\n\n",
+                serde_json::json!({"choices": [{"delta": {"content": piece}}]})
+            ));
+        }
+        body.push_str("data: [DONE]\n");
+        body
     }
 
     fn with_key(name: &str) -> Option<String> {
@@ -1853,16 +2233,29 @@ mod tests {
 
     #[test]
     #[ignore = "needs a live model server; see the comment above"]
-    fn live_unknown_model_surfaces_the_servers_message() {
+    fn live_unknown_model_is_an_error_or_a_logged_substitution() {
+        // LM Studio has answered an unknown model id both ways: HTTP 404 naming the model,
+        // and HTTP 200 from whichever model is loaded. Either must be visible to the user.
         let root = scratch("live-404");
         let mut agent = live_agent("UAPZ_LIVE_MODEL", ModelType::Generative, OutputType::Text);
         agent.model = "uapz-no-such-model".into();
         agent.prompt = "Say hi.".into();
         let doc = graph(vec![node("n0", Some(NodeData::Agent(agent)))], &[]);
-        let err = live_run(&doc, "n0", &root).result.unwrap_err();
-        println!("error: {err}");
-        assert!(err.contains("HTTP 4"), "{err}");
-        assert!(err.contains("uapz-no-such-model"), "{err}");
+        let report = live_run(&doc, "n0", &root);
+        match &report.result {
+            Err(err) => {
+                assert!(err.contains("HTTP 4"), "{err}");
+                assert!(err.contains("uapz-no-such-model"), "{err}");
+            }
+            Ok(_) => {
+                let warning = report
+                    .log
+                    .iter()
+                    .find(|l| l.starts_with("⚠ answered by "))
+                    .unwrap_or_else(|| panic!("no substitution warning in {:?}", report.log));
+                assert!(warning.contains("not uapz-no-such-model"), "{warning}");
+            }
+        }
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -2105,8 +2498,8 @@ mod tests {
         assert_eq!(seen[0].headers[0].1, "Bearer secret");
         drop(seen);
 
-        // A writable node drops the read-only instruction; a missing database is reported
-        // inside the prompt rather than refusing to help.
+        // A writable node drops the read-only instruction; a database file that does not
+        // exist yet is one the node will create, and the prompt says so.
         let writable = DatabaseConfig {
             path: "new.sqlite".into(),
             read_only: false,
@@ -2124,7 +2517,7 @@ mod tests {
         let seen = http.seen.lock().unwrap();
         let system = seen[1].body["messages"][0]["content"].as_str().unwrap();
         assert!(!system.contains("must only read"), "{system}");
-        assert!(system.contains("schema unavailable"), "{system}");
+        assert!(system.contains("new database, no tables yet"), "{system}");
         drop(seen);
 
         let embedder = AgentConfig {
@@ -2418,6 +2811,365 @@ mod tests {
     }
 
     #[test]
+    fn cache_reuses_agents_and_scripts_until_their_inputs_change() {
+        let root = scratch("cache");
+        fs::write(root.join("data/a.txt"), "v1").unwrap();
+        fs::write(root.join("scripts/count.sh"), "wc -c | tr -d ' '\n").unwrap();
+        let http = FakeHttp::new(200, r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+        let doc = graph(
+            vec![
+                node("n0", data("a.txt", DataFormat::Text)),
+                node("n1", shell("count.sh", &[], 10)),
+                node("n2", Some(NodeData::Agent(fake_agent()))),
+            ],
+            &[("n0", "n1"), ("n1", "n2")],
+        );
+        let calls = || http.seen.lock().unwrap().len();
+        let (control, _) = recording_control();
+        let go =
+            |control: &Control| run_with(&doc, "n2", Dirs::under(&root), &http, &with_key, control);
+
+        let first = go(&control);
+        assert_eq!(first.result.as_ref().unwrap().as_text(), Some("ok"));
+        assert_eq!((first.cached, calls()), (0, 1));
+
+        // Nothing changed: the script and the agent come from the cache.
+        let again = go(&control);
+        assert_eq!((again.cached, calls()), (2, 1));
+        assert!(
+            again
+                .log
+                .iter()
+                .any(|l| l == "n2: reused the cached Text · 2 B"),
+            "{:?}",
+            again.log
+        );
+        assert_eq!(lock(control.cache.as_ref().unwrap()).len(), 2);
+
+        // The data changed, so the script output changes and the agent runs again.
+        fs::write(root.join("data/a.txt"), "v222").unwrap();
+        assert_eq!((go(&control).cached, calls()), (0, 2));
+
+        // The script file changed but its output did not: only the script reruns.
+        fs::write(
+            root.join("scripts/count.sh"),
+            "# counts bytes\nwc -c | tr -d ' '\n",
+        )
+        .unwrap();
+        assert_eq!((go(&control).cached, calls()), (1, 2));
+
+        // Fresh ignores the cache and refills it.
+        let fresh = Control {
+            fresh: true,
+            ..control.clone()
+        };
+        assert_eq!((go(&fresh).cached, calls()), (0, 3));
+        assert_eq!((go(&control).cached, calls()), (2, 3));
+
+        // Clearing it, or running with no cache at all, runs everything.
+        lock(control.cache.as_ref().unwrap()).clear();
+        assert_eq!((go(&control).cached, calls()), (0, 4));
+        assert_eq!((go(&Control::default()).cached, calls()), (0, 5));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn cancel_kills_scripts_and_ends_the_run() {
+        let root = scratch("cancel");
+        fs::write(root.join("scripts/slow.sh"), "sleep 20\n").unwrap();
+        let http = FakeHttp::new(200, "{}");
+        let doc = graph(vec![node("n0", shell("slow.sh", &[], 60))], &[]);
+        let (control, seen) = recording_control();
+        let flag = control.cancel.clone();
+        let setter = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let started = Instant::now();
+        let report = run_with(&doc, "n0", Dirs::under(&root), &http, &no_env, &control);
+        setter.join().unwrap();
+        assert_eq!(report.result.unwrap_err(), CANCELLED);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "killed promptly"
+        );
+        let progress = seen.lock().unwrap();
+        assert!(
+            progress
+                .iter()
+                .any(|p| matches!(p, Progress::Log(l) if l.starts_with("$ sh "))),
+            "{progress:?}"
+        );
+
+        // Already cancelled: nothing runs at all.
+        let report = run_with(&doc, "n0", Dirs::under(&root), &http, &no_env, &control);
+        assert_eq!(report.result.unwrap_err(), CANCELLED);
+        assert!(report.log.is_empty(), "{:?}", report.log);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn agents_stream_text_into_progress_and_stop_on_cancel() {
+        let root = scratch("stream");
+        let http = FakeHttp::new(200, &sse(&["Hel", "lo", " there"]));
+        let doc = graph(vec![node("n0", Some(NodeData::Agent(fake_agent())))], &[]);
+        let (control, seen) = recording_control();
+        let report = run_with(&doc, "n0", Dirs::under(&root), &http, &with_key, &control);
+        assert_eq!(report.result.unwrap().as_text(), Some("Hello there"));
+        assert_eq!(http.seen.lock().unwrap()[0].body["stream"], true);
+        let texts: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|p| match p {
+                Progress::Text { id, text } if id == "n0" => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["Hel", "lo", " there"]);
+        assert!(
+            !report.log.iter().any(|l| l.starts_with('⚠')),
+            "{:?}",
+            report.log
+        );
+        let logs = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| matches!(p, Progress::Log(_)))
+            .count();
+        assert_eq!(logs, report.log.len());
+
+        // Cancelling while text streams in ends the run as cancelled, with nothing saved.
+        let outputs = || {
+            fs::read_dir(root.join("agents/n0/outputs"))
+                .unwrap()
+                .count()
+        };
+        let saved_before = outputs();
+        let flag = Arc::new(AtomicBool::new(false));
+        let stop = flag.clone();
+        let control = Control {
+            cache: None,
+            fresh: false,
+            cancel: flag,
+            progress: Some(Arc::new(move |p| {
+                if matches!(p, Progress::Text { .. }) {
+                    stop.store(true, Ordering::Relaxed);
+                }
+            })),
+        };
+        let report = run_with(&doc, "n0", Dirs::under(&root), &http, &with_key, &control);
+        assert_eq!(report.result.unwrap_err(), CANCELLED);
+        assert_eq!(outputs(), saved_before);
+
+        // A server answering with another model than asked is called out in the log;
+        // snapshot and tag suffixes are the same model.
+        let other = FakeHttp::new(
+            200,
+            "data: {\"model\":\"loaded-instead\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n",
+        );
+        let report = run(&doc, "n0", Dirs::under(&root), &other, &with_key);
+        assert_eq!(report.result.unwrap().as_text(), Some("hi"));
+        assert!(
+            report
+                .log
+                .iter()
+                .any(|l| l == "⚠ answered by loaded-instead, not m: the server substituted a model"),
+            "{:?}",
+            report.log
+        );
+        let same = |answered: &str| substituted_model(&fake_agent(), Some(answered)).is_none();
+        assert!(same("m"));
+        assert!(same("m-2024-08-06"));
+        assert!(same("m:latest"));
+        assert!(!same("n"));
+        assert!(substituted_model(&fake_agent(), None).is_none());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn file_nodes_write_wire_text_inside_the_root() {
+        let root = scratch("file");
+        fs::write(root.join("data/code.md"), "```rust\nfn t() {}\n```").unwrap();
+        fs::write(root.join("data/img.png"), [0x89, b'P', b'N', b'G', 0, 0xff]).unwrap();
+        fs::write(root.join("data/empty.txt"), "").unwrap();
+        let http = FakeHttp::new(200, "{}");
+        let file = |path: &str, mode: WriteMode, unfence: bool| {
+            Some(NodeData::File(FileConfig {
+                path: path.into(),
+                mode,
+                unfence,
+            }))
+        };
+        let doc = graph(
+            vec![
+                node("n0", data("code.md", DataFormat::Markdown)),
+                node("n1", file("tests/gen/t.rs", WriteMode::Create, true)),
+                node("n2", file("tests/gen/t.rs", WriteMode::Overwrite, false)),
+                node("n3", file("tests/gen/t.rs", WriteMode::Append, true)),
+                node("n4", file("scripts/planted.sh", WriteMode::Overwrite, true)),
+                node("n5", data("img.png", DataFormat::Image)),
+                node("n6", file("out/copy.png", WriteMode::Create, true)),
+                node("n7", file("both.txt", WriteMode::Create, true)),
+                node("n8", data("empty.txt", DataFormat::Text)),
+                node("n9", file("nothing.txt", WriteMode::Create, true)),
+                node("n10", file("", WriteMode::Create, true)),
+                node("n11", file("alone.txt", WriteMode::Create, true)),
+            ],
+            &[
+                ("n0", "n1"),
+                ("n0", "n2"),
+                ("n0", "n3"),
+                ("n0", "n4"),
+                ("n5", "n6"),
+                ("n0", "n7"),
+                ("n5", "n7"),
+                ("n8", "n9"),
+                ("n0", "n10"),
+            ],
+        );
+        let go = |id: &str| run(&doc, id, Dirs::under(&root), &http, &no_env);
+        let real_root = root.canonicalize().unwrap();
+
+        // Create: directories made on the way, fence stripped, newline added, text flows on.
+        let out = go("n1").result.expect("create");
+        let target = real_root.join("tests/gen/t.rs");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "fn t() {}\n");
+        assert_eq!(out.as_text(), Some("fn t() {}\n"));
+        assert_eq!(out.label, "Wrote tests/gen/t.rs · 10 B");
+        assert_eq!(out.saved.as_deref(), Some(target.as_path()));
+        let err = go("n1").result.unwrap_err();
+        assert!(err.contains("exists"), "{err}");
+
+        // Overwrite without unfencing keeps the text as it came.
+        go("n2").result.expect("overwrite");
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "```rust\nfn t() {}\n```"
+        );
+        // Append adds to it.
+        let report = go("n3");
+        report.result.expect("append");
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "```rust\nfn t() {}\n```fn t() {}\n"
+        );
+        assert!(
+            report.log.iter().any(|l| l.starts_with("appended to ")),
+            "{:?}",
+            report.log
+        );
+
+        // The app's directories are refused at validation and nothing is written.
+        let err = go("n4").result.unwrap_err();
+        assert!(err.contains("managed by the app"), "{err}");
+        assert!(!root.join("scripts/planted.sh").exists());
+
+        // A lone binary input is written byte for byte.
+        let out = go("n6").result.expect("binary");
+        assert!(!out.text);
+        assert_eq!(
+            fs::read(root.join("out/copy.png")).unwrap(),
+            [0x89, b'P', b'N', b'G', 0, 0xff]
+        );
+        // Binary next to text can't be joined.
+        let err = go("n7").result.unwrap_err();
+        assert!(err.contains("binary output"), "{err}");
+        assert!(!root.join("both.txt").exists());
+
+        // Empty input, an empty path and no input at all are errors.
+        let err = go("n9").result.unwrap_err();
+        assert!(err.contains("nothing to write"), "{err}");
+        let err = go("n10").result.unwrap_err();
+        assert!(err.contains("not valid: path"), "{err}");
+        let err = go("n11").result.unwrap_err();
+        assert!(err.contains("nothing to write"), "{err}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn writable_sqlite_nodes_may_create_the_database() {
+        require("sqlite3");
+        let root = scratch("newdb");
+        let http = FakeHttp::new(200, "{}");
+        let db = |path: &str, query: &str, read_only: bool| {
+            Some(NodeData::Database(DatabaseConfig {
+                path: path.into(),
+                query: query.into(),
+                read_only,
+                ..DatabaseConfig::default()
+            }))
+        };
+        let doc = graph(
+            vec![
+                node("n0", db("fresh.sqlite", "CREATE TABLE t(a INTEGER)", false)),
+                node(
+                    "n1",
+                    db("fresh.sqlite", "SELECT count(*) AS n FROM t", true),
+                ),
+                node("n2", db("missing/x.sqlite", "CREATE TABLE t(a)", false)),
+                node("n3", db("absent.sqlite", "SELECT 1", true)),
+            ],
+            &[],
+        );
+        let go = |id: &str| run(&doc, id, Dirs::under(&root), &http, &no_env);
+        let config = DatabaseConfig {
+            path: "fresh.sqlite".into(),
+            read_only: false,
+            ..DatabaseConfig::default()
+        };
+        assert_eq!(
+            describe_schema(&config, &Dirs::under(&root), &no_env).unwrap(),
+            "(new database, no tables yet)"
+        );
+        go("n0").result.expect("creates the file");
+        assert!(root.join("data/fresh.sqlite").is_file());
+        let out = go("n1").result.expect("reads it back");
+        assert_eq!(out.as_text().map(str::trim), Some(r#"[{"n":0}]"#));
+        assert!(
+            describe_schema(&config, &Dirs::under(&root), &no_env)
+                .unwrap()
+                .contains("CREATE TABLE t"),
+        );
+        let err = go("n2").result.unwrap_err();
+        assert!(err.contains("does not exist"), "{err}");
+        assert!(!root.join("data/missing").exists());
+        let err = go("n3").result.unwrap_err();
+        assert!(err.contains("absent.sqlite"), "{err}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs a live model server; see the comment above"]
+    fn live_agent_streams_its_answer_in_pieces() {
+        let mut agent = live_agent("UAPZ_LIVE_MODEL", ModelType::Generative, OutputType::Text);
+        agent.prompt = "Count from one to twenty in words, separated by commas.".into();
+        let http = providers::UreqHttp::new(HTTP_TIMEOUT);
+        let mut pieces: Vec<String> = Vec::new();
+        let out = providers::generate_streaming(&http, &agent, None, "", &mut |text| {
+            pieces.push(text.to_string());
+            true
+        })
+        .expect("live stream");
+        let text = String::from_utf8(out.bytes).unwrap();
+        println!("{} pieces: {text}", pieces.len());
+        assert!(pieces.len() >= 2, "{pieces:?}");
+        assert_eq!(pieces.concat(), text);
+        assert!(text.to_lowercase().contains("twenty"), "{text}");
+
+        // Stopping after the first piece ends the request.
+        let mut count = 0;
+        let err = providers::generate_streaming(&http, &agent, None, "", &mut |_| {
+            count += 1;
+            false
+        })
+        .unwrap_err();
+        assert_eq!(err, providers::STOPPED);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
     #[ignore = "needs a live model server; see the comment above"]
     fn live_agent_writes_tests_for_a_directory() {
         let root = scratch("live-dir");
@@ -2449,6 +3201,46 @@ mod tests {
         let text = out.as_text().unwrap();
         assert!(text.contains("#[test]"), "{text}");
         assert!(text.contains("add("), "{text}");
+
+        // The same answer lands in the repository through a write-file node, and a second
+        // run with a cache does not call the model again.
+        let mut doc = doc;
+        doc.nodes.push(node(
+            "n2",
+            Some(NodeData::File(FileConfig {
+                path: "tests/generated.rs".into(),
+                mode: WriteMode::Overwrite,
+                unfence: true,
+            })),
+        ));
+        doc.edges.push(EdgeDoc {
+            from: "n1".into(),
+            to: "n2".into(),
+        });
+        let (control, _) = recording_control();
+        let http = providers::UreqHttp::new(HTTP_TIMEOUT);
+        let first = run_with(
+            &doc,
+            "n2",
+            Dirs::under(&root),
+            &http,
+            &process_env,
+            &control,
+        );
+        first.result.expect("directory → agent → file");
+        let written = fs::read_to_string(root.join("tests/generated.rs")).unwrap();
+        assert!(written.contains("#[test]"), "{written}");
+        assert!(!written.starts_with("```"), "{written}");
+        let second = run_with(
+            &doc,
+            "n2",
+            Dirs::under(&root),
+            &http,
+            &process_env,
+            &control,
+        );
+        second.result.expect("second run");
+        assert_eq!(second.cached, 1, "{:?}", second.log);
         fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -78,7 +78,7 @@ struct Status {
     error: bool,
 }
 
-/// Dropdown entries: Blank, the four content types (with the writable database after the
+/// Dropdown entries: Blank, the content types (with the writable database after the
 /// read-only one), then every saved kind in list order.
 fn select_items(kinds: &[NodeKind]) -> Vec<SharedString> {
     std::iter::once(SharedString::from(BLANK))
@@ -1013,6 +1013,7 @@ mod tests {
                 "Script",
                 "Data",
                 "Directory",
+                "Write file",
                 "Note"
             ]
         );
@@ -1020,6 +1021,7 @@ mod tests {
         assert_eq!(current_of("Database"), Current::Type(NodeType::Database));
         assert_eq!(current_of("Database (write)"), Current::WritableDatabase);
         assert_eq!(current_of("Directory"), Current::Type(NodeType::Directory));
+        assert_eq!(current_of("Write file"), Current::Type(NodeType::File));
         assert_eq!(current_of("Note"), Current::Kind("Note".into()));
     }
 

@@ -2,12 +2,16 @@
 
 A small native node-graph editor built with [gpui-kit](https://gpui-kit.com). Nodes are
 boxes you drag around and wire together; each one can carry typed content: an **agent**,
-a **database**, a **script**, a **data** file or a **directory**. Graphs save as a Markdown file with a
-Mermaid diagram plus a JSON sidecar, and reusable agents, prompts and databases save into
-their own directories so they show up in the sidebar.
+a **database**, a **script**, a **data** file, a **directory** or a **file to write**.
+Graphs save as a Markdown file with a Mermaid diagram plus a JSON sidecar, and reusable
+agents, prompts and databases save into their own directories so they show up in the
+sidebar.
 
 Nodes run from the inspector. A node runs after everything wired into it, text flows along
-the wires, and every agent result is saved under that agent with a timestamp.
+the wires, agent answers stream into the panel as they are generated, and every agent
+result is saved under that agent with a timestamp. Outputs are cached between runs, so
+running a downstream node again does not re-call the agents above it unless something they
+depend on changed.
 
 ## Running
 
@@ -18,7 +22,8 @@ cargo run
 
 Tests cover the file formats, the Mermaid parser, every node config's validation, the SQL
 checker, path confinement, the library's on-disk layout, the executor (scripts, SQLite,
-chains, timeouts) and the request shape for every provider:
+chains, timeouts, the cache, cancellation, write-file nodes), streamed replies in every
+provider's shape and the request shape for every provider:
 
 ```sh
 cargo test
@@ -48,18 +53,19 @@ an inspector on the right. Drag the divider beside either side panel to resize i
 - Click a node or a wire to select it. Backspace or Delete removes it. Deleting a node
   removes its wires.
 - Double-click empty space, press cmd-n, or click **Add node** to add a node of whatever
-  the toolbar dropdown has selected: **Blank**, one of the five types, **Database
+  the toolbar dropdown has selected: **Blank**, one of the six types, **Database
   (write)**, or a saved kind.
 - Escape cancels a drag and clears the selection.
 - A typed node shows its label (its type, or the preset it came from) and a one-line
-  summary such as `Ollama · llama3.1` or `SQLite · sales.sqlite`. A database node whose
-  read-only switch is off is red and says `· write` in its summary.
+  summary such as `Ollama · llama3.1` or `SQLite · sales.sqlite`. Red nodes write: a
+  database node whose read-only switch is off (its summary says `· write`) and a **Write
+  file** node.
 
 **Inspector**
 
 - Select a node and its content appears as a form. Every edit writes straight back into
   the node; nothing is saved to disk until you save the graph or a preset.
-- A blank node offers buttons to give it content: the five types plus **Database (write)**,
+- A blank node offers buttons to give it content: the six types plus **Database (write)**,
   a database node that starts with its read-only switch off. A typed node can change type
   or go back to blank at the bottom of the panel.
 - Problems are listed under the form as they happen (`model: model is empty`, `query:
@@ -68,9 +74,11 @@ an inspector on the right. Drag the divider beside either side panel to resize i
   the field next to it and labels the node with that name. Invalid configs are refused.
 - In an agent, **Save prompt** writes the prompt text to `prompts/<name>.md`. Clicking a
   prompt in the sidebar loads it into the selected agent.
-- **Run** executes the selected node after everything wired into it. The result, the log
-  and a text preview appear under the form; the status line says where an agent's output
-  was saved. See *Running nodes*.
+- **Run** executes the selected node after everything wired into it. While it runs, the
+  log grows line by line and an agent's answer streams into a preview as it is generated;
+  **Cancel** stops it. The result, the log and a text preview appear under the form; the
+  status line says where an agent's output was saved and how many nodes came from the
+  cache. **Run fresh** ignores the cache. See *Running nodes*.
 
 **Sidebar**
 
@@ -148,6 +156,22 @@ the graph reads the repository the app runs in.
 | Max files | 1 to 10,000; the listing says when more matched |
 | Content budget | Bytes of contents after the listing; files are cut when it runs out. The agent downstream must still fit everything in its context size |
 
+**Write file**
+
+Writes the text arriving on its wire to a file in the working directory: the way an
+agent's answer becomes a test file, a document or a data file in the repository. Wire
+**Directory → Agent → Write file** and a run reads the code, drafts the tests and lands
+them on disk. The node is red because it changes files outside the app's own folders.
+
+| Field | Notes |
+| --- | --- |
+| File | Relative to the working directory; directories on the way are created. The path is yours, never the model's. `scripts/`, `agents/`, `prompts/`, `databases/`, `nodes/` and `graphs/` are refused, so a run can never plant a script or rewrite a preset. `data/` is allowed |
+| If the file exists | **Create only** (the default) refuses to touch an existing file; **Overwrite** replaces it; **Append** adds to it |
+| Strip a code fence | On by default: a surrounding ```` ``` ```` fence is removed and the text ends with a newline, which is what a model's answer needs to become a source file. Off writes the bytes as they came |
+
+A single binary input (an image from an agent) is written byte for byte. The node's output
+is what it wrote, so a script can run on the file next.
+
 ## Running nodes
 
 Press **Run** in the inspector. The executor runs the selected node's upstream nodes first
@@ -161,6 +185,29 @@ and hands that to the node:
 | Database | `sqlite3 -json`, `duckdb -json`, `psql --csv` or `mysql --batch` with the query on stdin | the SQL to run, only when the node's own query is empty; data comes from the input file | rows as JSON (file engines) or CSV/TSV (server engines) |
 | Agent | One request to the provider | the user message | text, JSON, an embedding vector or an image, saved to `agents/<name>/outputs/` |
 | Directory | Walks the directory (hidden entries and symlinks skipped, `.gitignore` honored when asked, 32 levels deep) | nothing | text: `Directory <path>: N files matched`, one line per file with its size, then `=== path ===` sections with contents until the budget is spent; binary files are named, not shown |
+| Write file | Creates, replaces or appends to the file, after checking the path again and resolving symlinks | the content | the content it wrote, with the file's path in the status line |
+
+**Streaming.** Generative agents are asked for a streamed reply (`stream: true`, or
+Google's `streamGenerateContent`), the body is read as it arrives, and every piece of text
+reaches the inspector while the model is still typing. JSON output is validated and
+pretty-printed once the stream ends, so the preview shows the raw text and the result is
+the finished document. A server that ignores the request and answers in one piece still
+works. Embeddings and images are not streams.
+
+**Cancel.** The run checks a cancel flag before every node, between the pieces of a
+streamed reply, and inside the wait for a child process, which is killed with its process
+group. A provider call that does not stream (embeddings, images) finishes or times out
+first. A cancelled run saves nothing and reports `Cancelled`.
+
+**Cache.** The inspector keeps every agent's and script's output across runs, keyed on the
+node's configuration, its inputs' outputs and (for scripts) the script file itself, so
+running a downstream node again re-uses the agents above it. Data, directory, database and
+write-file nodes always run: they read or change live state, and they are cheap. Every
+node's output is hashed for the nodes after it, so editing a comment in a script does not
+re-run the agent that reads its output, while changing a data file does. The log says
+`n3: reused the cached Text · 2 KB` for each hit, the status line counts them, **Run
+fresh** runs everything and refills the cache, and **Clear** under the run drops it. The
+cache lives in memory for the session; agent outputs are also on disk under `agents/`.
 
 Agents send the prompt as the system message and the wire text as the user message; with
 nothing on the wire the prompt is the user message. Prompt plus input must fit the context
@@ -175,10 +222,15 @@ A database node with an empty query runs the text arriving on the wire as its st
 with a surrounding code fence stripped. That SQL goes through the same checker as a typed
 query, with the node's read-only flag, so an agent wired into a read-only node can only
 read. Wire a generative agent into a **Database (write)** node and the agent's SQL can
-change the database: that is what the red color warns about.
+change the database: that is what the red color warns about. A writable SQLite or DuckDB
+node may name a file that does not exist yet, in an existing directory under `data/`; the
+engine creates it. Read-only nodes need an existing file.
 
-Provider notes: Ollama is called on its native API so the context size reaches the model
-as `num_ctx`. Anthropic is called on API version 2026-10-21 with server-side refusal
+Provider notes: when a reply names the model that answered and it is not the one asked for
+(LM Studio answers an unknown model id with whatever is loaded), the log says so:
+`⚠ answered by mistralai/ministral-3-3b, not my-typo: the server substituted a model`.
+Snapshot and tag suffixes (`gpt-4o-2024-08-06`, `llama3.1:latest`) count as the same model.
+Ollama is called on its native API so the context size reaches the model as `num_ctx`. Anthropic is called on API version 2026-10-21 with server-side refusal
 fallbacks enabled for the models that support them (Claude Opus 5.5, Opus 5, Sonnet 5.5,
 Fable 5.1). Google takes the key in a header, never in the URL. Embeddings work on every
 provider but Anthropic; image generation only on OpenAI (and Custom).
@@ -225,7 +277,12 @@ enforced now, at edit time, and are meant to be re-checked at run time.
   database through the validated input field, not through the query.
 - **Scripts are files you placed there.** The app never writes to `scripts/`; a node can
   only point at an existing file with a runtime-matching extension and pass bounded
-  arguments.
+  arguments. Write-file nodes refuse `scripts/` and every other directory the app manages,
+  at edit time and again at run time, so a run can never create a script, an agent, a
+  prompt, a database preset, a kind or a graph.
+- **Write-file paths are the user's.** The path is a setting on the node; nothing on the
+  wire can choose it. It is resolved with symlinks followed and must stay under the working
+  directory, missing directories included.
 - **Saving is strict, drafting is not.** The graph file keeps whatever you typed, flagged
   in the inspector. The library refuses to save an invalid agent or database, and the
   canvas shows the first problem.
@@ -252,7 +309,7 @@ are plain text, so they are easy to commit, diff or hand-edit.
 | `prompts/<name>.md` | A reusable prompt |
 | `databases/<name>.json` | A saved database config |
 | `scripts/` | Script files for script nodes (`.py`, `.sh`, `.js`, …) |
-| `data/` | Data files and database files for data and database nodes |
+| `data/` | Data files and database files for data and database nodes; write-file nodes may write here |
 
 ### `graphs/<name>.md`
 

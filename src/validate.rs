@@ -278,6 +278,87 @@ pub fn resolve_directory_inside(root: &Path, raw: &str) -> Result<PathBuf, Strin
     Ok(real)
 }
 
+/// A path a write node may create or replace: a [`relative_path`] whose first component
+/// is not one of the directories the app manages, so a node can never plant a script,
+/// agent, prompt, database preset, kind or graph. Pure: the file need not exist.
+pub fn writable_path(raw: &str) -> Result<PathBuf, String> {
+    let rel = relative_path(raw)?;
+    let first = rel
+        .components()
+        .next()
+        .and_then(|c| c.as_os_str().to_str())
+        .unwrap_or_default();
+    if let Some(reserved) = crate::library::RESERVED_DIRS
+        .iter()
+        .find(|d| d.eq_ignore_ascii_case(first))
+    {
+        return Err(format!(
+            "`{reserved}/` is managed by the app; nodes can't write into it"
+        ));
+    }
+    Ok(rel)
+}
+
+/// Resolve a file that may not exist yet inside `root`: the deepest existing ancestor is
+/// canonicalized and proven to be a directory under the real root, then the missing tail
+/// is appended. An existing target is resolved like [`resolve_inside`] and must be a
+/// regular file. For executors that create or replace files.
+pub fn resolve_new_inside(root: &Path, rel: &Path) -> Result<PathBuf, String> {
+    let root = root
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", root.display()))?;
+    let path = root.join(rel);
+    if path.symlink_metadata().is_ok() {
+        let real = path
+            .canonicalize()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        if !real.starts_with(&root) {
+            return Err(format!(
+                "{} resolves to {}, outside {}",
+                rel.display(),
+                real.display(),
+                root.display()
+            ));
+        }
+        if !real.is_file() {
+            return Err(format!("{} is not a regular file", real.display()));
+        }
+        return Ok(real);
+    }
+    // Walk up to something that exists. `rel` has no `.` or `..`, so this stops at the
+    // root at the latest.
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut dir = path.as_path();
+    loop {
+        tail.push(dir.file_name().unwrap_or_default().to_os_string());
+        dir = dir
+            .parent()
+            .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+        if dir.symlink_metadata().is_ok() {
+            break;
+        }
+    }
+    let real_dir = dir
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", dir.display()))?;
+    if !real_dir.starts_with(&root) {
+        return Err(format!(
+            "{} resolves to {}, outside {}",
+            rel.display(),
+            real_dir.display(),
+            root.display()
+        ));
+    }
+    if !real_dir.is_dir() {
+        return Err(format!("{} is not a directory", real_dir.display()));
+    }
+    let mut out = real_dir;
+    for part in tail.iter().rev() {
+        out.push(part);
+    }
+    Ok(out)
+}
+
 /// The lowercase extension of a path, if it has one.
 pub fn extension(raw: &str) -> Option<String> {
     Path::new(raw.trim())
@@ -989,6 +1070,73 @@ mod tests {
         assert_eq!(unfenced("  SELECT 1  "), "SELECT 1");
         assert_eq!(unfenced("```SELECT 1```"), "SELECT 1");
         assert_eq!(unfenced(""), "");
+    }
+
+    #[test]
+    fn writable_paths_skip_app_directories_and_resolve_new_files() {
+        assert_eq!(
+            writable_path("tests/gen/a.rs").unwrap(),
+            PathBuf::from("tests/gen/a.rs")
+        );
+        assert!(writable_path("data/out.csv").is_ok());
+        for bad in [
+            "scripts/x.sh",
+            "SCRIPTS/x.sh",
+            "agents/a/agent.json",
+            "graphs/g.md",
+        ] {
+            let err = writable_path(bad).unwrap_err();
+            assert!(err.contains("managed by the app"), "{bad}: {err}");
+        }
+        assert!(writable_path("../x").is_err());
+        assert!(writable_path("").is_err());
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("uapz-new-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "").unwrap();
+        std::fs::write(root.join("outside.txt"), "").unwrap();
+        let real_root = root.canonicalize().unwrap();
+
+        // A new file in an existing directory, and one under directories yet to be made.
+        let fresh = resolve_new_inside(&root, Path::new("src/new.rs")).unwrap();
+        assert_eq!(fresh, real_root.join("src/new.rs"));
+        let deep = resolve_new_inside(&root, Path::new("tests/gen/deep.rs")).unwrap();
+        assert_eq!(deep, real_root.join("tests/gen/deep.rs"));
+        assert!(!deep.parent().unwrap().exists(), "nothing is created here");
+
+        // An existing regular file resolves; a directory does not.
+        assert_eq!(
+            resolve_new_inside(&root, Path::new("src/lib.rs")).unwrap(),
+            real_root.join("src/lib.rs")
+        );
+        assert!(
+            resolve_new_inside(&root, Path::new("src"))
+                .unwrap_err()
+                .contains("not a regular file")
+        );
+
+        // Symlinks are followed and must stay inside the root.
+        #[cfg(unix)]
+        {
+            let elsewhere = std::env::temp_dir().join(format!("uapz-new-out-{nanos}"));
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, root.join("escape")).unwrap();
+            let err = resolve_new_inside(&root, Path::new("escape/file.txt")).unwrap_err();
+            assert!(err.contains("outside"), "{err}");
+            std::os::unix::fs::symlink(root.join("outside.txt"), root.join("src/alias.txt"))
+                .unwrap();
+            // Points inside the root, so writing through it is allowed.
+            assert_eq!(
+                resolve_new_inside(&root, Path::new("src/alias.txt")).unwrap(),
+                real_root.join("outside.txt")
+            );
+            std::fs::remove_dir_all(&elsewhere).unwrap();
+        }
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

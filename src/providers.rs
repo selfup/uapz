@@ -5,6 +5,13 @@
 //! two around an [`Http`] client. The client is a trait so tests can use a fake; the real
 //! one is [`UreqHttp`].
 //!
+//! [`generate_streaming`] is the same call for generative models with the reply streamed:
+//! the request asks for a stream, the body is read as it arrives, and every piece of text
+//! goes to a callback that may stop the request. Servers answer with server-sent events
+//! (`data: {…}` lines) or, for Ollama, one JSON object per line; both are handled by the
+//! same line parser. A server that ignores the request and answers in one piece still
+//! works: the whole body goes through [`parse_reply`].
+//!
 //! Protocols:
 //! - OpenAI-compatible servers (OpenAI, OpenRouter, Mistral, LM Studio, llama.cpp, custom)
 //!   share `/chat/completions`, `/embeddings` and `/images/generations`. JSON output is
@@ -41,6 +48,10 @@ pub const MAX_OUTPUT_TOKENS: u32 = 16_000;
 /// Replies larger than this are cut off; images are the only big ones.
 pub const MAX_REPLY_BYTES: u64 = 64 * 1024 * 1024;
 const JSON_INSTRUCTION: &str = "Respond with a single JSON value and nothing else.";
+/// The error [`generate_streaming`] returns when its callback stopped the request.
+pub const STOPPED: &str = "the request was stopped";
+/// How much of a streamed body is read at a time.
+const STREAM_CHUNK: usize = 8 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Request {
@@ -59,6 +70,19 @@ pub struct Reply {
 /// transport failures are errors.
 pub trait Http: Send + Sync {
     fn post_json(&self, request: &Request) -> Result<Reply, String>;
+
+    /// The same POST with the body handed over in pieces as it arrives, each with the
+    /// status, for streamed replies. `sink` returns false to stop reading; the status is
+    /// returned either way. The default delivers the whole body at once.
+    fn post_json_streaming(
+        &self,
+        request: &Request,
+        sink: &mut dyn FnMut(u16, &[u8]) -> bool,
+    ) -> Result<u16, String> {
+        let reply = self.post_json(request)?;
+        sink(reply.status, reply.body.as_bytes());
+        Ok(reply.status)
+    }
 }
 
 pub struct UreqHttp {
@@ -95,6 +119,44 @@ impl Http for UreqHttp {
             .map_err(|e| format!("reading the reply from {} failed: {e}", request.url))?;
         Ok(Reply { status, body })
     }
+
+    fn post_json_streaming(
+        &self,
+        request: &Request,
+        sink: &mut dyn FnMut(u16, &[u8]) -> bool,
+    ) -> Result<u16, String> {
+        let mut req = self.agent.post(&request.url);
+        for (key, value) in &request.headers {
+            req = req.header(key.as_str(), value.as_str());
+        }
+        let mut response = req
+            .send_json(&request.body)
+            .map_err(|e| format!("request to {} failed: {e}", request.url))?;
+        let status = response.status().as_u16();
+        let mut reader = response
+            .body_mut()
+            .with_config()
+            .limit(MAX_REPLY_BYTES)
+            .reader();
+        let mut buf = vec![0u8; STREAM_CHUNK];
+        loop {
+            match std::io::Read::read(&mut reader, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if !sink(status, &buf[..n]) {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "reading the reply from {} failed: {e}",
+                        request.url
+                    ));
+                }
+            }
+        }
+        Ok(status)
+    }
 }
 
 /// Send `input` through the agent and return the output bytes in the agent's output type.
@@ -107,6 +169,200 @@ pub fn generate(
     let request = build_request(config, key, input)?;
     let reply = http.post_json(&request)?;
     parse_reply(config, &reply)
+}
+
+/// What [`generate_streaming`] produced.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Streamed {
+    /// The output in the agent's output type, as [`generate`] would return it.
+    pub bytes: Vec<u8>,
+    /// The model id the server says answered, when the reply carries one. Servers may
+    /// substitute a loaded model for an unknown name; the executor logs the difference.
+    pub model: Option<String>,
+}
+
+/// [`generate`] with the reply streamed for generative models: `on_text` gets each piece
+/// of text as it arrives and returns false to stop, which ends in [`STOPPED`]. The bytes
+/// are the same ones [`generate`] would return, JSON validated and pretty-printed at the
+/// end. Embeddings and images are not streams and go through [`generate`].
+pub fn generate_streaming(
+    http: &dyn Http,
+    config: &AgentConfig,
+    key: Option<&str>,
+    input: &str,
+    on_text: &mut dyn FnMut(&str) -> bool,
+) -> Result<Streamed, String> {
+    if config.model_type != ModelType::Generative {
+        return generate(http, config, key, input).map(|bytes| Streamed { bytes, model: None });
+    }
+    let mut request = build_request(config, key, input)?;
+    let api = config.provider.api();
+    ask_for_stream(&mut request, api);
+    let mut stream = Stream::new(config, on_text);
+    let mut body: Vec<u8> = Vec::new();
+    let status = http.post_json_streaming(&request, &mut |status, chunk| {
+        if body.len() < MAX_REPLY_BYTES as usize {
+            body.extend_from_slice(chunk);
+        }
+        // Error bodies are plain JSON, kept whole for the message below.
+        status >= 400 || stream.feed(chunk)
+    })?;
+    if stream.stopped {
+        return Err(STOPPED.into());
+    }
+    if let Some(error) = stream.error {
+        return Err(error);
+    }
+    if status >= 400 || stream.text.is_empty() {
+        // Not a stream after all (or nothing in it): read it as a single reply.
+        let body = String::from_utf8_lossy(&body).into_owned();
+        let model = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|value| reply_model(api, &value));
+        let bytes = parse_reply(config, &Reply { status, body })?;
+        return Ok(Streamed { bytes, model });
+    }
+    Ok(Streamed {
+        bytes: finish_text(config, &stream.text)?,
+        model: stream.model,
+    })
+}
+
+/// The model id a reply or stream event names, in each API's shape.
+fn reply_model(api: Api, value: &Value) -> Option<String> {
+    let model = match api {
+        Api::OpenAi | Api::Ollama => value["model"].as_str(),
+        Api::Anthropic => value["model"]
+            .as_str()
+            .or_else(|| value["message"]["model"].as_str()),
+        Api::Google => value["modelVersion"].as_str(),
+    };
+    model.map(str::to_string).filter(|m| !m.is_empty())
+}
+
+/// Turn a built request into its streaming form.
+fn ask_for_stream(request: &mut Request, api: Api) {
+    match api {
+        Api::OpenAi | Api::Ollama | Api::Anthropic => request.body["stream"] = json!(true),
+        Api::Google => {
+            if let Some(base) = request.url.strip_suffix(":generateContent") {
+                request.url = format!("{base}:streamGenerateContent?alt=sse");
+            }
+        }
+    }
+}
+
+/// Reads a streamed body line by line, pulling the text out of each event.
+struct Stream<'a> {
+    api: Api,
+    provider: &'static str,
+    /// Bytes after the last complete line.
+    pending: Vec<u8>,
+    text: String,
+    /// The model named by the first event that names one.
+    model: Option<String>,
+    error: Option<String>,
+    stopped: bool,
+    on_text: &'a mut dyn FnMut(&str) -> bool,
+}
+
+impl<'a> Stream<'a> {
+    fn new(config: &AgentConfig, on_text: &'a mut dyn FnMut(&str) -> bool) -> Self {
+        Self {
+            api: config.provider.api(),
+            provider: config.provider.label(),
+            pending: Vec::new(),
+            text: String::new(),
+            model: None,
+            error: None,
+            stopped: false,
+            on_text,
+        }
+    }
+
+    /// Take more bytes; false means stop reading (the callback said so, or an error event
+    /// arrived).
+    fn feed(&mut self, chunk: &[u8]) -> bool {
+        self.pending.extend_from_slice(chunk);
+        while let Some(end) = self.pending.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = self.pending.drain(..=end).collect();
+            let line = String::from_utf8_lossy(&line);
+            if !self.line(line.trim_end_matches(['\r', '\n'])) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// One line: an SSE `data:` payload or a bare JSON object (Ollama). Everything else
+    /// (`event:`, `id:`, comments, blank lines) is skipped.
+    fn line(&mut self, line: &str) -> bool {
+        let payload = match line.strip_prefix("data:") {
+            Some(rest) => rest.trim(),
+            None if line.starts_with('{') => line,
+            None => return true,
+        };
+        if payload == "[DONE]" {
+            return true;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(payload) else {
+            return true;
+        };
+        if self.model.is_none() {
+            self.model = reply_model(self.api, &value);
+        }
+        match self.event(&value) {
+            Err(e) => {
+                self.error = Some(e);
+                false
+            }
+            Ok(None) => true,
+            Ok(Some(text)) => {
+                self.text.push_str(&text);
+                if (self.on_text)(&text) {
+                    true
+                } else {
+                    self.stopped = true;
+                    false
+                }
+            }
+        }
+    }
+
+    /// The text carried by one event, if any, in each API's shape.
+    fn event(&self, value: &Value) -> Result<Option<String>, String> {
+        if let Some(message) = error_message(value) {
+            return Err(format!("{}: {message}", self.provider));
+        }
+        let text = match self.api {
+            Api::OpenAi => value["choices"][0]["delta"]["content"]
+                .as_str()
+                .map(str::to_string),
+            Api::Ollama => value["message"]["content"].as_str().map(str::to_string),
+            Api::Anthropic => match value["type"].as_str() {
+                Some("content_block_delta") => value["delta"]["text"].as_str().map(str::to_string),
+                Some("message_delta")
+                    if value["delta"]["stop_reason"].as_str() == Some("refusal") =>
+                {
+                    return Err(refusal(&value["delta"]["stop_details"]));
+                }
+                _ => None,
+            },
+            Api::Google => Some(joined_text(
+                value["candidates"][0]["content"]["parts"].as_array(),
+                |part| part["text"].as_str(),
+            )),
+        };
+        Ok(text.filter(|t| !t.is_empty()))
+    }
+}
+
+fn refusal(details: &Value) -> String {
+    format!(
+        "Anthropic declined the request ({}): {}",
+        details["category"].as_str().unwrap_or("no category"),
+        details["explanation"].as_str().unwrap_or("no explanation")
+    )
 }
 
 /// The system prompt (if any) and the user text. With no input the prompt is the user text;
@@ -360,12 +616,7 @@ pub fn parse_reply(config: &AgentConfig, reply: &Reply) -> Result<Vec<u8>, Strin
         (Api::Ollama, ModelType::Embedding) => floats(&value["embeddings"][0], provider),
         (Api::Anthropic, ModelType::Generative) => {
             if value["stop_reason"].as_str() == Some("refusal") {
-                let details = &value["stop_details"];
-                return Err(format!(
-                    "Anthropic declined the request ({}): {}",
-                    details["category"].as_str().unwrap_or("no category"),
-                    details["explanation"].as_str().unwrap_or("no explanation")
-                ));
+                return Err(refusal(&value["stop_details"]));
             }
             let text = joined_text(value["content"].as_array(), |block| {
                 (block["type"].as_str() == Some("text")).then(|| block["text"].as_str())?
@@ -963,6 +1214,278 @@ pub(crate) mod tests {
         };
         let err = generate(&http, &unreachable, None, "hi").unwrap_err();
         assert!(err.contains("failed"), "{err}");
+    }
+
+    /// Streamed pieces and the final bytes from a fake server body.
+    fn stream_with(
+        config: &AgentConfig,
+        status: u16,
+        body: &str,
+    ) -> (Result<Vec<u8>, String>, Vec<String>, Request) {
+        let (result, pieces, request) = stream_full(config, status, body);
+        (result.map(|s| s.bytes), pieces, request)
+    }
+
+    fn stream_full(
+        config: &AgentConfig,
+        status: u16,
+        body: &str,
+    ) -> (Result<Streamed, String>, Vec<String>, Request) {
+        let http = FakeHttp::new(status, body);
+        let mut pieces = Vec::new();
+        let result = generate_streaming(&http, config, Some("k"), "hi", &mut |text| {
+            pieces.push(text.to_string());
+            true
+        });
+        let request = http.seen.lock().unwrap()[0].clone();
+        (result, pieces, request)
+    }
+
+    #[test]
+    fn streams_report_the_model_that_answered() {
+        let openai = agent(Provider::OpenAi, ModelType::Generative, OutputType::Text);
+        let body = concat!(
+            "data: {\"model\":\"other-model\",\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+            "data: {\"model\":\"other-model\",\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n",
+        );
+        let (result, _, _) = stream_full(&openai, 200, body);
+        let streamed = result.unwrap();
+        assert_eq!(streamed.bytes, b"ab");
+        assert_eq!(streamed.model.as_deref(), Some("other-model"));
+
+        // A whole reply names it too; a stream without a model field gives none.
+        let (result, _, _) = stream_full(
+            &openai,
+            200,
+            r#"{"model":"m-2024","choices":[{"message":{"content":"x"}}]}"#,
+        );
+        assert_eq!(result.unwrap().model.as_deref(), Some("m-2024"));
+        let (result, _, _) = stream_full(
+            &openai,
+            200,
+            "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n",
+        );
+        assert_eq!(result.unwrap().model, None);
+
+        let anthropic = agent(Provider::Anthropic, ModelType::Generative, OutputType::Text);
+        let body = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-x\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"y\"}}\n\n",
+        );
+        let (result, _, _) = stream_full(&anthropic, 200, body);
+        assert_eq!(result.unwrap().model.as_deref(), Some("claude-x"));
+
+        let google = agent(Provider::Google, ModelType::Generative, OutputType::Text);
+        let body = "data: {\"modelVersion\":\"gemini-z\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"q\"}]}}]}\n";
+        let (result, _, _) = stream_full(&google, 200, body);
+        assert_eq!(result.unwrap().model.as_deref(), Some("gemini-z"));
+    }
+
+    #[test]
+    fn openai_streams_sse_and_finishes_json_at_the_end() {
+        let config = agent(Provider::OpenAi, ModelType::Generative, OutputType::Json);
+        let body = concat!(
+            ": keep-alive\n",
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"a\\\":\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\" 1}\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (result, pieces, request) = stream_with(&config, 200, body);
+        assert_eq!(request.body["stream"], true);
+        assert_eq!(pieces, ["{\"a\":", " 1}"]);
+        assert_eq!(result.unwrap(), b"{\n  \"a\": 1\n}");
+
+        // Bad JSON at the end is the usual error, after the pieces were seen.
+        let (result, pieces, _) = stream_with(
+            &config,
+            200,
+            "data: {\"choices\":[{\"delta\":{\"content\":\"nope\"}}]}\n",
+        );
+        assert_eq!(pieces, ["nope"]);
+        assert!(result.unwrap_err().contains("did not return valid JSON"));
+    }
+
+    #[test]
+    fn ollama_streams_one_object_per_line() {
+        let config = AgentConfig {
+            auth: Auth::None,
+            ..agent(Provider::Ollama, ModelType::Generative, OutputType::Text)
+        };
+        let body = "{\"message\":{\"role\":\"assistant\",\"content\":\"Bon\"},\"done\":false}\n\
+                    {\"message\":{\"role\":\"assistant\",\"content\":\"jour\"},\"done\":false}\n\
+                    {\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true}\n";
+        let (result, pieces, request) = stream_with(&config, 200, body);
+        assert_eq!(request.body["stream"], true);
+        assert_eq!(pieces, ["Bon", "jour"]);
+        assert_eq!(result.unwrap(), b"Bonjour");
+
+        let (result, _, _) = stream_with(&config, 200, "{\"error\":\"model not found\"}\n");
+        assert_eq!(result.unwrap_err(), "Ollama: model not found");
+    }
+
+    #[test]
+    fn anthropic_streams_deltas_and_reports_refusals_and_errors() {
+        let config = agent(Provider::Anthropic, ModelType::Generative, OutputType::Text);
+        let body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+            "event: ping\n",
+            "data: {\"type\":\"ping\"}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" there\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let (result, pieces, request) = stream_with(&config, 200, body);
+        assert_eq!(request.body["stream"], true);
+        assert_eq!(pieces, ["Hi", " there"]);
+        assert_eq!(result.unwrap(), b"Hi there");
+
+        let refusal = concat!(
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"I\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\",\"stop_details\":{\"category\":\"c\",\"explanation\":\"e\"}}}\n\n",
+        );
+        let (result, _, _) = stream_with(&config, 200, refusal);
+        assert_eq!(result.unwrap_err(), "Anthropic declined the request (c): e");
+
+        let error = "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+        let (result, _, _) = stream_with(&config, 200, error);
+        assert_eq!(result.unwrap_err(), "Anthropic: Overloaded");
+    }
+
+    #[test]
+    fn google_streams_on_its_stream_url() {
+        let config = agent(Provider::Google, ModelType::Generative, OutputType::Text);
+        let body = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Ol\"}]}}]}\n\n\
+                    data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"á\"}]},\"finishReason\":\"STOP\"}]}\n\n";
+        let (result, pieces, request) = stream_with(&config, 200, body);
+        assert!(
+            request
+                .url
+                .ends_with("/models/m:streamGenerateContent?alt=sse"),
+            "{}",
+            request.url
+        );
+        assert!(request.body.get("stream").is_none());
+        assert_eq!(pieces, ["Ol", "á"]);
+        assert_eq!(result.unwrap(), "Olá".as_bytes());
+    }
+
+    #[test]
+    fn streaming_falls_back_to_whole_replies_and_errors() {
+        let config = agent(Provider::Mistral, ModelType::Generative, OutputType::Text);
+        // A server that ignored `stream`: the single reply is parsed as usual.
+        let (result, pieces, _) = stream_with(
+            &config,
+            200,
+            r#"{"choices":[{"message":{"content":"bonjour"}}]}"#,
+        );
+        assert!(pieces.is_empty());
+        assert_eq!(result.unwrap(), b"bonjour");
+
+        // Errors come back whole and keep their message.
+        let (result, pieces, _) = stream_with(&config, 429, r#"{"error":{"message":"slow down"}}"#);
+        assert!(pieces.is_empty());
+        assert_eq!(result.unwrap_err(), "Mistral returned HTTP 429: slow down");
+
+        // Embeddings are not streams.
+        let embed = agent(
+            Provider::OpenAi,
+            ModelType::Embedding,
+            OutputType::Embedding,
+        );
+        let (result, pieces, request) =
+            stream_with(&embed, 200, r#"{"data":[{"embedding":[0.5,0.25]}]}"#);
+        assert!(pieces.is_empty());
+        assert!(request.body.get("stream").is_none());
+        assert_eq!(result.unwrap(), b"[0.5,0.25]");
+    }
+
+    #[test]
+    fn stopping_a_stream_returns_stopped() {
+        let config = agent(Provider::OpenAi, ModelType::Generative, OutputType::Text);
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"two\"}}]}\n\n",
+        );
+        let http = FakeHttp::new(200, body);
+        let mut seen = 0;
+        let err = generate_streaming(&http, &config, Some("k"), "hi", &mut |_| {
+            seen += 1;
+            false
+        })
+        .unwrap_err();
+        assert_eq!(err, STOPPED);
+        assert_eq!(seen, 1);
+    }
+
+    #[test]
+    fn ureq_client_streams_the_body_as_it_arrives() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let events: [&str; 2] = [
+            "data: {\"choices\":[{\"delta\":{\"content\":\"first \"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"second\"}}]}\n\ndata: [DONE]\n\n",
+        ];
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut length = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let mut payload = vec![0u8; length];
+            reader.read_exact(&mut payload).unwrap();
+            let total: usize = events.iter().map(|e| e.len()).sum();
+            let out = reader.get_mut();
+            out.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {total}\r\nconnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            // Two writes a pause apart, so the client sees them separately.
+            out.write_all(events[0].as_bytes()).unwrap();
+            out.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            out.write_all(events[1].as_bytes()).unwrap();
+            out.flush().unwrap();
+        });
+        let config = AgentConfig {
+            endpoint: url,
+            auth: Auth::None,
+            ..agent(Provider::Custom, ModelType::Generative, OutputType::Text)
+        };
+        let http = UreqHttp::new(Duration::from_secs(5));
+        let mut arrivals: Vec<(String, std::time::Instant)> = Vec::new();
+        let out = generate_streaming(&http, &config, None, "hi", &mut |text| {
+            arrivals.push((text.to_string(), std::time::Instant::now()));
+            true
+        })
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(out.bytes, b"first second");
+        assert_eq!(out.model, None);
+        assert_eq!(arrivals.len(), 2, "{arrivals:?}");
+        let gap = arrivals[1].1.duration_since(arrivals[0].1);
+        assert!(
+            gap >= Duration::from_millis(100),
+            "{gap:?}: read as one piece"
+        );
     }
 
     #[test]
