@@ -655,7 +655,7 @@ impl DatabaseConfig {
         }
         // An empty query is allowed: the executor then runs the SQL arriving on the wire.
         if !self.query.trim().is_empty()
-            && let Err(e) = validate::sql(&self.query, self.read_only)
+            && let Err(e) = validate::sql_for_engine(&self.query, self.read_only, self.engine)
         {
             issues.push(Issue::new("query", e));
         }

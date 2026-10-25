@@ -389,6 +389,34 @@ pub fn writable_path(raw: &str) -> Result<PathBuf, String> {
     })
 }
 
+/// Check both the requested path and its resolved destination. An alias inside the
+/// workspace must not turn an otherwise allowed path into a hidden or managed file.
+pub fn resolve_writable_inside(root: &Path, raw: &str) -> Result<PathBuf, String> {
+    let rel = writable_path(raw)?;
+    let root = root
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", root.display()))?;
+    let real = resolve_new_inside(&root, &rel)?;
+    let resolved = real.strip_prefix(&root).map_err(|e| e.to_string())?;
+    writable_path(
+        resolved
+            .to_str()
+            .ok_or("resolved path is not valid UTF-8")?,
+    )?;
+    // A managed directory may itself be a symlink into an otherwise writable part of
+    // the workspace. Protect that destination as well as the directory's literal name.
+    for reserved in crate::library::RESERVED_DIRS {
+        if let Ok(dir) = root.join(reserved).canonicalize()
+            && real.starts_with(dir)
+        {
+            return Err(format!(
+                "`{reserved}/` is managed by the app; nodes can't write into it"
+            ));
+        }
+    }
+    Ok(real)
+}
+
 /// The first component of `rel` when it names a directory the app owns, compared without
 /// case so a case-insensitive filesystem can't be talked around.
 fn reserved_dir(rel: &Path) -> Option<&'static str> {
@@ -665,6 +693,12 @@ const READ_ONLY_STARTS: &[&str] = &[
     "select", "with", "explain", "show", "describe", "desc", "values",
 ];
 
+/// Writable nodes accept ordinary data/schema statements, not arbitrary administrative
+/// commands. Keep the escape-hatch checks as well: an allowed verb is not enough.
+const WRITE_STARTS: &[&str] = &[
+    "insert", "update", "delete", "replace", "merge", "create", "alter", "drop", "truncate",
+];
+
 /// Words that write, change schema, or change session state. Rejected anywhere in a
 /// read-only query, including inside CTEs (`WITH x AS (...) DELETE ...` is valid SQL).
 const WRITE_WORDS: &[&str] = &[
@@ -731,6 +765,10 @@ const BLOCKED_WORDS: &[&str] = &[
     "outfile",
     "dumpfile",
     "infile",
+    "vacuum", // SQLite VACUUM INTO writes a separate, unrestricted file.
+    "pragma", // writable_schema, temp_store_directory, and other engine controls.
+    "export",
+    "import",
     // postgresql
     "pg_read_file",
     "pg_read_binary_file",
@@ -826,12 +864,12 @@ const MYSQL_CLIENT_COMMANDS: &[&str] = &[
 
 /// Check a SQL query before it reaches an engine. Always: non-empty, bounded, exactly one
 /// statement, no MySQL executable comments, no words from [`BLOCKED_WORDS`], and no client
-/// meta-command ([`shell_metacharacters`]). With `read_only`: must start with a read
-/// statement and contain no [`WRITE_WORDS`].
+/// meta-command ([`shell_metacharacters`]). Writable queries must start with a supported
+/// read or write verb. With `read_only`: a read verb and no [`WRITE_WORDS`].
 ///
 /// Quoted identifiers are scanned like bare ones because `"pg_read_file"(...)` is a valid
-/// call, and `/* */` comments end at the first `*/` because that is what the engines that
-/// don't nest comments do; both choices only ever reject more.
+/// call. Ambiguous escapes, nested comments and executable comments are refused because
+/// they can hide executable SQL from a lexer using another engine's rules.
 pub fn sql(query: &str, read_only: bool) -> Result<(), String> {
     let q = query.trim();
     if q.is_empty() {
@@ -882,6 +920,11 @@ pub fn sql(query: &str, read_only: bool) -> Result<(), String> {
                 w.to_uppercase()
             ));
         }
+    } else if !READ_ONLY_STARTS.contains(first) && !WRITE_STARTS.contains(first) {
+        return Err(format!(
+            "`{}` is not a supported query statement",
+            first.to_uppercase()
+        ));
     }
     if let Some(w) = words.iter().find(|w| BLOCKED_WORDS.contains(w)) {
         return Err(format!(
@@ -904,6 +947,43 @@ pub fn sql(query: &str, read_only: bool) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The statement subset supported by the selected engine. Validation at edit time and
+/// execution use this same entry point, including SQL supplied by an upstream node.
+pub fn sql_for_engine(
+    query: &str,
+    read_only: bool,
+    engine: crate::node_data::DbEngine,
+) -> Result<(), String> {
+    use crate::node_data::DbEngine;
+    sql(query, read_only)?;
+    let tokens = tokenize(query.trim())?;
+    let first = tokens
+        .iter()
+        .find_map(|token| match token {
+            Tok::Word(word) => Some(word.as_str()),
+            _ => None,
+        })
+        .ok_or("query has no statement")?;
+    let supported = match first {
+        "select" | "with" | "explain" | "values" | "insert" | "update" | "delete" | "create"
+        | "alter" | "drop" => true,
+        "show" | "truncate" => engine != DbEngine::Sqlite,
+        "describe" | "desc" => matches!(engine, DbEngine::DuckDb | DbEngine::Mysql),
+        "replace" => matches!(engine, DbEngine::Sqlite | DbEngine::Mysql),
+        "merge" => matches!(engine, DbEngine::DuckDb | DbEngine::Postgres),
+        _ => false,
+    };
+    if supported {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{}` is not a supported {} statement",
+            first.to_uppercase(),
+            engine.label()
+        ))
+    }
 }
 
 /// Reject what a database client would read as its own command instead of SQL: `psql`
@@ -931,22 +1011,13 @@ fn shell_metacharacters(q: &str) -> Result<(), String> {
                 i = end;
             }
             '-' if next == Some('-') => {
+                check_line_comment(&chars, i)?;
                 while i < chars.len() && chars[i] != '\n' {
                     i += 1;
                 }
             }
             '/' if next == Some('*') => {
-                i += 2;
-                loop {
-                    match (chars.get(i), chars.get(i + 1)) {
-                        (None, _) => return Err("unterminated comment".into()),
-                        (Some('*'), Some('/')) => {
-                            i += 2;
-                            break;
-                        }
-                        _ => i += 1,
-                    }
-                }
+                i = skip_comment(&chars, i)?;
                 line_start = false;
             }
             '\n' | '\r' => {
@@ -997,25 +1068,13 @@ fn tokenize(q: &str) -> Result<Vec<Tok>, String> {
                 i = end;
             }
             '-' if next == Some('-') => {
+                check_line_comment(&chars, i)?;
                 while i < chars.len() && chars[i] != '\n' {
                     i += 1;
                 }
             }
             '/' if next == Some('*') => {
-                if chars.get(i + 2) == Some(&'!') {
-                    return Err("executable comments (`/*!`) are not allowed".into());
-                }
-                i += 2;
-                loop {
-                    match (chars.get(i), chars.get(i + 1)) {
-                        (None, _) => return Err("unterminated comment".into()),
-                        (Some('*'), Some('/')) => {
-                            i += 2;
-                            break;
-                        }
-                        _ => i += 1,
-                    }
-                }
+                i = skip_comment(&chars, i)?;
             }
             ';' => {
                 out.push(Tok::Semicolon);
@@ -1039,17 +1098,52 @@ fn tokenize(q: &str) -> Result<Vec<Tok>, String> {
     Ok(out)
 }
 
+fn check_line_comment(chars: &[char], start: usize) -> Result<(), String> {
+    if chars
+        .get(start + 2)
+        .is_some_and(|c| !c.is_ascii_whitespace())
+    {
+        return Err(
+            "put whitespace after `--`; otherwise MySQL can execute the text as SQL".into(),
+        );
+    }
+    Ok(())
+}
+
+/// Nested and executable comments have different meanings across supported engines.
+/// Refuse them so the checker cannot skip text an engine would execute.
+fn skip_comment(chars: &[char], start: usize) -> Result<usize, String> {
+    if chars.get(start + 2) == Some(&'!')
+        || (chars.get(start + 2).is_some_and(|c| matches!(c, 'M' | 'm'))
+            && chars.get(start + 3) == Some(&'!'))
+    {
+        return Err("executable comments are not allowed".into());
+    }
+    let mut i = start + 2;
+    loop {
+        match (chars.get(i), chars.get(i + 1)) {
+            (None, _) => return Err("unterminated comment".into()),
+            (Some('/'), Some('*')) => return Err("nested SQL comments are not allowed".into()),
+            (Some('*'), Some('/')) => return Ok(i + 2),
+            _ => i += 1,
+        }
+    }
+}
+
 fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '$'
 }
 
-/// Skip a single-quoted literal starting after its opening quote. `''` and `\'` continue
-/// the literal. Returns the index after the closing quote.
+/// Skip a single-quoted literal starting after its opening quote. Only `''` escapes a
+/// quote portably: a backslash before a quote closes the literal in SQLite but escapes
+/// it in other SQL modes. Refuse that ambiguity instead of hiding executable text.
 fn skip_string(chars: &[char], mut i: usize) -> Result<usize, String> {
     loop {
         match chars.get(i) {
             None => return Err("unterminated string literal".into()),
-            Some('\\') if i + 1 < chars.len() => i += 2,
+            Some('\\') if chars.get(i + 1) == Some(&'\'') => {
+                return Err("backslash before a quote is ambiguous across SQL engines; use doubled quotes (`''`) instead".into());
+            }
             Some('\'') if chars.get(i + 1) == Some(&'\'') => i += 2,
             Some('\'') => return Ok(i + 1),
             Some(_) => i += 1,
@@ -1332,6 +1426,73 @@ mod tests {
         assert!(sql("SELECT * FROM read_parquet('x')", false).is_err());
         assert!(sql("LOAD httpfs", false).is_err());
         assert!(sql("GRANT ALL ON t TO u", false).is_err());
+    }
+
+    #[test]
+    fn sql_refuses_ambiguous_quote_escapes() {
+        // SQLite closes the literal after the backslash. A lexer treating it as an
+        // escaped quote instead hides the following statement and client command.
+        for query in [
+            "SELECT '\\';\n.print escaped\n-- '",
+            "SELECT '\\'; DELETE FROM t; -- '",
+            "SELECT 'it\\'s'",
+        ] {
+            for read_only in [true, false] {
+                assert!(sql(query, read_only).is_err(), "accepted {query:?}");
+            }
+        }
+        assert!(sql("SELECT 'it''s', '\\d'", true).is_ok());
+    }
+
+    #[test]
+    fn sql_comments_cannot_hide_statements_in_other_dialects() {
+        for query in [
+            "SELECT 1--1; DELETE FROM t",
+            "SELECT 1 /*M! ; DELETE FROM t */",
+            "SELECT /* outer /* nested */ 1 */ 2",
+        ] {
+            for read_only in [true, false] {
+                assert!(sql(query, read_only).is_err(), "accepted {query:?}");
+            }
+        }
+        assert!(sql("SELECT 1 -- ordinary comment", true).is_ok());
+        assert!(sql("SELECT 1 /* ordinary comment */", true).is_ok());
+    }
+
+    #[test]
+    fn database_statement_allowlists_fail_closed() {
+        use crate::node_data::DbEngine;
+        for engine in DbEngine::ALL {
+            for query in ["SELECT 1", "WITH t AS (SELECT 1) SELECT * FROM t"] {
+                assert!(sql_for_engine(query, true, engine).is_ok());
+            }
+            for query in [
+                "CREATE TABLE t(a TEXT)",
+                "INSERT INTO t VALUES ('a')",
+                "UPDATE t SET a = 'b'",
+                "DELETE FROM t",
+            ] {
+                assert!(sql_for_engine(query, false, engine).is_ok());
+                assert!(sql_for_engine(query, true, engine).is_err());
+            }
+            for query in [
+                "VACUUM INTO '/tmp/copy.db'",
+                "PRAGMA temp_store_directory = '/tmp'",
+                "SET x = 1",
+                "DO 'anything'",
+                "CALL something()",
+                "EXPORT DATABASE '/tmp/export'",
+            ] {
+                assert!(
+                    sql_for_engine(query, false, engine).is_err(),
+                    "{engine:?}: {query}"
+                );
+            }
+        }
+        assert!(sql_for_engine("REPLACE INTO t VALUES (1)", false, DbEngine::Sqlite).is_ok());
+        assert!(sql_for_engine("REPLACE INTO t VALUES (1)", false, DbEngine::Postgres).is_err());
+        assert!(sql_for_engine("SHOW TABLES", true, DbEngine::DuckDb).is_ok());
+        assert!(sql_for_engine("SHOW TABLES", true, DbEngine::Sqlite).is_err());
     }
 
     #[test]
