@@ -63,6 +63,7 @@ use crate::node_data::{
     ModelType, NodeData, NodeType, OutputType, Runtime, ScriptConfig, WriteMode,
 };
 use crate::providers::{self, Http};
+use crate::storage;
 use crate::validate;
 
 pub const HTTP_TIMEOUT: Duration = Duration::from_secs(300);
@@ -221,17 +222,25 @@ struct Meta {
     saved: Option<PathBuf>,
     /// When it was stored, for people reading the directory.
     stored: String,
+    /// Detect incomplete or mixed writes before any cached bytes reach a downstream node.
+    bytes: usize,
+    checksum: String,
 }
 
 #[allow(clippy::len_without_is_empty)]
 impl Cache {
     /// A cache that also keeps its entries under `dir`, created on first store.
     pub fn persistent(dir: PathBuf) -> Self {
-        let on_disk = std::fs::read_dir(&dir)
+        let on_disk = cache_directory(&dir, false)
+            .ok()
+            .and_then(|dir| std::fs::read_dir(dir).ok())
             .map(|entries| {
                 entries
                     .flatten()
-                    .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+                    .filter(|e| {
+                        e.file_type().is_ok_and(|t| t.is_file())
+                            && e.path().extension().is_some_and(|x| x == "json")
+                    })
                     .count()
             })
             .unwrap_or(0);
@@ -253,6 +262,7 @@ impl Cache {
     pub fn clear(&mut self) {
         self.entries.clear();
         if let Some(dir) = &self.dir
+            && let Ok(dir) = cache_directory(dir, false)
             && let Ok(entries) = std::fs::read_dir(dir)
         {
             for entry in entries.flatten() {
@@ -307,7 +317,7 @@ impl Cache {
         if output.bytes.len() > MAX_HISTORY_BYTES {
             return false;
         }
-        if meta_path.is_file() && bin_path.is_file() {
+        if self.read(key).is_some() {
             let now = std::time::SystemTime::now();
             for path in [&meta_path, &bin_path] {
                 if let Ok(file) = std::fs::File::options().append(true).open(path) {
@@ -339,9 +349,17 @@ impl Cache {
     }
 
     fn read(&self, key: Key) -> Option<Output> {
+        cache_directory(self.dir.as_ref()?, false).ok()?;
         let (meta_path, bin_path) = self.paths(key)?;
-        let meta: Meta = serde_json::from_slice(&std::fs::read(meta_path).ok()?).ok()?;
-        let bytes = std::fs::read(bin_path).ok()?;
+        let meta: Meta =
+            serde_json::from_slice(&storage::read(&meta_path, 64 * 1024).ok()?).ok()?;
+        if meta.bytes > MAX_OUTPUT_BYTES {
+            return None;
+        }
+        let bytes = storage::read(&bin_path, meta.bytes as u64).ok()?;
+        if bytes.len() != meta.bytes || meta.checksum != format!("{:032x}", key_of(&[&bytes])) {
+            return None;
+        }
         Some(Output {
             text: meta.text && std::str::from_utf8(&bytes).is_ok(),
             bytes,
@@ -354,8 +372,8 @@ impl Cache {
         let Some((meta_path, bin_path)) = self.paths(key) else {
             return Ok(());
         };
-        let dir = self.dir.clone().unwrap_or_default();
-        std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        storage::check_size(output.bytes.len(), MAX_OUTPUT_BYTES as u64)?;
+        let dir = cache_directory(self.dir.as_deref().unwrap_or(Path::new("")), true)?;
         let fresh = !meta_path.exists();
         write_atomically(&bin_path, &output.bytes)?;
         let meta = Meta {
@@ -363,6 +381,8 @@ impl Cache {
             text: output.text,
             saved: output.saved.clone(),
             stored: library::timestamp(),
+            bytes: output.bytes.len(),
+            checksum: format!("{:032x}", key_of(&[&output.bytes])),
         };
         let json = serde_json::to_vec_pretty(&meta).map_err(|e| e.to_string())?;
         write_atomically(&meta_path, &json)?;
@@ -385,6 +405,9 @@ impl Cache {
                 let path = e.path();
                 (path.extension()? == "bin").then_some(())?;
                 let meta = e.metadata().ok()?;
+                if !meta.is_file() {
+                    return None;
+                }
                 Some((
                     meta.modified().unwrap_or(std::time::UNIX_EPOCH),
                     path,
@@ -392,7 +415,7 @@ impl Cache {
                 ))
             })
             .collect();
-        let mut total: u64 = bins.iter().map(|b| b.2).sum();
+        let mut total = bins.iter().fold(0u64, |sum, b| sum.saturating_add(b.2));
         if total <= MAX_CACHE_BYTES {
             return;
         }
@@ -410,11 +433,18 @@ impl Cache {
     }
 }
 
+fn cache_directory(dir: &Path, create: bool) -> Result<PathBuf, String> {
+    let parent = dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = dir.file_name().ok_or("cache directory has no name")?;
+    storage::directory(parent, Path::new(name), create)
+}
+
 /// Write through a temporary file and rename, so a reader never sees half a file.
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("rename {}: {e}", path.display()))
+    storage::write_atomic(path, bytes)
 }
 
 /// What the caller holds while a run is in flight. The default caches nothing, is never
@@ -1169,6 +1199,9 @@ impl Runner<'_> {
                 return Err(e);
             }
         };
+        // Whole replies, embeddings and images may never call on_text. Cancellation
+        // while their request was in flight still prevents persistence and cache reuse.
+        self.check_cancel()?;
         if let Some(answered) = substituted_model(config, streamed.model.as_deref()) {
             self.log(format!(
                 "⚠ answered by {answered}, not {}: the server substituted a model",
@@ -1780,19 +1813,7 @@ fn sql_instructions(config: &DatabaseConfig, schema: &str) -> String {
 // ----- files -----
 
 fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>, String> {
-    let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if !meta.is_file() {
-        return Err(format!("{} is not a regular file", path.display()));
-    }
-    if meta.len() > max {
-        return Err(format!(
-            "{} is {} , over the {} limit",
-            path.display(),
-            size(meta.len() as usize),
-            size(max as usize)
-        ));
-    }
-    std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))
+    storage::read(path, max)
 }
 
 /// Human-readable byte count.
@@ -4326,6 +4347,108 @@ mod tests {
         );
         assert_ne!(key_of(&[b"ab", b"c"]), key_of(&[b"a", b"bc"]));
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn oversized_cache_entries_are_misses() {
+        let root = scratch("oversized-cache");
+        let mut cache = Cache::persistent(root.join("cache"));
+        let output = Output::new(b"ok".to_vec(), true, "Text");
+        cache.write(1, &output).unwrap();
+        let (_, bin) = cache.paths(1).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(bin)
+            .unwrap()
+            .set_len(MAX_OUTPUT_BYTES as u64 + 1)
+            .unwrap();
+        assert!(
+            cache.fetch(1).is_none(),
+            "an oversized cache file was accepted"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_cache_bytes_are_misses_and_history_can_repair_them() {
+        let root = scratch("corrupt-cache");
+        let mut cache = Cache::persistent(root.join("cache"));
+        let output = Output::new(b"good".to_vec(), true, "Text");
+        cache.write(1, &output).unwrap();
+        let (meta, bin) = cache.paths(1).unwrap();
+        fs::write(&bin, b"evil").unwrap();
+        assert!(
+            cache.fetch(1).is_none(),
+            "a same-length corrupt payload was accepted"
+        );
+        assert!(cache.keep(1, &output));
+        assert_eq!(cache.fetch(1).unwrap().bytes, b"good");
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&fs::read(&meta).unwrap()).unwrap();
+        legacy.as_object_mut().unwrap().remove("checksum");
+        fs::write(&meta, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(cache.fetch(1).is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_never_reads_writes_or_clears_a_symlinked_directory() {
+        let root = scratch("linked-cache");
+        let destination = root.join("elsewhere");
+        fs::create_dir(&destination).unwrap();
+        let preserved = destination.join("user.json");
+        fs::write(&preserved, b"original").unwrap();
+        std::os::unix::fs::symlink(&destination, root.join("cache")).unwrap();
+        let mut cache = Cache::persistent(root.join("cache"));
+        assert_eq!(cache.len(), 0);
+        assert!(
+            cache
+                .write(1, &Output::new(b"new".to_vec(), true, "Text"))
+                .is_err()
+        );
+        assert!(cache.fetch(1).is_none());
+        cache.clear();
+        assert_eq!(fs::read(preserved).unwrap(), b"original");
+        assert_eq!(fs::read_dir(destination).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_writes_never_follow_a_planted_temporary_symlink() {
+        let root = scratch("cache-temp-symlink");
+        let target = root.join("untouched");
+        fs::write(&target, b"original").unwrap();
+        let path = root.join("entry.bin");
+        std::os::unix::fs::symlink(&target, path.with_extension("tmp")).unwrap();
+        let _ = write_atomically(&path, b"cached output");
+        assert_eq!(fs::read(&target).unwrap(), b"original");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cancellation_after_a_whole_reply_prevents_saving_and_caching() {
+        struct CancellingHttp(Arc<AtomicBool>);
+        impl Http for CancellingHttp {
+            fn post_json(&self, _: &providers::Request) -> Result<providers::Reply, String> {
+                self.0.store(true, Ordering::Relaxed);
+                Ok(providers::Reply {
+                    status: 200,
+                    body: r#"{"choices":[{"message":{"content":"cancelled output"}}]}"#.into(),
+                })
+            }
+        }
+        let root = scratch("cancel-whole-reply");
+        let (control, _) = recording_control();
+        let http = CancellingHttp(control.cancel.clone());
+        let doc = graph(vec![node("n0", Some(NodeData::Agent(fake_agent())))], &[]);
+        let report = run_with(&doc, "n0", Dirs::under(&root), &http, &with_key, &control);
+        assert_eq!(report.result.unwrap_err(), CANCELLED);
+        assert!(report.outputs.is_empty());
+        assert_eq!(lock(control.cache.as_ref().unwrap()).len(), 0);
+        assert_eq!(fs::read_dir(root.join("agents")).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

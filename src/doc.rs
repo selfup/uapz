@@ -11,6 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::node_data::{self, NodeData};
+use crate::storage;
 use crate::validate;
 
 /// Directory, relative to the working directory, that holds saved graphs.
@@ -151,11 +152,14 @@ pub fn save(doc: &GraphDoc) -> Result<(PathBuf, PathBuf), String> {
 
 fn save_in(dir: &Path, doc: &GraphDoc) -> Result<(PathBuf, PathBuf), String> {
     safe_name(&doc.name)?;
+    let text = serde_json::to_string_pretty(doc).map_err(|e| e.to_string())? + "\n";
+    let markdown = doc.markdown();
+    storage::check_size(text.len(), storage::MAX_DOCUMENT_BYTES)?;
+    storage::check_size(markdown.len(), storage::MAX_DOCUMENT_BYTES)?;
     fs::create_dir_all(dir).map_err(|e| format!("create {}/: {e}", dir.display()))?;
     let (md, json) = paths_in(dir, &doc.name);
-    fs::write(&md, doc.markdown()).map_err(|e| format!("write {}: {e}", md.display()))?;
-    let text = serde_json::to_string_pretty(doc).map_err(|e| e.to_string())?;
-    fs::write(&json, text + "\n").map_err(|e| format!("write {}: {e}", json.display()))?;
+    storage::write_atomic(&md, markdown.as_bytes())?;
+    storage::write_atomic(&json, text.as_bytes())?;
     Ok((md, json))
 }
 
@@ -168,12 +172,11 @@ fn load_in(dir: &Path, name: &str) -> Result<GraphDoc, String> {
     listed_name(name)?;
     let (md, json) = paths_in(dir, name);
     let mut doc = if json.exists() {
-        let text =
-            fs::read_to_string(&json).map_err(|e| format!("read {}: {e}", json.display()))?;
+        let text = storage::read_text(&json, storage::MAX_DOCUMENT_BYTES)?;
         serde_json::from_str::<GraphDoc>(&text)
             .map_err(|e| format!("parse {}: {e}", json.display()))?
     } else {
-        let text = fs::read_to_string(&md).map_err(|e| format!("read {}: {e}", md.display()))?;
+        let text = storage::read_text(&md, storage::MAX_DOCUMENT_BYTES)?;
         parse_markdown(&text)
     };
     doc.name = name.to_string();
@@ -227,10 +230,11 @@ pub fn save_kind(kind: &NodeKind) -> Result<PathBuf, String> {
 
 fn save_kind_in(dir: &Path, kind: &NodeKind) -> Result<PathBuf, String> {
     safe_name(&kind.name)?;
+    let text = serde_json::to_string_pretty(kind).map_err(|e| e.to_string())? + "\n";
+    storage::check_size(text.len(), storage::MAX_DOCUMENT_BYTES)?;
     fs::create_dir_all(dir).map_err(|e| format!("create {}/: {e}", dir.display()))?;
     let path = dir.join(format!("{}.json", kind.name));
-    let text = serde_json::to_string_pretty(kind).map_err(|e| e.to_string())?;
-    fs::write(&path, text + "\n").map_err(|e| format!("write {}: {e}", path.display()))?;
+    storage::write_atomic(&path, text.as_bytes())?;
     Ok(path)
 }
 
@@ -260,7 +264,7 @@ fn list_kinds_in(dir: &Path) -> Vec<NodeKind> {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 return None;
             }
-            serde_json::from_str(&fs::read_to_string(&path).ok()?).ok()
+            serde_json::from_slice(&storage::read(&path, storage::MAX_DOCUMENT_BYTES).ok()?).ok()
         })
         .collect();
     kinds.sort_by(|a, b| a.name.cmp(&b.name));
