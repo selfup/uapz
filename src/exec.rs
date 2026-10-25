@@ -1659,7 +1659,7 @@ pub fn describe_schema(config: &DatabaseConfig, dirs: &Dirs, env: Env) -> Result
         let file = validate::resolve_inside(&dirs.data, &config.input)?;
         let columns = match validate::extension(&config.input).as_deref() {
             Some("csv" | "tsv") => first_line(&file)
-                .map(|header| format!(" with columns: {header}"))
+                .map(|header| format!(" with text columns: {header}"))
                 .unwrap_or_default(),
             _ => String::new(),
         };
@@ -2019,7 +2019,11 @@ fn plain_path(path: &Path) -> Result<String, String> {
 }
 
 /// `sqlite3 -json [-readonly] <db>` with an optional CSV import into the `temp` schema,
-/// which stays writable on a read-only connection and vanishes with the process.
+/// which stays writable on a read-only connection and vanishes with the process. The table
+/// is created from the file's header with TEXT columns before the import, so every value
+/// arrives as the file spelled it on every sqlite3 version: the shell's own table (TEXT
+/// columns up to 3.53, ANY from 3.54) would otherwise make `007` a 7 on one machine and a
+/// `"007"` on another.
 fn sqlite_plan(config: &DatabaseConfig, db: &Path, input: Option<&Path>) -> Result<Plan, String> {
     let mut args: Vec<String> = ["-batch", "-bail", "-json"]
         .into_iter()
@@ -2032,10 +2036,16 @@ fn sqlite_plan(config: &DatabaseConfig, db: &Path, input: Option<&Path>) -> Resu
     let mut stdin = String::new();
     if let Some(file) = input {
         validate::identifier(&config.input_table)?;
+        let table = config.input_table.trim();
+        let columns = csv_header(file)?
+            .iter()
+            .map(|name| format!("{} TEXT", quote_identifier(name)))
+            .collect::<Vec<_>>()
+            .join(", ");
         stdin.push_str(&format!(
-            ".import --csv --schema temp \"{}\" {}\n",
+            "CREATE TABLE temp.{}({columns});\n.import --csv --skip 1 --schema temp \"{}\" {table}\n",
+            quote_identifier(table),
             plain_path(file)?,
-            config.input_table.trim()
         ));
     }
     stdin.push_str(&query_statement(config));
@@ -2046,6 +2056,63 @@ fn sqlite_plan(config: &DatabaseConfig, db: &Path, input: Option<&Path>) -> Resu
         stdin,
         json: true,
     })
+}
+
+/// The column names in a CSV file's header line (RFC 4180: comma-separated, a quoted field
+/// may hold commas and doubled quotes), with a byte-order mark dropped. An empty name
+/// becomes `column_<n>` so a trailing comma still imports, and two names that differ only in
+/// case are refused here, where the message can name them, rather than by the shell.
+fn csv_header(path: &Path) -> Result<Vec<String>, String> {
+    let line = first_line(path).ok_or_else(|| {
+        format!(
+            "{} has no header line to name the input table's columns",
+            path.display()
+        )
+    })?;
+    let line = line.strip_prefix('\u{feff}').unwrap_or(&line);
+    let mut names = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if quoted => {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    field.push('"');
+                } else {
+                    quoted = false;
+                }
+            }
+            '"' if field.is_empty() => quoted = true,
+            ',' if !quoted => names.push(std::mem::take(&mut field)),
+            _ => field.push(c),
+        }
+    }
+    names.push(field);
+    let mut seen = HashSet::new();
+    let mut columns = Vec::with_capacity(names.len());
+    for (i, name) in names.into_iter().enumerate() {
+        let name = name.trim();
+        let name = if name.is_empty() {
+            format!("column_{}", i + 1)
+        } else {
+            name.to_string()
+        };
+        if !seen.insert(name.to_lowercase()) {
+            return Err(format!(
+                "{} names column {name} twice; SQLite column names are case-insensitive",
+                path.display()
+            ));
+        }
+        columns.push(name);
+    }
+    Ok(columns)
+}
+
+/// A name as a double-quoted SQL identifier.
+fn quote_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 /// `duckdb -json [-readonly] <db>` with the input loaded into a temporary table through
@@ -2880,17 +2947,31 @@ mod tests {
             read_only: false,
             ..config
         };
-        let plan = sqlite_plan(
-            &sqlite,
-            Path::new("/d/x.db"),
-            Some(Path::new("/d/rows.csv")),
+        let root = scratch("sqlite-plan");
+        let rows = root.join("data/rows.csv");
+        fs::write(
+            &rows,
+            "\u{feff}id,\"full name\",\"say \"\"hi\"\"\",\n1,Ann,x,y\n",
         )
         .unwrap();
+        let plan = sqlite_plan(&sqlite, Path::new("/d/x.db"), Some(&rows)).unwrap();
         assert!(!plan.args.contains(&"-readonly".to_string()));
-        assert!(
-            plan.stdin
-                .starts_with(".import --csv --schema temp \"/d/rows.csv\" rows\n")
+        assert_eq!(
+            plan.stdin,
+            format!(
+                "CREATE TABLE temp.\"rows\"(\"id\" TEXT, \"full name\" TEXT, \"say \"\"hi\"\"\" TEXT, \"column_4\" TEXT);\n\
+                 .import --csv --skip 1 --schema temp \"{}\" rows\nSELECT * FROM rows;\n",
+                rows.display()
+            )
         );
+
+        fs::write(&rows, "a,A\n1,2\n").unwrap();
+        let err = sqlite_plan(&sqlite, Path::new("/d/x.db"), Some(&rows)).unwrap_err();
+        assert!(err.contains("names column A twice"), "{err}");
+        fs::write(&rows, "").unwrap();
+        let err = sqlite_plan(&sqlite, Path::new("/d/x.db"), Some(&rows)).unwrap_err();
+        assert!(err.contains("no header line"), "{err}");
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -3348,7 +3429,7 @@ mod tests {
         };
         let schema = describe_schema(&with_input, &Dirs::under(&root), &no_env).unwrap();
         assert!(
-            schema.ends_with("Table extra is loaded from extra.csv with columns: x,y"),
+            schema.ends_with("Table extra is loaded from extra.csv with text columns: x,y"),
             "{schema}"
         );
 

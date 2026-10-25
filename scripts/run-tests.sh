@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eo pipefail
 
 cd "$(dirname "$0")/.."
 
@@ -11,4 +11,12 @@ export UAPZ_LIVE_MODEL="${UAPZ_LIVE_MODEL:-mistralai/ministral-3-3b}"
 export UAPZ_LIVE_EMBED_MODEL="${UAPZ_LIVE_EMBED_MODEL:-text-embedding-nomic-embed-text-v1.5}"
 export UAPZ_LIVE_PG_URL="${UAPZ_LIVE_PG_URL:-postgres://localhost/postgres}"
 
-cargo test live_ -- --ignored
+if [[ $1 == "local" ]]
+then
+    lms server start
+    lms unload --all
+    lms load mistralai/ministral-3-3b
+    lms load text-embedding-nomic-embed-text-v1.5@q8_0
+
+    cargo test live_ -- --ignored
+fi

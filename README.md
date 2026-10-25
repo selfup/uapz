@@ -321,8 +321,9 @@ provider but Anthropic; image generation only on OpenAI (and Custom).
 Outputs are named `agents/<preset name or node id>/outputs/<UTC timestamp>.<txt|json|png>`.
 
 Database command-line tools must be installed (`sqlite3` ships with macOS). Loading an
-input file is supported for SQLite (CSV, imported into the `temp` schema so a read-only
-database stays untouched) and DuckDB (CSV, TSV, JSON, Parquet, into a temporary table).
+input file is supported for SQLite (CSV, imported into the `temp` schema with text columns, so
+a read-only database stays untouched and `007` stays `007`) and DuckDB (CSV, TSV, JSON,
+Parquet, into a temporary table).
 Server engines read the connection URL from the named environment variable and pass it to
 the tool through its own environment variables (`PGHOST`, `PGPASSWORD`, `MYSQL_PWD`, …),
 never on the command line. Read-only is enforced by the engine too: `-readonly` for SQLite
