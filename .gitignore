@@ -1,4 +1,9 @@
 /target
+/node_modules/
+/dist/
+/test-results/
+/playwright-report/
+/src-tauri/gen/
 graphs
 nodes
 /agents/

@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
-set -eo pipefail
+set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-cargo test
+# Run `npm ci` and `npx playwright install chromium` once before this script.
+cargo fmt --all --check
+npm run check
+npm run build
+npm test
+npm run test:ui
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 
 # The live tests are ignored by default: they need a model server and a PostgreSQL
 # server (see README.md). Override these from the environment.
@@ -11,12 +19,12 @@ export UAPZ_LIVE_MODEL="${UAPZ_LIVE_MODEL:-mistralai/ministral-3-3b}"
 export UAPZ_LIVE_EMBED_MODEL="${UAPZ_LIVE_EMBED_MODEL:-text-embedding-nomic-embed-text-v1.5}"
 export UAPZ_LIVE_PG_URL="${UAPZ_LIVE_PG_URL:-postgres://localhost/postgres}"
 
-if [[ $1 == "local" ]]
+if [[ ${1:-} == "local" ]]
 then
     lms server start
     lms unload --all
     lms load mistralai/ministral-3-3b
     lms load text-embedding-nomic-embed-text-v1.5@q8_0
 
-    cargo test live_ -- --ignored
+    cargo test -p uapz live_ -- --ignored
 fi

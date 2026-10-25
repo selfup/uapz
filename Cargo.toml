@@ -2,22 +2,18 @@
 name = "uapz"
 version = "0.1.0"
 edition = "2024"
+autobins = false
+
+[workspace]
+members = ["src-tauri"]
+default-members = [".", "src-tauri"]
+resolver = "3"
 
 [dependencies]
 base64 = "0.22"
 globset = "0.4"
-gpui-kit = "0.7"
 ignore = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "3", features = ["json"] }
 url = "2"
-
-[features]
-ui-tests = ["gpui-kit/test-support"]
-
-[[test]]
-name = "workspace_rendering"
-path = "src/ui_tests.rs"
-harness = false
-required-features = ["ui-tests"]
