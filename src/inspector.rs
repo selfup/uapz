@@ -11,6 +11,10 @@
 //! flag behind the Cancel button, and a progress sink the executor writes log lines and
 //! streamed agent text into. A foreground task polls that sink a few times a second and
 //! redraws, so the log and the text appear while the run is still going.
+//!
+//! Every node that took part in a run keeps its result here, so selecting a node in the
+//! middle of a graph shows what it produced (or why it failed) in the last run that
+//! included it, with a note when the node has been edited since.
 
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::form::{field, v_form};
@@ -20,13 +24,15 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{ActiveTheme, Disableable, IndexPath, Sizable, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::exec::{self, Cache, Control, Progress, Report};
-use crate::graph::{Graph, GraphEvent, NodeId, data_color};
+use crate::doc::GraphDoc;
+use crate::exec::{self, Cache, Control, NodeState, Progress, Report};
+use crate::graph::{Graph, GraphEvent, Mark, NodeId, data_color};
 use crate::library;
 use crate::node_data::{
     AgentConfig, Auth, DataConfig, DataFormat, DatabaseConfig, DbEngine, DirectoryConfig,
@@ -49,6 +55,8 @@ struct Live {
     log: Vec<String>,
     /// The node whose text is streaming in, and the text so far.
     stream: Option<(String, String)>,
+    /// Node state changes, in order.
+    states: Vec<(String, NodeState)>,
     /// Set once by the thread when the run is over.
     report: Option<Report>,
 }
@@ -61,6 +69,7 @@ impl Live {
                 Some((current, so_far)) if *current == id => so_far.push_str(&text),
                 _ => self.stream = Some((id, text)),
             },
+            Progress::Node { id, state } => self.states.push((id, state)),
         }
     }
 }
@@ -69,6 +78,17 @@ impl Live {
 struct Job {
     cancel: Arc<AtomicBool>,
     live: Arc<Mutex<Live>>,
+    /// The node Run was pressed on.
+    target: NodeId,
+    /// The document the run works on, to remember each node's content at run time.
+    doc: GraphDoc,
+}
+
+/// What a node produced the last time a run included it.
+struct NodeResult {
+    result: Result<exec::Output, String>,
+    /// The node's content when it ran, to tell whether it has changed since.
+    data: Option<NodeData>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -104,8 +124,14 @@ pub struct Inspector {
     /// Log lines and streamed text of the run in flight, mirrored for rendering.
     live_log: Vec<String>,
     live_stream: Option<(String, String)>,
-    /// Result of the last run started from this panel.
-    report: Option<Report>,
+    /// How many node state changes of the run in flight were applied to the canvas.
+    live_states: usize,
+    /// The canvas dots: one run's worth, the latest.
+    marks: HashMap<NodeId, Mark>,
+    /// The last finished run and the node it was started from.
+    report: Option<(NodeId, Report)>,
+    /// What every node produced the last time a run included it.
+    results: HashMap<NodeId, NodeResult>,
     /// Node outputs kept across runs, so a downstream run reuses upstream agents.
     cache: Arc<Mutex<Cache>>,
     preset_name: Entity<InputState>,
@@ -153,6 +179,7 @@ pub struct Inspector {
     file_path: Entity<InputState>,
     file_mode: Entity<StrSelect>,
     file_unfence: bool,
+    file_bundle: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -189,6 +216,11 @@ fn choose<T: Copy + PartialEq>(
     select.update(cx, |select, cx| {
         select.set_selected_index(Some(IndexPath::new(index)), window, cx)
     });
+}
+
+/// The editor id behind a document id such as `n3`.
+fn node_id(doc_id: &str) -> Option<NodeId> {
+    doc_id.strip_prefix('n')?.parse().ok()
 }
 
 fn set_text(state: &Entity<InputState>, value: String, window: &mut Window, cx: &mut App) {
@@ -295,6 +327,7 @@ impl Inspector {
                 cx.subscribe_in(&graph, window, |this, _, event: &GraphEvent, window, cx| {
                     match event {
                         GraphEvent::SelectionChanged => this.reload(window, cx),
+                        GraphEvent::Replaced => this.forget_results(cx),
                     }
                 }),
             ];
@@ -411,8 +444,11 @@ impl Inspector {
             job: None,
             live_log: Vec::new(),
             live_stream: None,
+            live_states: 0,
+            marks: HashMap::new(),
             report: None,
-            cache: Arc::new(Mutex::new(Cache::default())),
+            results: HashMap::new(),
+            cache: Arc::new(Mutex::new(Cache::persistent(exec::Dirs::from_cwd().cache))),
             preset_name,
             provider,
             endpoint,
@@ -451,6 +487,7 @@ impl Inspector {
             file_path,
             file_mode,
             file_unfence: true,
+            file_bundle: false,
             _subscriptions: subscriptions,
         };
         inspector.reload(window, cx);
@@ -459,6 +496,38 @@ impl Inspector {
 
     fn status(&mut self, text: String, error: bool, cx: &mut Context<Self>) {
         cx.emit(InspectorEvent::Status { text, error });
+    }
+
+    /// A different graph is loaded: node ids mean other nodes now.
+    fn forget_results(&mut self, cx: &mut Context<Self>) {
+        self.results.clear();
+        self.report = None;
+        self.marks.clear();
+        cx.notify();
+    }
+
+    fn push_marks(&self, cx: &mut Context<Self>) {
+        let marks = self.marks.clone();
+        self.graph
+            .update(cx, |graph, cx| graph.set_marks(marks, cx));
+    }
+
+    /// The target and everything wired into it, directly or not.
+    fn run_members(doc: &GraphDoc, target: NodeId) -> Vec<NodeId> {
+        let mut members = vec![target];
+        let mut i = 0;
+        while i < members.len() {
+            let current = format!("n{}", members[i]);
+            for edge in doc.edges.iter().filter(|e| e.to == current) {
+                if let Some(from) = node_id(&edge.from)
+                    && !members.contains(&from)
+                {
+                    members.push(from);
+                }
+            }
+            i += 1;
+        }
+        members
     }
 
     // ----- graph <-> form -----
@@ -478,12 +547,8 @@ impl Inspector {
                 self.kind = None;
                 self.issues.clear();
                 self.output_count = 0;
-                self.report = None;
             }
             Some((id, preset, data)) => {
-                if self.node != Some(id) {
-                    self.report = None;
-                }
                 self.node = Some(id);
                 set_text(
                     &self.preset_name,
@@ -560,6 +625,7 @@ impl Inspector {
                 set_text(&self.file_path, f.path.clone(), window, cx);
                 choose(&self.file_mode, &WriteMode::ALL, f.mode, window, cx);
                 self.file_unfence = f.unfence;
+                self.file_bundle = f.bundle;
             }
         }
     }
@@ -718,6 +784,7 @@ impl Inspector {
                     mode: chosen(&self.file_mode, &WriteMode::ALL, WriteMode::label, cx)
                         .unwrap_or(prev.mode),
                     unfence: self.file_unfence,
+                    bundle: self.file_bundle,
                 })
             }
         };
@@ -818,6 +885,11 @@ impl Inspector {
 
     fn set_file_unfence(&mut self, on: bool, cx: &mut Context<Self>) {
         self.file_unfence = on;
+        self.sync(cx);
+    }
+
+    fn set_file_bundle(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.file_bundle = on;
         self.sync(cx);
     }
 
@@ -996,10 +1068,19 @@ impl Inspector {
         self.job = Some(Job {
             cancel,
             live: live.clone(),
+            target: id,
+            doc: doc.clone(),
         });
         self.live_log.clear();
         self.live_stream = None;
+        self.live_states = 0;
         self.report = None;
+        // The dots now describe this run: every member hollow until it moves.
+        self.marks = Self::run_members(&doc, id)
+            .into_iter()
+            .map(|member| (member, Mark::Pending))
+            .collect();
+        self.push_marks(cx);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let worker = live.clone();
@@ -1039,7 +1120,7 @@ impl Inspector {
         {
             return true;
         }
-        let report = {
+        let (report, moved) = {
             let mut live = lock(live);
             if live.log.len() > self.live_log.len() {
                 self.live_log
@@ -1048,13 +1129,33 @@ impl Inspector {
             if live.stream.is_some() {
                 self.live_stream = live.stream.clone();
             }
-            live.report.take()
+            let mut moved = false;
+            for (id, state) in &live.states[self.live_states..] {
+                if let Some(node) = node_id(id) {
+                    let mark = match state {
+                        NodeState::Running => Mark::Running,
+                        NodeState::Done => Mark::Ran,
+                        NodeState::Reused => Mark::Reused,
+                        NodeState::Failed => Mark::Failed,
+                    };
+                    self.marks.insert(node, mark);
+                    moved = true;
+                }
+            }
+            self.live_states = live.states.len();
+            (live.report.take(), moved)
         };
+        if moved {
+            self.push_marks(cx);
+        }
         cx.notify();
         let Some(report) = report else { return false };
-        self.job = None;
+        let Some(job) = self.job.take() else {
+            return true;
+        };
         self.live_log.clear();
         self.live_stream = None;
+        self.remember(&job, &report, cx);
         let (text, error) = match &report.result {
             Ok(output) => {
                 let saved = output
@@ -1062,7 +1163,7 @@ impl Inspector {
                     .as_ref()
                     .map(|p| format!(" → {}", p.display()))
                     .unwrap_or_default();
-                let cached = match report.cached {
+                let cached = match report.reused.len() {
                     0 => String::new(),
                     1 => " (1 node from the cache)".to_string(),
                     n => format!(" ({n} nodes from the cache)"),
@@ -1084,10 +1185,58 @@ impl Inspector {
         {
             self.output_count += 1;
         }
-        self.report = Some(report);
+        self.report = Some((job.target, report));
         self.status(text, error, cx);
         cx.notify();
         true
+    }
+
+    /// Keep every node's outcome from a run: the outputs that were made, and the error on
+    /// the node that failed. Nodes the run never reached keep their earlier result. The
+    /// canvas dots are settled from the report: a node that never got going loses its
+    /// hollow dot.
+    fn remember(&mut self, job: &Job, report: &Report, cx: &mut Context<Self>) {
+        let data_of = |id: &str| {
+            job.doc
+                .nodes
+                .iter()
+                .find(|n| n.id == id)
+                .and_then(|n| n.data.clone())
+        };
+        for (id, output) in &report.outputs {
+            if let Some(node) = node_id(id) {
+                self.results.insert(
+                    node,
+                    NodeResult {
+                        result: Ok(output.clone()),
+                        data: data_of(id),
+                    },
+                );
+                let mark = if report.reused.contains(id) {
+                    Mark::Reused
+                } else {
+                    Mark::Ran
+                };
+                self.marks.insert(node, mark);
+            }
+        }
+        if let (Some(id), Err(e)) = (&report.failed, &report.result)
+            && let Some(node) = node_id(id)
+        {
+            self.results.insert(
+                node,
+                NodeResult {
+                    result: Err(e.clone()),
+                    data: data_of(id),
+                },
+            );
+            if e != exec::CANCELLED {
+                self.marks.insert(node, Mark::Failed);
+            }
+        }
+        self.marks
+            .retain(|_, mark| !matches!(mark, Mark::Pending | Mark::Running));
+        self.push_marks(cx);
     }
 
     /// Ask the running job to stop. Scripts and database tools are killed at once; a
@@ -1525,31 +1674,57 @@ impl Inspector {
 
     fn render_file(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let unfence = self.file_unfence;
+        let bundle = self.file_bundle;
         let danger = cx.theme().danger;
+        let muted = cx.theme().muted_foreground;
+        let reserved = library::RESERVED_DIRS
+            .iter()
+            .map(|d| format!("{d}/"))
+            .collect::<Vec<_>>()
+            .join(", ");
         v_form()
             .small()
             .child(
                 field()
-                    .label("File")
-                    .description(format!(
-                        "Relative to the working directory; missing directories are created. {} are off limits.",
-                        library::RESERVED_DIRS
-                            .iter()
-                            .map(|d| format!("{d}/"))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ))
+                    .label(if bundle { "Directory" } else { "File" })
+                    .description(if bundle {
+                        format!(
+                            "Relative to the working directory; `.` is that directory itself. Each section's path goes under it. {reserved} are off limits."
+                        )
+                    } else {
+                        format!(
+                            "Relative to the working directory; missing directories are created. {reserved} are off limits."
+                        )
+                    })
                     .child(Input::new(&self.file_path).small()),
             )
             .child(
                 field()
-                    .label("If the file exists")
+                    .label(if bundle {
+                        "If a file exists"
+                    } else {
+                        "If the file exists"
+                    })
                     .child(Select::new(&self.file_mode).small().w_full()),
             )
             .child(
                 field().label("Content").child(
                     v_flex()
                         .gap_1()
+                        .child(
+                            Switch::new("file-bundle")
+                                .small()
+                                .checked(bundle)
+                                .label("Split `=== path ===` sections into files under the directory")
+                                .on_change(cx.listener(|this, on: &bool, _, cx| {
+                                    this.set_file_bundle(*on, cx)
+                                })),
+                        )
+                        .when(bundle, |d| {
+                            d.child(div().text_xs().text_color(muted).child(
+                                "The format a directory node emits. Ask the agent: \"Answer with one `=== path ===` section per file, nothing else.\" Nothing is written until every path checks out.",
+                            ))
+                        })
                         .child(
                             Switch::new("file-unfence")
                                 .small()
@@ -1806,16 +1981,41 @@ impl Render for Inspector {
                         .children(self.live_log.iter().map(|line| hint(line.clone())))
                         .children(stream)
                 });
-                let run_section = self.report.as_ref().map(|report| {
-                    let (headline, color) = match &report.result {
-                        Ok(output) => (
-                            format!("✓ {} in {:.1}s", output.label, report.elapsed.as_secs_f32()),
-                            success,
-                        ),
-                        Err(e) if e == exec::CANCELLED => ("■ Cancelled".to_string(), muted),
-                        Err(e) => (format!("✗ {e}"), danger),
+                // The run's headline and log stay with the node Run was pressed on.
+                let run_section = self
+                    .report
+                    .as_ref()
+                    .filter(|(target, _)| Some(*target) == self.node)
+                    .map(|(_, report)| {
+                        let (headline, color) = match &report.result {
+                            Ok(output) => (
+                                format!(
+                                    "✓ {} in {:.1}s",
+                                    output.label,
+                                    report.elapsed.as_secs_f32()
+                                ),
+                                success,
+                            ),
+                            Err(e) if e == exec::CANCELLED => ("■ Cancelled".to_string(), muted),
+                            Err(e) => (format!("✗ {e}"), danger),
+                        };
+                        v_flex()
+                            .gap_1()
+                            .child(div().text_xs().text_color(color).child(headline))
+                            .children(report.log.iter().map(|line| hint(line.clone())))
+                    });
+                // What this node produced the last time a run included it, whether it was
+                // the target or somewhere upstream.
+                let output_section = self.node.and_then(|id| self.results.get(&id)).map(|last| {
+                    let changed = data.as_ref() != last.data.as_ref();
+                    let (headline, color) = match &last.result {
+                        Ok(output) => (format!("Last output · {}", output.label), fg),
+                        Err(e) if e == exec::CANCELLED => {
+                            ("Last run was cancelled here".to_string(), muted)
+                        }
+                        Err(e) => (format!("✗ Failed here: {e}"), danger),
                     };
-                    let output = report.result.as_ref().ok();
+                    let output = last.result.as_ref().ok();
                     let saved = output
                         .and_then(|o| o.saved.clone())
                         .map(|p| hint(format!("saved {}", p.display())));
@@ -1827,12 +2027,26 @@ impl Render for Inspector {
                             .child(preview_box(shown))
                             .when(cut, |d| d.child(hint("… truncated in this preview".into())))
                     });
+                    let binary = output
+                        .filter(|o| !o.text)
+                        .map(|o| hint(format!("{}: binary, no preview", o.label)));
                     v_flex()
                         .gap_1()
-                        .child(div().text_xs().text_color(color).child(headline))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(color)
+                                .child(headline),
+                        )
+                        .when(changed, |d| {
+                            d.child(div().text_xs().text_color(danger).child(
+                                "The node changed since this ran; run again for a current result.",
+                            ))
+                        })
                         .children(saved)
-                        .children(report.log.iter().map(|line| hint(line.clone())))
                         .children(preview)
+                        .children(binary)
                 });
                 let cached = lock(&self.cache).len();
                 let cache_row = (cached > 0).then(|| {
@@ -1840,8 +2054,9 @@ impl Render for Inspector {
                         .gap_2()
                         .items_center()
                         .child(hint(format!(
-                            "{cached} node output{} cached from earlier runs; Run reuses them when nothing upstream changed.",
-                            if cached == 1 { "" } else { "s" }
+                            "{cached} output{} cached in {}/ across sessions; Run reuses them when nothing upstream changed.",
+                            if cached == 1 { "" } else { "s" },
+                            library::CACHE_DIR
                         )))
                         .child(
                             Button::new("clear-cache")
@@ -1860,6 +2075,7 @@ impl Render for Inspector {
                     .child(v_flex().gap_1().children(issues))
                     .children(live_section)
                     .children(run_section)
+                    .children(output_section)
                     .children(cache_row)
                     .children(save_row)
                     .child(div().h(px(1.0)).flex_shrink_0().bg(border))

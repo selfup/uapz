@@ -991,15 +991,21 @@ impl WriteMode {
 /// an agent's answer lands in the repository as a test, a document or a data file.
 /// Missing directories on the way are created. The path is the node's own setting, never
 /// the model's, and the app's directories (`scripts/`, `agents/`, …) are off limits.
+///
+/// With `bundle` on, `path` is a directory and the text is split on `=== path ===`
+/// headers, the format a directory node emits, so one answer can write several files
+/// under it. Section paths are relative to that directory and checked like any other.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FileConfig {
-    /// Relative to the working directory.
+    /// Relative to the working directory: the file, or with `bundle` the directory.
     pub path: String,
     pub mode: WriteMode,
     /// Strip a surrounding Markdown code fence and end the text with a newline, which is
     /// what a model's answer usually needs to become a source file.
     pub unfence: bool,
+    /// Write one file per `=== path ===` section under `path`.
+    pub bundle: bool,
 }
 
 impl Default for FileConfig {
@@ -1008,22 +1014,45 @@ impl Default for FileConfig {
             path: String::new(),
             mode: WriteMode::Create,
             unfence: true,
+            bundle: false,
         }
     }
 }
 
 impl FileConfig {
+    /// The directory a bundle writes under, as shown: `.` for the working directory.
+    pub fn display_path(&self) -> &str {
+        match self.path.trim() {
+            "" => ".",
+            path => path,
+        }
+    }
+
     pub fn summary(&self) -> String {
-        format!(
-            "{} · {}",
-            file_name(&self.path).unwrap_or("no file"),
-            self.mode.label().to_lowercase()
-        )
+        let target = if self.bundle {
+            format!("{}/ · sections", self.display_path())
+        } else {
+            file_name(&self.path).unwrap_or("no file").to_string()
+        };
+        format!("{target} · {}", self.mode.label().to_lowercase())
     }
 
     pub fn validate(&self) -> Vec<Issue> {
         let mut issues = Vec::new();
-        if let Err(e) = validate::writable_path(&self.path) {
+        let checked = if self.bundle {
+            // The directory may be the working directory itself; each section's path is
+            // checked against the app's directories when it is written.
+            validate::directory_path(&self.path).and_then(|dir| {
+                if dir.as_os_str().is_empty() {
+                    Ok(dir)
+                } else {
+                    validate::writable_path(&self.path)
+                }
+            })
+        } else {
+            validate::writable_path(&self.path)
+        };
+        if let Err(e) = checked {
             issues.push(Issue::new("path", e));
         }
         issues
@@ -1296,8 +1325,31 @@ mod tests {
         let blank = FileConfig::default();
         assert_eq!(blank.mode, WriteMode::Create);
         assert!(blank.unfence);
+        assert!(!blank.bundle);
         assert_eq!(blank.validate()[0].field, "path");
         assert_eq!(blank.summary(), "no file · create only");
+
+        // A bundle may target the working directory itself, but not an app directory.
+        let bundle = FileConfig {
+            bundle: true,
+            ..FileConfig::default()
+        };
+        assert!(bundle.validate().is_empty(), "{:?}", bundle.validate());
+        assert_eq!(bundle.summary(), "./ · sections · create only");
+        let under = FileConfig {
+            path: "tests/generated".into(),
+            bundle: true,
+            mode: WriteMode::Overwrite,
+            ..FileConfig::default()
+        };
+        assert!(under.validate().is_empty());
+        assert_eq!(under.summary(), "tests/generated/ · sections · overwrite");
+        let bad = FileConfig {
+            path: "agents".into(),
+            bundle: true,
+            ..FileConfig::default()
+        };
+        assert_eq!(bad.validate()[0].field, "path");
 
         let file = FileConfig {
             path: "tests/generated/math.rs".into(),

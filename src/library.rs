@@ -26,14 +26,17 @@ pub const PROMPTS_DIR: &str = "prompts";
 pub const DATABASES_DIR: &str = "databases";
 pub const SCRIPTS_DIR: &str = "scripts";
 pub const DATA_DIR: &str = "data";
+/// Where the executor's persistent output cache lives.
+pub const CACHE_DIR: &str = "cache";
 /// Directories the app owns. Write nodes may not create files under them, so a run can
-/// never plant a script, agent, prompt, database preset, kind or graph. `data/` is not
-/// reserved: that is where generated data belongs.
+/// never plant a script, agent, prompt, database preset, kind, graph or cache entry.
+/// `data/` is not reserved: that is where generated data belongs.
 pub const RESERVED_DIRS: &[&str] = &[
     SCRIPTS_DIR,
     AGENTS_DIR,
     PROMPTS_DIR,
     DATABASES_DIR,
+    CACHE_DIR,
     crate::doc::DIR,
     crate::doc::NODES_DIR,
 ];

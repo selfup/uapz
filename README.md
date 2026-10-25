@@ -29,6 +29,11 @@ provider's shape and the request shape for every provider:
 cargo test
 ```
 
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets -D
+warnings` and `cargo test` on a macOS runner for every push and pull request.
+`scripts/run-tests.sh` runs the unit suite and then the live suite with this machine's
+defaults.
+
 Live tests drive the executor against a real OpenAI-compatible server and a PostgreSQL
 server; they are ignored by default. With a chat model and an embedding model loaded in LM
 Studio (or any server named by `UAPZ_LIVE_ENDPOINT`) and a local PostgreSQL:
@@ -60,6 +65,13 @@ an inspector on the right. Drag the divider beside either side panel to resize i
   summary such as `Ollama · llama3.1` or `SQLite · sales.sqlite`. Red nodes write: a
   database node whose read-only switch is off (its summary says `· write`) and a **Write
   file** node.
+- The dots in the nodes' corners follow the latest run. Press Run and every node that
+  takes part gets a hollow dot; each turns the accent color while its own step runs, then
+  green when it ran and produced output, grey when its output came from the cache, red
+  when it failed. A node the run never reached loses its dot. Data, directory, database
+  and write-file nodes always run, so they are always green; an agent or script that stays
+  green on a rerun had something upstream change, and the log says which nodes were
+  reused. Loading or clearing the graph removes the dots.
 
 **Inspector**
 
@@ -76,9 +88,13 @@ an inspector on the right. Drag the divider beside either side panel to resize i
   prompt in the sidebar loads it into the selected agent.
 - **Run** executes the selected node after everything wired into it. While it runs, the
   log grows line by line and an agent's answer streams into a preview as it is generated;
-  **Cancel** stops it. The result, the log and a text preview appear under the form; the
-  status line says where an agent's output was saved and how many nodes came from the
+  **Cancel** stops it. The result and the log appear under the form of the node you ran;
+  the status line says where an agent's output was saved and how many nodes came from the
   cache. **Run fresh** ignores the cache. See *Running nodes*.
+- Every node that took part in a run keeps its result. Select a node in the middle of the
+  graph and **Last output** shows what it produced (its saved file, a text preview) or why
+  it failed, with a warning when the node has been edited since. Loading another graph
+  forgets these.
 
 **Sidebar**
 
@@ -165,12 +181,34 @@ them on disk. The node is red because it changes files outside the app's own fol
 
 | Field | Notes |
 | --- | --- |
-| File | Relative to the working directory; directories on the way are created. The path is yours, never the model's. `scripts/`, `agents/`, `prompts/`, `databases/`, `nodes/` and `graphs/` are refused, so a run can never plant a script or rewrite a preset. `data/` is allowed |
+| File | Relative to the working directory; directories on the way are created. The path is yours, never the model's. `scripts/`, `agents/`, `prompts/`, `databases/`, `nodes/`, `graphs/` and `cache/` are refused, so a run can never plant a script or rewrite a preset. `data/` is allowed |
 | If the file exists | **Create only** (the default) refuses to touch an existing file; **Overwrite** replaces it; **Append** adds to it |
+| Split sections | Off: the whole text becomes the one file. On: the field names a directory (`.` for the working directory) and the text is split on `=== path ===` headers, one file per section under it. See below |
 | Strip a code fence | On by default: a surrounding ```` ``` ```` fence is removed and the text ends with a newline, which is what a model's answer needs to become a source file. Off writes the bytes as they came |
 
 A single binary input (an image from an agent) is written byte for byte. The node's output
 is what it wrote, so a script can run on the file next.
+
+**Several files from one answer.** The section format is the one a directory node emits, so
+an agent that read the repository can answer in kind. Prompt it with something like
+*"Answer with one `=== path ===` section per file, nothing else"* and turn **Split
+sections** on:
+
+```
+=== src/add_test.rs ===
+#[test]
+fn adds() { assert_eq!(add(2, 2), 4); }
+
+=== notes/README.md ===
+# notes
+```
+
+Section paths are relative to the node's directory and go through the same checks as any
+path (no `..`, no hidden names, no app directories). Every path is checked and resolved
+before anything is written, and in **Create only** mode one existing file stops the whole
+write. Text before the first header is ignored, each section's own code fence is stripped,
+the same path twice is an error, and one answer may write at most 500 files. The output
+lists what was written.
 
 ## Running nodes
 
@@ -199,15 +237,21 @@ streamed reply, and inside the wait for a child process, which is killed with it
 group. A provider call that does not stream (embeddings, images) finishes or times out
 first. A cancelled run saves nothing and reports `Cancelled`.
 
-**Cache.** The inspector keeps every agent's and script's output across runs, keyed on the
-node's configuration, its inputs' outputs and (for scripts) the script file itself, so
-running a downstream node again re-uses the agents above it. Data, directory, database and
+**Cache.** Every agent's and script's output is kept across runs, keyed on the node's
+configuration, its inputs' outputs and (for scripts) the script file itself, so running a
+downstream node again re-uses the agents above it. Data, directory, database and
 write-file nodes always run: they read or change live state, and they are cheap. Every
 node's output is hashed for the nodes after it, so editing a comment in a script does not
 re-run the agent that reads its output, while changing a data file does. The log says
 `n3: reused the cached Text · 2 KB` for each hit, the status line counts them, **Run
-fresh** runs everything and refills the cache, and **Clear** under the run drops it. The
-cache lives in memory for the session; agent outputs are also on disk under `agents/`.
+fresh** runs everything and refills the cache, and **Clear** under the run drops it.
+
+The cache lives in `cache/` as `<key>.json` (label, type, saved path, time) plus
+`<key>.bin` (the bytes), so it survives a restart and is shared by every graph: another
+node asking the same question of the same inputs gets the same answer without a call. Keys
+are content hashes (two FNV-1a passes, 128 bits), stable across builds. The directory is
+pruned oldest-first past 1 GB, a broken entry is a miss, and a disk that refuses the write
+costs persistence, not the run. Add `cache/` to `.gitignore`, as this repository does.
 
 Agents send the prompt as the system message and the wire text as the user message; with
 nothing on the wire the prompt is the user message. Prompt plus input must fit the context
@@ -310,6 +354,7 @@ are plain text, so they are easy to commit, diff or hand-edit.
 | `databases/<name>.json` | A saved database config |
 | `scripts/` | Script files for script nodes (`.py`, `.sh`, `.js`, …) |
 | `data/` | Data files and database files for data and database nodes; write-file nodes may write here |
+| `cache/<key>.json`, `cache/<key>.bin` | The executor's output cache, by content hash; safe to delete |
 
 ### `graphs/<name>.md`
 
@@ -384,7 +429,8 @@ ids and `-->` edges (node shapes and `|labels|` are tolerated) and laid out left
 | `src/sidebar.rs` | Workspace: sidebar sections, toolbar, layout |
 | `src/inspector.rs` | The node content editor on the right, with Run |
 | `src/exec.rs` | The executor: upstream ordering, files, child processes, database tools, agent runs |
-| `src/providers.rs` | Provider request builders and reply parsers; the HTTP client |
+| `src/providers.rs` | Provider request builders and reply parsers; the HTTP client, plain and streamed |
+| `.github/workflows/ci.yml` | Format, clippy and tests on every push |
 | `src/graph.rs` | The editor view: nodes, wires, dragging, selection |
 | `src/node_data.rs` | The typed node content: configs, enums, summaries, validation |
 | `src/validate.rs` | Sanitizers and validators: names, paths, env vars, identifiers, SQL |
