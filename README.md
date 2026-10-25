@@ -2,7 +2,7 @@
 
 A small native node-graph editor built with [gpui-kit](https://gpui-kit.com). Nodes are
 boxes you drag around and wire together; each one can carry typed content: an **agent**,
-a **database**, a **script** or a **data** file. Graphs save as a Markdown file with a
+a **database**, a **script**, a **data** file or a **directory**. Graphs save as a Markdown file with a
 Mermaid diagram plus a JSON sidecar, and reusable agents, prompts and databases save into
 their own directories so they show up in the sidebar.
 
@@ -24,10 +24,21 @@ chains, timeouts) and the request shape for every provider:
 cargo test
 ```
 
+Live tests drive the executor against a real OpenAI-compatible server and a PostgreSQL
+server; they are ignored by default. With a chat model and an embedding model loaded in LM
+Studio (or any server named by `UAPZ_LIVE_ENDPOINT`) and a local PostgreSQL:
+
+```sh
+UAPZ_LIVE_MODEL=mistralai/ministral-3-3b \
+UAPZ_LIVE_EMBED_MODEL=text-embedding-nomic-embed-text-v1.5 \
+UAPZ_LIVE_PG_URL=postgres://localhost/postgres \
+cargo test live_ -- --ignored --nocapture
+```
+
 ## Using it
 
 The window has a sidebar on the left, a toolbar above the canvas, the canvas itself, and
-an inspector on the right.
+an inspector on the right. Drag the divider beside either side panel to resize it.
 
 **Canvas**
 
@@ -37,17 +48,20 @@ an inspector on the right.
 - Click a node or a wire to select it. Backspace or Delete removes it. Deleting a node
   removes its wires.
 - Double-click empty space, press cmd-n, or click **Add node** to add a node of whatever
-  the toolbar dropdown has selected: **Blank**, one of the four types, or a saved kind.
+  the toolbar dropdown has selected: **Blank**, one of the five types, **Database
+  (write)**, or a saved kind.
 - Escape cancels a drag and clears the selection.
 - A typed node shows its label (its type, or the preset it came from) and a one-line
-  summary such as `Ollama · llama3.1` or `SQLite · sales.sqlite`.
+  summary such as `Ollama · llama3.1` or `SQLite · sales.sqlite`. A database node whose
+  read-only switch is off is red and says `· write` in its summary.
 
 **Inspector**
 
 - Select a node and its content appears as a form. Every edit writes straight back into
   the node; nothing is saved to disk until you save the graph or a preset.
-- A blank node offers four buttons to give it content. A typed node can change type or go
-  back to blank at the bottom of the panel.
+- A blank node offers buttons to give it content: the five types plus **Database (write)**,
+  a database node that starts with its read-only switch off. A typed node can change type
+  or go back to blank at the bottom of the panel.
 - Problems are listed under the form as they happen (`model: model is empty`, `query:
   DELETE is not allowed in a read-only query`). A valid config says so.
 - **Save agent** / **Save database** writes the config into the library under the name in
@@ -99,7 +113,8 @@ Every section header collapses on click. Sections, top to bottom:
 | Connection URL env var | Server engines: the *name* of the variable holding the URL, so credentials stay in the environment |
 | Input data | Optional `.csv`, `.tsv`, `.json`, `.ndjson`, `.jsonl` or `.parquet` file inside `data/`, loaded into the input table before the query |
 | Input table | Table name for the input; a plain identifier |
-| Query | One statement. Read-only by default, see below |
+| Query | One statement. Read-only by default, see below. Empty means the SQL arrives on the wire, typically from an agent |
+| Write the query with an agent | Pick a saved generative agent, describe what the query should do, press **Write query**. The agent gets the engine, the schema (`.schema` for SQLite and DuckDB, `information_schema` for the servers, plus the input file's columns) and your request; its answer lands in the query field, where the usual checks run on it |
 
 **Script**
 
@@ -107,7 +122,7 @@ Every section header collapses on click. Sections, top to bottom:
 | --- | --- |
 | Runtime | Python (run through `uv`), Shell, Node; picked from the file extension |
 | Script file | A path inside `scripts/` whose extension matches the runtime |
-| Arguments | Space separated; at most 64, each printable and under 4096 bytes |
+| Arguments | Split like a shell: spaces separate, `"double"` or `'single'` quotes keep words together, a backslash escapes the next character. At most 64, each printable and under 4096 bytes |
 | Timeout | Seconds, 1 to 86,400 |
 
 **Data**
@@ -116,6 +131,22 @@ Every section header collapses on click. Sections, top to bottom:
 | --- | --- |
 | File | A path inside `data/` |
 | Format | CSV, TSV, JSON, Text, Markdown, Image, PDF, Parquet or Binary; picked from the extension and checked against it |
+
+**Directory**
+
+Reads a directory as one text, so an agent can work on a whole repository: a listing of
+the files that pass the filters, then their contents up to a budget. Point it at `.` and
+the graph reads the repository the app runs in.
+
+| Field | Notes |
+| --- | --- |
+| Directory | Relative to the working directory; `.` or empty is the working directory itself. Must be inside it |
+| Include patterns | Space-separated globs relative to the directory, e.g. `src/**/*.rs *.md`. `*` crosses `/`, so `*.rs` takes Rust files at any depth. Empty takes every file |
+| Exclude patterns | Globs to skip. Hidden entries and symlinks are always skipped |
+| Respect .gitignore | On by default, so `target/` and the like stay out of a repository scan |
+| Include file contents | Off gives the listing only |
+| Max files | 1 to 10,000; the listing says when more matched |
+| Content budget | Bytes of contents after the listing; files are cut when it runs out. The agent downstream must still fit everything in its context size |
 
 ## Running nodes
 
@@ -127,15 +158,24 @@ and hands that to the node:
 | --- | --- | --- | --- |
 | Data | Reads the file (up to 64 MB) | nothing | the file; text for CSV, TSV, JSON, Text and Markdown, binary otherwise |
 | Script | `uv run --quiet <file>`, `sh`/`bash`/`zsh <file>` or `node <file>` with the arguments, in `scripts/` | stdin | stdout as text; non-zero exit or the timeout is an error |
-| Database | `sqlite3 -json`, `duckdb -json`, `psql --csv` or `mysql --batch` with the query on stdin | nothing (use the input file) | rows as JSON (file engines) or CSV/TSV (server engines) |
+| Database | `sqlite3 -json`, `duckdb -json`, `psql --csv` or `mysql --batch` with the query on stdin | the SQL to run, only when the node's own query is empty; data comes from the input file | rows as JSON (file engines) or CSV/TSV (server engines) |
 | Agent | One request to the provider | the user message | text, JSON, an embedding vector or an image, saved to `agents/<name>/outputs/` |
+| Directory | Walks the directory (hidden entries and symlinks skipped, `.gitignore` honored when asked, 32 levels deep) | nothing | text: `Directory <path>: N files matched`, one line per file with its size, then `=== path ===` sections with contents until the budget is spent; binary files are named, not shown |
 
 Agents send the prompt as the system message and the wire text as the user message; with
 nothing on the wire the prompt is the user message. Prompt plus input must fit the context
 size (estimated at four characters per token) or the run is refused before anything is
-sent. JSON output is requested natively where the API has a flag (OpenAI-style
-`response_format`, Ollama `format`, Google `responseMimeType`), by instruction on
-Anthropic, and always validated and pretty-printed; fenced or chatty replies are unwrapped.
+sent. JSON output adds an instruction to the system prompt on every provider and is also
+requested natively where the API has a flag (OpenAI-style `response_format`, which LM
+Studio only accepts in its `json_schema` form; Ollama `format`; Google
+`responseMimeType`). It is always validated and pretty-printed; fenced or chatty replies
+are unwrapped.
+
+A database node with an empty query runs the text arriving on the wire as its statement,
+with a surrounding code fence stripped. That SQL goes through the same checker as a typed
+query, with the node's read-only flag, so an agent wired into a read-only node can only
+read. Wire a generative agent into a **Database (write)** node and the agent's SQL can
+change the database: that is what the red color warns about.
 
 Provider notes: Ollama is called on its native API so the context size reaches the model
 as `num_ctx`. Anthropic is called on API version 2026-10-21 with server-side refusal

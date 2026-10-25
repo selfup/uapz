@@ -2,16 +2,18 @@
 //! (agents, prompts, databases, scripts, data), the toolbar, the editor, and the inspector.
 
 use crate::doc::{self, NodeKind};
-use crate::graph::{Current, Graph, hsla_of, type_color};
-use crate::inspector::{Inspector, InspectorEvent};
+use crate::graph::{Current, Graph, data_color, hsla_of, type_color};
+use crate::inspector::{INSPECTOR_W, Inspector, InspectorEvent};
 use crate::library::{self, Preset};
 use crate::node_data::{
     AgentConfig, DataConfig, DataFormat, DatabaseConfig, NodeData, NodeType, Runtime, ScriptConfig,
+    WRITABLE_DATABASE_LABEL,
 };
 use crate::validate;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::color_picker::{ColorPicker, ColorPickerState};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::{ActiveTheme, IndexPath, Sizable, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
@@ -21,7 +23,11 @@ use std::collections::HashSet;
 gpui_kit::actions!(workspace, [Save, NewGraph]);
 
 pub const KEY_CONTEXT: &str = "Workspace";
+/// Initial sidebar width; the divider next to it resizes it.
 const SIDEBAR_W: f32 = 260.0;
+/// How narrow and how wide either side panel can be dragged.
+const PANEL_MIN_W: f32 = 200.0;
+const PANEL_MAX_W: f32 = 720.0;
 /// First entry of the kind dropdown: a plain node.
 const BLANK: &str = "Blank";
 /// Starting color in the node creator.
@@ -72,10 +78,17 @@ struct Status {
     error: bool,
 }
 
-/// Dropdown entries: Blank, the four content types, then every saved kind in list order.
+/// Dropdown entries: Blank, the four content types (with the writable database after the
+/// read-only one), then every saved kind in list order.
 fn select_items(kinds: &[NodeKind]) -> Vec<SharedString> {
     std::iter::once(SharedString::from(BLANK))
-        .chain(NodeType::ALL.iter().map(|t| SharedString::from(t.label())))
+        .chain(NodeType::ALL.iter().flat_map(|t| {
+            let mut labels = vec![SharedString::from(t.label())];
+            if *t == NodeType::Database {
+                labels.push(SharedString::from(WRITABLE_DATABASE_LABEL));
+            }
+            labels
+        }))
         .chain(kinds.iter().map(|k| SharedString::from(k.name.clone())))
         .collect()
 }
@@ -84,6 +97,8 @@ fn select_items(kinds: &[NodeKind]) -> Vec<SharedString> {
 fn current_of(value: &str) -> Current {
     if value == BLANK {
         Current::Blank
+    } else if value == WRITABLE_DATABASE_LABEL {
+        Current::WritableDatabase
     } else if let Some(ty) = NodeType::from_label(value) {
         Current::Type(ty)
     } else {
@@ -261,7 +276,10 @@ impl Workspace {
 
     fn save_kind_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name = doc::sanitize_name(&self.kind_name.read(cx).value());
-        if name == BLANK || NodeType::from_label(&name).is_some() {
+        if name == BLANK
+            || name.eq_ignore_ascii_case(WRITABLE_DATABASE_LABEL)
+            || NodeType::from_label(&name).is_some()
+        {
             self.err(format!(
                 "`{name}` is reserved for the node types; pick another name"
             ));
@@ -469,6 +487,7 @@ fn ghost_button(id: impl Into<ElementId>, label: &'static str) -> Button {
 impl Workspace {
     /// A collapsible sidebar section: header row with a chevron, title and count; the body
     /// only when expanded.
+    #[allow(clippy::too_many_arguments)]
     fn section(
         &self,
         key: &'static str,
@@ -692,10 +711,10 @@ impl Workspace {
     }
 
     fn render_databases(&self, c: Colors, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let color = type_color(NodeType::Database);
         let mut rows = Vec::with_capacity(self.databases.len());
         for (i, db) in self.databases.iter().enumerate() {
             let (name, config) = (db.name.clone(), db.config.clone());
+            let color = data_color(&NodeData::Database(config.clone()));
             let delete_name = db.name.clone();
             rows.push(
                 row(("database", i), c)
@@ -918,40 +937,115 @@ impl Render for Workspace {
                 cx,
             ));
 
+        let sidebar = v_flex()
+            .size_full()
+            .min_w_0()
+            .bg(bg)
+            .border_r_1()
+            .border_color(c.border)
+            .child(
+                div()
+                    .id("sidebar")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .p_3()
+                    .child(sections),
+            )
+            .children(status);
+        let center = v_flex()
+            .size_full()
+            .min_w_0()
+            .child(toolbar)
+            .child(div().flex_1().min_h_0().w_full().child(self.graph.clone()));
+
+        // The three columns form a resizable group: drag a divider to widen a side panel.
         div()
             .key_context(KEY_CONTEXT)
             .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::on_new))
             .size_full()
-            .flex()
-            .flex_row()
             .child(
-                v_flex()
-                    .w(px(SIDEBAR_W))
-                    .h_full()
-                    .flex_shrink_0()
-                    .bg(bg)
-                    .border_r_1()
-                    .border_color(c.border)
+                h_resizable("layout")
                     .child(
-                        div()
-                            .id("sidebar")
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .p_3()
-                            .child(sections),
+                        resizable_panel()
+                            .size(px(SIDEBAR_W))
+                            .size_range(px(PANEL_MIN_W)..px(PANEL_MAX_W))
+                            .flex_none()
+                            .child(sidebar),
                     )
-                    .children(status),
+                    .child(resizable_panel().child(center))
+                    .child(
+                        resizable_panel()
+                            .size(px(INSPECTOR_W))
+                            .size_range(px(PANEL_MIN_W)..px(PANEL_MAX_W))
+                            .flex_none()
+                            .child(self.inspector.clone()),
+                    ),
             )
-            .child(
-                v_flex()
-                    .flex_1()
-                    .h_full()
-                    .min_w_0()
-                    .child(toolbar)
-                    .child(div().flex_1().min_h_0().w_full().child(self.graph.clone())),
-            )
-            .child(self.inspector.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // `use super::*` would also import gpui's `test` attribute macro, which shadows the
+    // standard one, so the module names what it needs.
+    use super::{current_of, file_data, select_items};
+    use crate::doc::NodeKind;
+    use crate::graph::Current;
+    use crate::node_data::{DataFormat, NodeData, NodeType, Runtime};
+
+    #[test]
+    fn dropdown_entries_cover_blank_the_types_and_saved_kinds() {
+        let kinds = vec![NodeKind {
+            name: "Note".into(),
+            color: "#112233".into(),
+        }];
+        let items = select_items(&kinds);
+        let items: Vec<&str> = items.iter().map(|s| s.as_ref()).collect();
+        assert_eq!(
+            items,
+            [
+                "Blank",
+                "Agent",
+                "Database",
+                "Database (write)",
+                "Script",
+                "Data",
+                "Directory",
+                "Note"
+            ]
+        );
+        assert_eq!(current_of("Blank"), Current::Blank);
+        assert_eq!(current_of("Database"), Current::Type(NodeType::Database));
+        assert_eq!(current_of("Database (write)"), Current::WritableDatabase);
+        assert_eq!(current_of("Directory"), Current::Type(NodeType::Directory));
+        assert_eq!(current_of("Note"), Current::Kind("Note".into()));
+    }
+
+    #[test]
+    fn files_become_nodes_of_the_matching_runtime_or_format() {
+        match file_data(NodeType::Script, "etl/run.py") {
+            NodeData::Script(s) => {
+                assert_eq!(s.runtime, Runtime::Python);
+                assert_eq!(s.path, "etl/run.py");
+            }
+            other => panic!("{other:?}"),
+        }
+        match file_data(NodeType::Script, "tool.sh") {
+            NodeData::Script(s) => assert_eq!(s.runtime, Runtime::Shell),
+            other => panic!("{other:?}"),
+        }
+        match file_data(NodeType::Data, "sales.csv") {
+            NodeData::Data(d) => {
+                assert_eq!(d.format, DataFormat::Csv);
+                assert_eq!(d.path, "sales.csv");
+            }
+            other => panic!("{other:?}"),
+        }
+        match file_data(NodeType::Data, "img.png") {
+            NodeData::Data(d) => assert_eq!(d.format, DataFormat::Image),
+            other => panic!("{other:?}"),
+        }
     }
 }

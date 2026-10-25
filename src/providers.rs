@@ -7,7 +7,11 @@
 //!
 //! Protocols:
 //! - OpenAI-compatible servers (OpenAI, OpenRouter, Mistral, LM Studio, llama.cpp, custom)
-//!   share `/chat/completions`, `/embeddings` and `/images/generations`.
+//!   share `/chat/completions`, `/embeddings` and `/images/generations`. JSON output is
+//!   requested with `response_format`; LM Studio only accepts its `json_schema` form.
+//! - JSON output also adds an instruction to the system prompt on every provider: OpenAI's
+//!   `json_object` mode refuses requests that never mention JSON, and Ollama pads replies
+//!   with whitespace without one.
 //! - Ollama is called on its native `/api/chat` and `/api/embed`, which carry the
 //!   configured context size as `num_ctx`.
 //! - Anthropic is called on API version 2026-10-21. That version rejects sampling
@@ -142,6 +146,18 @@ fn with_json_instruction(system: Option<String>, wants_json: bool) -> Option<Str
     })
 }
 
+/// How an OpenAI-compatible server is asked for JSON. LM Studio rejects `json_object` and
+/// only takes `json_schema`; an empty schema accepts any JSON value.
+fn json_response_format(provider: Provider) -> Value {
+    match provider {
+        Provider::LmStudio => json!({
+            "type": "json_schema",
+            "json_schema": {"name": "output", "schema": {}},
+        }),
+        _ => json!({"type": "json_object"}),
+    }
+}
+
 fn chat_messages(system: Option<&str>, user: &str) -> Value {
     let mut messages = Vec::new();
     if let Some(system) = system {
@@ -180,13 +196,14 @@ pub fn build_request(
             match config.model_type {
                 ModelType::Generative => {
                     let (system, user) = prompt_parts(config, input)?;
+                    let system = with_json_instruction(system, wants_json);
                     let mut body = json!({
                         "model": model,
                         "messages": chat_messages(system.as_deref(), &user),
                         "temperature": temperature(config),
                     });
                     if wants_json {
-                        body["response_format"] = json!({"type": "json_object"});
+                        body["response_format"] = json_response_format(config.provider);
                     }
                     (format!("{base}/chat/completions"), body)
                 }
@@ -212,6 +229,7 @@ pub fn build_request(
         Api::Ollama => match config.model_type {
             ModelType::Generative => {
                 let (system, user) = prompt_parts(config, input)?;
+                let system = with_json_instruction(system, wants_json);
                 let mut body = json!({
                     "model": model,
                     "messages": chat_messages(system.as_deref(), &user),
@@ -262,6 +280,7 @@ pub fn build_request(
             match config.model_type {
                 ModelType::Generative => {
                     let (system, user) = prompt_parts(config, input)?;
+                    let system = with_json_instruction(system, wants_json);
                     let mut body = json!({
                         "contents": [{"role": "user", "parts": [{"text": user}]}],
                         "generationConfig": {"temperature": temperature(config)},
@@ -522,9 +541,39 @@ pub(crate) mod tests {
         assert_eq!(req.body["model"], "m");
         assert_eq!(req.body["temperature"], 0.2);
         assert_eq!(req.body["messages"][0]["role"], "system");
-        assert_eq!(req.body["messages"][0]["content"], "Be brief.");
+        assert_eq!(
+            req.body["messages"][0]["content"],
+            format!("Be brief.\n\n{JSON_INSTRUCTION}")
+        );
         assert_eq!(req.body["messages"][1]["content"], "hello");
         assert_eq!(req.body["response_format"]["type"], "json_object");
+    }
+
+    #[test]
+    fn lm_studio_asks_for_json_with_a_schema() {
+        let config = AgentConfig {
+            auth: Auth::None,
+            ..agent(Provider::LmStudio, ModelType::Generative, OutputType::Json)
+        };
+        let req = build_request(&config, None, "hi").unwrap();
+        let format = &req.body["response_format"];
+        assert_eq!(format["type"], "json_schema");
+        assert!(format["json_schema"]["name"].is_string());
+        assert_eq!(format["json_schema"]["schema"], json!({}));
+        assert!(
+            req.body["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .ends_with(JSON_INSTRUCTION)
+        );
+
+        let text = AgentConfig {
+            output: OutputType::Text,
+            ..config
+        };
+        let req = build_request(&text, None, "hi").unwrap();
+        assert!(req.body.get("response_format").is_none());
+        assert_eq!(req.body["messages"][0]["content"], "Be brief.");
     }
 
     #[test]
@@ -582,6 +631,10 @@ pub(crate) mod tests {
         assert_eq!(req.body["stream"], false);
         assert_eq!(req.body["options"]["num_ctx"], 4096);
         assert_eq!(req.body["format"], "json");
+        assert_eq!(
+            req.body["messages"][0]["content"],
+            format!("Be brief.\n\n{JSON_INSTRUCTION}")
+        );
 
         let embed = AgentConfig {
             model_type: ModelType::Embedding,
@@ -645,7 +698,7 @@ pub(crate) mod tests {
         assert_eq!(req.headers, vec![("x-goog-api-key".into(), "g-key".into())]);
         assert_eq!(
             req.body["system_instruction"]["parts"][0]["text"],
-            "Be brief."
+            format!("Be brief.\n\n{JSON_INSTRUCTION}")
         );
         assert_eq!(
             req.body["generationConfig"]["responseMimeType"],
@@ -821,9 +874,25 @@ pub(crate) mod tests {
     ) -> (String, std::thread::JoinHandle<String>) {
         use std::io::{BufRead, BufReader, Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
         let handle = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
+            // Poll with a deadline so a client that never connects fails the test
+            // instead of hanging it on join.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("no client connected: {e}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
             let mut reader = BufReader::new(stream);
             let mut head = String::new();
             let mut length = 0usize;

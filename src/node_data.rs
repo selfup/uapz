@@ -12,7 +12,12 @@ use serde_json::Value;
 use crate::library::{DATA_DIR, SCRIPTS_DIR};
 use crate::validate::{self, Issue, MAX_PROMPT_LEN};
 
-/// The four kinds of content a node can carry.
+/// Fill color of a database node that may write, as `#rrggbb`: red, unlike any type.
+pub const WRITE_COLOR: &str = "#ef4444";
+/// Picker label for a database node created with its read-only flag off.
+pub const WRITABLE_DATABASE_LABEL: &str = "Database (write)";
+
+/// The five kinds of content a node can carry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NodeType {
@@ -20,10 +25,17 @@ pub enum NodeType {
     Database,
     Script,
     Data,
+    Directory,
 }
 
 impl NodeType {
-    pub const ALL: [NodeType; 4] = [Self::Agent, Self::Database, Self::Script, Self::Data];
+    pub const ALL: [NodeType; 5] = [
+        Self::Agent,
+        Self::Database,
+        Self::Script,
+        Self::Data,
+        Self::Directory,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -31,6 +43,7 @@ impl NodeType {
             Self::Database => "Database",
             Self::Script => "Script",
             Self::Data => "Data",
+            Self::Directory => "Directory",
         }
     }
 
@@ -41,6 +54,7 @@ impl NodeType {
             Self::Database => "#0ea5e9",
             Self::Script => "#f59e0b",
             Self::Data => "#22c55e",
+            Self::Directory => "#14b8a6",
         }
     }
 
@@ -57,6 +71,7 @@ impl NodeType {
             Self::Database => NodeData::Database(DatabaseConfig::default()),
             Self::Script => NodeData::Script(ScriptConfig::default()),
             Self::Data => NodeData::Data(DataConfig::default()),
+            Self::Directory => NodeData::Directory(DirectoryConfig::default()),
         }
     }
 }
@@ -69,6 +84,7 @@ pub enum NodeData {
     Database(DatabaseConfig),
     Script(ScriptConfig),
     Data(DataConfig),
+    Directory(DirectoryConfig),
 }
 
 impl NodeData {
@@ -78,6 +94,24 @@ impl NodeData {
             Self::Database(_) => NodeType::Database,
             Self::Script(_) => NodeType::Script,
             Self::Data(_) => NodeType::Data,
+            Self::Directory(_) => NodeType::Directory,
+        }
+    }
+
+    /// Fill color for the canvas and sidebar: the type's, except that a database allowed
+    /// to write is red so it stands out.
+    pub fn color(&self) -> &'static str {
+        match self {
+            Self::Database(d) if !d.read_only => WRITE_COLOR,
+            other => other.node_type().color(),
+        }
+    }
+
+    /// The type's label, or `Database (write)` for a database allowed to write.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Database(d) if !d.read_only => WRITABLE_DATABASE_LABEL,
+            other => other.node_type().label(),
         }
     }
 
@@ -88,6 +122,7 @@ impl NodeData {
             Self::Database(d) => d.summary(),
             Self::Script(s) => s.summary(),
             Self::Data(d) => d.summary(),
+            Self::Directory(d) => d.summary(),
         }
     }
 
@@ -98,6 +133,7 @@ impl NodeData {
             Self::Database(d) => d.validate(),
             Self::Script(s) => s.validate(),
             Self::Data(d) => d.validate(),
+            Self::Directory(d) => d.validate(),
         }
     }
 }
@@ -526,6 +562,14 @@ impl Default for DatabaseConfig {
 }
 
 impl DatabaseConfig {
+    /// A fresh config whose read-only flag is off: the red node that may write.
+    pub fn writable() -> Self {
+        Self {
+            read_only: false,
+            ..Self::default()
+        }
+    }
+
     pub fn summary(&self) -> String {
         let target = if self.engine.is_file_based() {
             file_name(&self.path).unwrap_or("no file")
@@ -534,7 +578,8 @@ impl DatabaseConfig {
         } else {
             self.url_env.trim()
         };
-        format!("{} · {target}", self.engine.label())
+        let mode = if self.read_only { "" } else { " · write" };
+        format!("{} · {target}{mode}", self.engine.label())
     }
 
     pub fn validate(&self) -> Vec<Issue> {
@@ -584,7 +629,10 @@ impl DatabaseConfig {
                 issues.push(Issue::new("input table", e));
             }
         }
-        if let Err(e) = validate::sql(&self.query, self.read_only) {
+        // An empty query is allowed: the executor then runs the SQL arriving on the wire.
+        if !self.query.trim().is_empty()
+            && let Err(e) = validate::sql(&self.query, self.read_only)
+        {
             issues.push(Issue::new("query", e));
         }
         issues
@@ -819,6 +867,90 @@ impl DataConfig {
     }
 }
 
+// ----- directory -----
+
+pub const MAX_DIRECTORY_FILES: u32 = 10_000;
+/// Largest content budget a directory node may have: the executor's file cap.
+pub const MAX_DIRECTORY_BYTES: u32 = 64 * 1024 * 1024;
+
+/// A directory under the working directory, read as one text: a listing of the files
+/// that pass the filters, then their contents up to a budget. `.` is the working
+/// directory itself, so a graph can read the repository it lives in.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DirectoryConfig {
+    /// Relative to the working directory; `.` or empty is the working directory.
+    pub path: String,
+    /// Glob patterns of files to take, relative to the directory (`src/**/*.rs`,
+    /// `*.md`). Empty takes every file.
+    pub include: Vec<String>,
+    /// Glob patterns of files to skip, on top of hidden entries and symlinks, which are
+    /// always skipped.
+    pub exclude: Vec<String>,
+    /// Whether `.gitignore` files apply, so a repository's build output stays out.
+    pub gitignore: bool,
+    /// Whether file contents follow the listing.
+    pub contents: bool,
+    pub max_files: u32,
+    /// Budget for the contents, in bytes.
+    pub max_bytes: u32,
+}
+
+impl Default for DirectoryConfig {
+    fn default() -> Self {
+        Self {
+            path: ".".to_string(),
+            include: Vec::new(),
+            exclude: Vec::new(),
+            gitignore: true,
+            contents: true,
+            max_files: 200,
+            max_bytes: 256 * 1024,
+        }
+    }
+}
+
+impl DirectoryConfig {
+    /// The directory as shown: `.` for the working directory.
+    pub fn display_path(&self) -> &str {
+        match self.path.trim() {
+            "" => ".",
+            path => path,
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        let what = if self.contents { "contents" } else { "listing" };
+        let filter = self
+            .include
+            .first()
+            .map(|p| format!(" · {p}"))
+            .unwrap_or_default();
+        format!("{}{filter} · {what}", self.display_path())
+    }
+
+    pub fn validate(&self) -> Vec<Issue> {
+        let mut issues = Vec::new();
+        if let Err(e) = validate::directory_path(&self.path) {
+            issues.push(Issue::new("path", e));
+        }
+        for (field, patterns) in [("include", &self.include), ("exclude", &self.exclude)] {
+            for pattern in patterns {
+                if let Err(e) = validate::glob(pattern) {
+                    issues.push(Issue::new(field, e));
+                }
+            }
+        }
+        if let Err(e) = validate::in_range("max files", self.max_files, 1, MAX_DIRECTORY_FILES) {
+            issues.push(Issue::new("max files", e));
+        }
+        if let Err(e) = validate::in_range("max bytes", self.max_bytes, 1, MAX_DIRECTORY_BYTES) {
+            issues.push(Issue::new("max bytes", e));
+        }
+        issues
+    }
+}
+
 /// The last component of a relative path, for summaries.
 fn file_name(path: &str) -> Option<&str> {
     let name = path.trim().rsplit('/').next()?.trim();
@@ -1011,5 +1143,72 @@ mod tests {
             assert!(crate::doc::hex_to_rgb(t.color()).is_some());
             assert_eq!(t.default_data().node_type(), t);
         }
+    }
+
+    #[test]
+    fn writable_databases_are_red_and_labeled() {
+        let read = NodeData::Database(DatabaseConfig::default());
+        assert_eq!(read.color(), NodeType::Database.color());
+        assert_eq!(read.label(), "Database");
+        let write = NodeData::Database(DatabaseConfig::writable());
+        assert_eq!(write.color(), WRITE_COLOR);
+        assert_eq!(write.label(), WRITABLE_DATABASE_LABEL);
+        assert!(write.summary().ends_with(" · write"), "{}", write.summary());
+        assert!(!read.summary().contains("write"));
+        assert_eq!(NodeData::Agent(AgentConfig::default()).label(), "Agent");
+    }
+
+    #[test]
+    fn empty_queries_are_allowed_so_the_wire_can_supply_one() {
+        let db = DatabaseConfig {
+            path: "x.db".into(),
+            ..DatabaseConfig::default()
+        };
+        assert!(db.validate().is_empty(), "{:?}", db.validate());
+        let bad = DatabaseConfig {
+            query: "   ".into(),
+            ..db.clone()
+        };
+        assert!(bad.validate().is_empty());
+        let bad = DatabaseConfig {
+            query: "DELETE FROM t".into(),
+            ..db
+        };
+        assert_eq!(bad.validate()[0].field, "query");
+    }
+
+    #[test]
+    fn directory_paths_patterns_and_limits_are_checked() {
+        let dir = DirectoryConfig::default();
+        assert!(dir.validate().is_empty(), "{:?}", dir.validate());
+        assert_eq!(dir.summary(), ". · contents");
+        let filtered = DirectoryConfig {
+            path: "src".into(),
+            include: vec!["**/*.rs".into()],
+            contents: false,
+            ..DirectoryConfig::default()
+        };
+        assert!(filtered.validate().is_empty());
+        assert_eq!(filtered.summary(), "src · **/*.rs · listing");
+
+        let bad = DirectoryConfig {
+            path: "../other".into(),
+            include: vec!["src/[".into()],
+            exclude: vec!["".into()],
+            max_files: 0,
+            max_bytes: MAX_DIRECTORY_BYTES + 1,
+            ..DirectoryConfig::default()
+        };
+        let fields: Vec<&str> = bad.validate().iter().map(|i| i.field).collect();
+        assert_eq!(
+            fields,
+            ["path", "include", "exclude", "max files", "max bytes"]
+        );
+        let json = serde_json::to_string(&NodeData::Directory(filtered.clone())).unwrap();
+        assert!(json.starts_with(r#"{"type":"directory""#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<NodeData>(&json).unwrap(),
+            NodeData::Directory(filtered)
+        );
     }
 }
