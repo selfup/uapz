@@ -637,9 +637,11 @@ impl DatabaseConfig {
                 }
                 Ok(_) => {}
             }
-            if let Err(e) = validate::identifier(&self.input_table) {
-                issues.push(Issue::new("input table", e));
-            }
+        }
+        // Checked whatever the input is: the field's value doesn't become wrong or right
+        // because a file was chosen, and the inspector should say so before a run.
+        if let Err(e) = validate::identifier(&self.input_table) {
+            issues.push(Issue::new("input table", e));
         }
         // An empty query is allowed: the executor then runs the SQL arriving on the wire.
         if !self.query.trim().is_empty()
@@ -1152,6 +1154,23 @@ mod tests {
             ..DatabaseConfig::default()
         };
         assert_eq!(db.validate()[0].field, "connection");
+
+        // The table name is checked on its own: it is wrong whether or not a file was
+        // chosen, and the inspector should say so before the node runs.
+        for input in ["", "sales.csv"] {
+            let db = DatabaseConfig {
+                path: "sales.sqlite".into(),
+                input: input.into(),
+                input_table: "input; DROP TABLE t".into(),
+                query: "SELECT 1".into(),
+                ..DatabaseConfig::default()
+            };
+            let issues = db.validate();
+            assert!(
+                issues.iter().any(|i| i.field == "input table"),
+                "input {input:?}: {issues:?}"
+            );
+        }
     }
 
     #[test]

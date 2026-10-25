@@ -767,7 +767,11 @@ impl Runner<'_> {
             if plan.iter().any(|(p, ..)| *p == shown) {
                 return Err(format!("{shown} appears twice in the answer"));
             }
-            let rel_path = validate::writable_path(&shown)?;
+            // The whole path from the working directory is judged, not only the section:
+            // `=== scripts/x.sh ===` under `out/` is `out/scripts/x.sh` and harmless, while
+            // a bundle rooted at `.` may not plant an app directory.
+            validate::writable_path(&shown)?;
+            let rel_path = validate::path_inside(".", &shown)?;
             let real = validate::resolve_new_inside(&self.dirs.root, &rel_path)?;
             let exists = real.exists();
             if exists && config.mode == WriteMode::Create {
@@ -1607,7 +1611,7 @@ fn run_process(
     let _ = writer.join();
     let stdout = stdout.join().unwrap_or_default();
     let stderr = stderr.join().unwrap_or_default();
-    if stdout.len() > MAX_OUTPUT_BYTES {
+    if stdout.overflowed || stderr.overflowed {
         return Err(format!(
             "`{program}` produced more than {} of output",
             size(MAX_OUTPUT_BYTES)
@@ -1615,8 +1619,8 @@ fn run_process(
     }
     Ok(Finished {
         status,
-        stdout,
-        stderr,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
         timed_out,
     })
 }
@@ -1637,21 +1641,39 @@ fn kill_group(pid: u32) {
     let _ = pid;
 }
 
-/// Read a stream to the end, keeping at most one byte over the cap so the caller can tell.
-fn read_capped(mut reader: impl Read) -> Vec<u8> {
+/// What a child wrote on one stream, and whether it went past the cap.
+#[derive(Default)]
+struct Capped {
+    bytes: Vec<u8>,
+    /// More than [`MAX_OUTPUT_BYTES`] arrived; only a prefix was kept.
+    overflowed: bool,
+}
+
+/// Read a stream until it ends, keeping at most [`MAX_OUTPUT_BYTES`] and noticing when
+/// more arrives. Reading stops once the cap is crossed: a child that runs away is not
+/// worth the I/O, and the caller closes the pipe, which ends its next write with SIGPIPE.
+fn read_capped(mut reader: impl Read) -> Capped {
     let mut out = Vec::new();
     let mut buf = [0u8; 64 * 1024];
+    let mut overflowed = false;
     loop {
         match reader.read(&mut buf) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                if out.len() <= MAX_OUTPUT_BYTES {
-                    out.extend_from_slice(&buf[..n]);
+                let room = MAX_OUTPUT_BYTES.saturating_sub(out.len());
+                if n > room {
+                    out.extend_from_slice(&buf[..room]);
+                    overflowed = true;
+                    break;
                 }
+                out.extend_from_slice(&buf[..n]);
             }
         }
     }
-    out
+    Capped {
+        bytes: out,
+        overflowed,
+    }
 }
 
 fn describe_status(status: ExitStatus) -> String {
@@ -2287,6 +2309,133 @@ mod tests {
                 vec!["run".into(), "--quiet".into(), "/x/s.py".into()]
             )
         );
+    }
+
+    #[test]
+    fn child_processes_see_only_the_inherited_variables() {
+        // A secret in this process's environment, named exactly like one agents and
+        // databases read. The child must not see it: `env_clear()` plus INHERITED_ENV is
+        // the whole of the isolation, so it is asserted from both sides.
+        const SECRET: &str = "UAPZ_TEST_SECRET_TOKEN";
+        // SAFETY: this test owns the variable for its duration and reads it back itself.
+        unsafe { std::env::set_var(SECRET, "s3cr3t") };
+        let root = scratch("env");
+        // The names come in as arguments, so no `${...}` has to survive Rust's formatting.
+        fs::write(
+            root.join("scripts/env.sh"),
+            concat!(
+                "for name in \"$@\"; do\n",
+                "  value=$(printenv \"$name\" || true)\n",
+                "  if [ -n \"$value\" ]; then echo \"$name=$value\"; else echo \"$name=unset\"; fi\n",
+                "done\n",
+                "if [ -n \"$PATH\" ]; then echo PATH=set; else echo PATH=unset; fi\n",
+            ),
+        )
+        .unwrap();
+        let http = FakeHttp::new(200, "{}");
+        let names = [SECRET, "DATABASE_URL", "ANTHROPIC_API_KEY"];
+        let doc = graph(vec![node("n0", shell("env.sh", &names, 10))], &[]);
+        let out = run(&doc, "n0", Dirs::under(&root), &http, &no_env)
+            .result
+            .expect("env");
+        let text = out.as_text().unwrap();
+        for absent in names {
+            assert!(
+                text.contains(&format!("{absent}=unset")),
+                "{absent} leaked to the child: {text}"
+            );
+            assert!(!text.contains("s3cr3t"), "{text}");
+        }
+        // What a script does need is there.
+        assert!(text.contains("PATH=set"), "{text}");
+        // SAFETY: the same test removes the variable it set.
+        unsafe { std::env::remove_var(SECRET) };
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn database_children_get_their_secret_and_nothing_else() {
+        // The one variable a database node is given is the connection URL; a key that
+        // belongs to an agent must not ride along.
+        const URI: &str = "UAPZ_TEST_PG_URL";
+        const KEY: &str = "UAPZ_TEST_AGENT_KEY";
+        let env = |name: &str| match name {
+            URI => Some("postgres://localhost/db".to_string()),
+            KEY => Some("sk-should-not-travel".to_string()),
+            _ => None,
+        };
+        let config = DatabaseConfig {
+            engine: DbEngine::Postgres,
+            url_env: URI.into(),
+            query: "SELECT 1".into(),
+            ..DatabaseConfig::default()
+        };
+        let plan = postgres_plan(&config, &env_secret(&env, &config.url_env).unwrap()).unwrap();
+        assert!(plan.env.contains(&("PGDATABASE".into(), "db".into())));
+        // Everything in `env` reaches the child through `run_process`; nothing outside it
+        // does, because the command starts from an empty environment.
+        assert!(!plan.env.iter().any(|(k, _)| k == KEY));
+        assert!(!plan.env.iter().any(|(_, v)| v.contains("sk-")));
+    }
+
+    #[test]
+    fn read_stops_at_the_cap_and_says_so() {
+        // A reader with more than the cap to give: only the cap is kept and nothing past
+        // the chunk that crossed it is read.
+        struct Endless {
+            /// How much the reader handed over in total.
+            handed: usize,
+            /// What it has left to hand over.
+            left: usize,
+        }
+        impl Read for Endless {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.left.min(buf.len());
+                buf[..n].fill(b'x');
+                self.left -= n;
+                self.handed += n;
+                Ok(n)
+            }
+        }
+        // Twice the cap, so a run that drains the reader is unmistakable.
+        let mut endless = Endless {
+            handed: 0,
+            left: MAX_OUTPUT_BYTES * 2,
+        };
+        let read = read_capped(&mut endless);
+        assert!(read.overflowed, "the overflow is reported");
+        assert_eq!(
+            read.bytes.len(),
+            MAX_OUTPUT_BYTES,
+            "exactly the cap is kept"
+        );
+        assert!(
+            endless.handed <= MAX_OUTPUT_BYTES + 64 * 1024,
+            "reading stopped at the cap, handed {}",
+            endless.handed
+        );
+        assert!(
+            endless.left > 0,
+            "the stream was not drained: {} bytes left",
+            endless.left
+        );
+
+        // A short stream is passed through untouched, without claiming an overflow.
+        let short = read_capped(std::io::Cursor::new(b"hello"));
+        assert!(!short.overflowed);
+        assert_eq!(short.bytes, b"hello");
+    }
+
+    #[test]
+    fn script_runtime_selection() {
+        let path = Path::new("/x/s.py");
+        assert_eq!(
+            script_command(Runtime::Python, path),
+            (
+                "uv".to_string(),
+                vec!["run".into(), "--quiet".into(), "/x/s.py".into()]
+            )
+        );
         assert_eq!(
             script_command(Runtime::Shell, Path::new("/x/a.zsh")).0,
             "zsh"
@@ -2469,6 +2618,89 @@ mod tests {
         assert_eq!(parts.host, "h");
         assert_eq!(parts.user, None);
         assert_eq!(parts.database.as_deref(), Some("db"));
+    }
+
+    #[test]
+    fn sql_client_commands_are_refused_before_the_process_starts() {
+        require("sqlite3");
+        let root = scratch("metacommands");
+        let http = FakeHttp::new(200, "{}");
+        // What every attack tries to create. Each client runs the query from stdin, so a
+        // query carrying a meta-command becomes a shell command run as this user; an
+        // absolute path keeps the proof out of the working directory.
+        let planted = root.join("planted");
+        let planted = plain_path(&planted).unwrap();
+        let plant = format!("touch {planted}");
+        assert!(
+            Command::new("sqlite3")
+                .arg(root.join("data/t.sqlite"))
+                .arg("CREATE TABLE t(a INTEGER);")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let db = |id: &str, query: &str, read_only: bool| {
+            node(
+                id,
+                Some(NodeData::Database(DatabaseConfig {
+                    path: "t.sqlite".into(),
+                    query: query.into(),
+                    read_only,
+                    ..DatabaseConfig::default()
+                })),
+            )
+        };
+        let doc = graph(
+            vec![
+                db("n0", &format!("SELECT 1\n.shell {plant}\n"), true),
+                db("n1", &format!("SELECT 1;\n.shell {plant}\n;\n"), true),
+                db("n2", &format!("SELECT 1 \\! {plant}"), true),
+                db("n3", &format!("SELECT 1\n\\! {plant}\n"), true),
+                db("n4", &format!("SELECT 1;\nsystem {plant}\n"), false),
+                db("n5", "SELECT 1", true),
+                node("n6", data("wired.txt", DataFormat::Text)),
+                db("n7", "", true),
+                db("n8", "SELECT 1 \\q", true),
+            ],
+            &[("n6", "n7")],
+        );
+        // SQL arriving on the wire is validated by `run_database`, not by any config.
+        fs::write(
+            root.join("data/wired.txt"),
+            format!("SELECT 1\n.shell {plant}\n"),
+        )
+        .unwrap();
+        let go = |id: &str| run(&doc, id, Dirs::under(&root), &http, &no_env);
+
+        for id in ["n0", "n1", "n2", "n3", "n4", "n8"] {
+            let report = go(id);
+            let err = report.result.unwrap_err();
+            assert!(
+                err.contains("not valid: query") || err.contains("not allowed"),
+                "{id}: {err}"
+            );
+            // The proof that nothing reached a shell: no client was started at all.
+            assert!(
+                !report.log.iter().any(|l| l.starts_with("$ sqlite3")),
+                "{id}: a client ran: {:?}",
+                report.log
+            );
+        }
+        // The wire's SQL is refused by the executor's own check, not by a config check.
+        let report = go("n7");
+        let err = report.result.unwrap_err();
+        assert!(err.contains('.'), "{err}");
+        assert!(!report.log.iter().any(|l| l.starts_with("$ sqlite3")));
+        // The plain query still runs, so the check did not simply break the node.
+        let out = go("n5").result.expect("plain select still runs");
+        assert!(out.text);
+        assert_eq!(out.as_text().unwrap().trim(), r#"[{"1":1}]"#);
+        // `query_statement` appends `;`, which a shell command would take as part of its
+        // argument; both spellings are checked so the marker can't hide behind it.
+        for marker in ["planted", "planted;"] {
+            assert!(!root.join(marker).exists(), "a shell command ran: {marker}");
+        }
+        fs::remove_dir_all(&root).unwrap();
     }
 
     // ----- live tests -----
@@ -3746,6 +3978,159 @@ mod tests {
         assert!(err.contains("not valid: path"), "{err}");
         let err = go("n11").result.unwrap_err();
         assert!(err.contains("nothing to write"), "{err}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn file_nodes_never_write_through_a_symlink_out_of_the_root() {
+        let root = scratch("filelinks");
+        fs::write(root.join("data/in.md"), "payload").unwrap();
+        fs::create_dir_all(root.join("inside")).unwrap();
+        // A directory outside the root, and symlinks into it: one directory deep, one to a
+        // file that does not exist yet (so the "deepest existing ancestor" walk is what
+        // has to catch it), and one that stays inside and must be allowed.
+        let elsewhere = std::env::temp_dir().join(format!(
+            "uapz-exec-outside-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&elsewhere).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&elsewhere, root.join("escape")).unwrap();
+            std::os::unix::fs::symlink(elsewhere.join("new.txt"), root.join("escape-file.txt"))
+                .unwrap();
+            std::os::unix::fs::symlink(root.join("inside"), root.join("link-inside")).unwrap();
+        }
+        let http = FakeHttp::new(200, "{}");
+        let file = |path: &str| {
+            Some(NodeData::File(FileConfig {
+                path: path.into(),
+                mode: WriteMode::Overwrite,
+                unfence: false,
+                bundle: false,
+            }))
+        };
+        let doc = graph(
+            vec![
+                node("n0", data("in.md", DataFormat::Markdown)),
+                // Through a symlinked directory.
+                node("n1", file("escape/planted.txt")),
+                // Through a symlink to a file that is not there yet.
+                node("n2", file("escape-file.txt")),
+                // A symlink that resolves inside the root is a legitimate path.
+                node("n3", file("link-inside/ok.txt")),
+            ],
+            &[("n0", "n1"), ("n0", "n2"), ("n0", "n3")],
+        );
+        let go = |id: &str| run(&doc, id, Dirs::under(&root), &http, &no_env);
+
+        // A link into another directory is an escape.
+        let err = go("n1").result.unwrap_err();
+        assert!(err.contains("outside"), "{err}");
+        // A link whose target is missing is refused too, and says so rather than leaking
+        // a bare OS error; writing the target directly is what a user should do.
+        let err = go("n2").result.unwrap_err();
+        assert!(
+            err.contains("symlink whose target does not exist"),
+            "a dangling symlink is named as such: {err}"
+        );
+        assert!(
+            !elsewhere.join("planted.txt").exists()
+                && !elsewhere.join("new.txt").exists()
+                && fs::read_dir(&elsewhere).unwrap().next().is_none(),
+            "nothing was written outside the root"
+        );
+
+        go("n3").result.expect("a symlink inside the root is fine");
+        assert_eq!(
+            fs::read_to_string(root.join("inside/ok.txt")).unwrap(),
+            "payload"
+        );
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&elsewhere).unwrap();
+    }
+
+    #[test]
+    fn bundle_sections_cannot_escape_the_directory_or_plant_app_files() {
+        let root = scratch("bundlepaths");
+        fs::write(
+            root.join("data/answer.md"),
+            concat!(
+                "=== ../../etc/evil ===\nno\n",
+                "=== /etc/evil ===\nno\n",
+                "=== .hidden ===\nno\n",
+                "=== ok.txt ===\nyes\n",
+            ),
+        )
+        .unwrap();
+        let http = FakeHttp::new(200, "{}");
+        let bundle = |path: &str| {
+            Some(NodeData::File(FileConfig {
+                path: path.into(),
+                mode: WriteMode::Overwrite,
+                unfence: true,
+                bundle: true,
+            }))
+        };
+        let doc = graph(
+            vec![
+                node("n0", data("answer.md", DataFormat::Markdown)),
+                node("n1", bundle("out")),
+            ],
+            &[("n0", "n1")],
+        );
+        let err = run(&doc, "n1", Dirs::under(&root), &http, &no_env)
+            .result
+            .unwrap_err();
+        assert!(err.contains(".."), "{err}");
+        // Every section is checked before the first file is written.
+        assert!(
+            !root.join("out").exists(),
+            "a refused bundle left files behind"
+        );
+
+        // Each refusal on its own, so one bad section can't mask another's message.
+        for (body, needle) in [
+            ("=== /etc/evil ===\nno\n", "absolute"),
+            ("=== .hidden ===\nno\n", "hidden"),
+            ("=== a/../../b ===\nno\n", ".."),
+        ] {
+            fs::write(root.join("data/one.md"), body).unwrap();
+            let doc = graph(
+                vec![
+                    node("n0", data("one.md", DataFormat::Markdown)),
+                    node("n1", bundle("out")),
+                ],
+                &[("n0", "n1")],
+            );
+            let err = run(&doc, "n1", Dirs::under(&root), &http, &no_env)
+                .result
+                .unwrap_err();
+            assert!(err.contains(needle), "{body:?}: {err}");
+        }
+
+        // The path from the working directory is what decides whether an app directory is
+        // involved, so a section under a bundle root may name one: `out/scripts/` is not
+        // the app's `scripts/` and is written.
+        fs::write(root.join("data/nested.md"), "=== scripts/x.sh ===\nno\n").unwrap();
+        let doc_nested = graph(
+            vec![
+                node("n0", data("nested.md", DataFormat::Markdown)),
+                node("n1", bundle("out")),
+            ],
+            &[("n0", "n1")],
+        );
+        run(&doc_nested, "n1", Dirs::under(&root), &http, &no_env)
+            .result
+            .expect("out/scripts is not the app's scripts/");
+        assert_eq!(
+            fs::read_to_string(root.join("out/scripts/x.sh")).unwrap(),
+            "no\n"
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 

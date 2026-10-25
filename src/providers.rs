@@ -200,13 +200,26 @@ pub fn generate_streaming(
     ask_for_stream(&mut request, api);
     let mut stream = Stream::new(config, on_text);
     let mut body: Vec<u8> = Vec::new();
+    let mut body_overflowed = false;
     let status = http.post_json_streaming(&request, &mut |status, chunk| {
-        if body.len() < MAX_REPLY_BYTES as usize {
+        // The body is kept only for a non-streamed reply to be read back, so it stops
+        // growing at the cap; the stream itself keeps parsing the pieces it receives.
+        let room = (MAX_REPLY_BYTES as usize).saturating_sub(body.len());
+        if chunk.len() > room {
+            body.extend_from_slice(&chunk[..room]);
+            body_overflowed = true;
+        } else {
             body.extend_from_slice(chunk);
         }
         // Error bodies are plain JSON, kept whole for the message below.
         status >= 400 || stream.feed(chunk)
     })?;
+    if body_overflowed {
+        return Err(format!(
+            "the reply from {} is larger than {} bytes",
+            request.url, MAX_REPLY_BYTES
+        ));
+    }
     if stream.stopped {
         return Err(STOPPED.into());
     }

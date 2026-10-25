@@ -916,7 +916,9 @@ fn restore_plan(doc: &GraphDoc, kinds: &HashMap<String, Hsla>) -> Restored {
         .iter()
         .map(|n| parse_key(&n.id).filter(|id| taken.insert(*id)))
         .collect();
-    let mut next = taken.iter().max().map_or(0, |max| max + 1);
+    // A file can name `n<usize::MAX>`; adding one to that would panic in debug and wrap
+    // in release, so the counter saturates and new ids reuse the top of the range.
+    let mut next = taken.iter().max().map_or(0, |max| max.saturating_add(1));
 
     let mut ids: HashMap<&str, NodeId> = HashMap::new();
     let nodes: Vec<Node> = doc
@@ -925,7 +927,7 @@ fn restore_plan(doc: &GraphDoc, kinds: &HashMap<String, Hsla>) -> Restored {
         .zip(parsed)
         .map(|(n, parsed)| {
             let id = parsed.unwrap_or_else(|| {
-                next += 1;
+                next = next.saturating_add(1);
                 next - 1
             });
             ids.insert(n.id.as_str(), id);
@@ -1045,7 +1047,14 @@ fn node_key(id: NodeId) -> String {
 }
 
 fn parse_key(key: &str) -> Option<NodeId> {
-    key.strip_prefix('n')?.parse().ok()
+    // Only what `node_key` writes and the mermaid parser reads back whole: `n` and
+    // decimal digits. The parser takes an id as a leading run of alphanumerics and `_`,
+    // so `n-1` would come back as `n` and `1` and silently become two nodes.
+    let digits = key.strip_prefix('n')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 fn style_from_doc(n: &NodeDoc, kinds: &HashMap<String, Hsla>) -> Option<NodeStyle> {
@@ -1134,6 +1143,20 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn parse_key_rejects_ids_the_mermaid_writer_cannot_write() {
+        // These are exactly the ids `doc.rs` would write and then read back split in two.
+        for bad in ["n-1", "n 2", "n,3", "n", "x", "plain", ""] {
+            assert_eq!(parse_key(bad), None, "{bad:?} must not claim an id");
+        }
+        assert_eq!(parse_key("n0"), Some(0));
+        assert_eq!(parse_key("n7"), Some(7));
+        // Every id this module writes survives its own parser.
+        for id in [0usize, 1, 42, usize::MAX] {
+            assert_eq!(parse_key(&node_key(id)), Some(id), "{}", node_key(id));
+        }
+    }
+
     fn graph_doc(nodes: Vec<NodeDoc>, edges: Vec<EdgeDoc>) -> GraphDoc {
         GraphDoc {
             version: doc::VERSION,
@@ -1217,6 +1240,50 @@ mod tests {
             restore_plan(&graph_doc(vec![], vec![]), &HashMap::new()).next_id,
             0
         );
+    }
+
+    #[test]
+    fn restore_survives_ids_the_mermaid_writer_cannot_write() {
+        // The JSON sidecar accepts any string as an id, but `doc.rs` writes ids into a
+        // mermaid diagram that is read back without the sidecar. Only `n<digits>`
+        // survives that trip, so anything else gets a fresh id here instead of coming
+        // back as a different node.
+        let doc = graph_doc(
+            vec![
+                doc_node("n-1", None, None),
+                doc_node("n 2", None, None),
+                doc_node("n", None, None),
+                doc_node("plain", None, None),
+                doc_node("n7", None, None),
+            ],
+            vec![],
+        );
+        let restored = restore_plan(&doc, &HashMap::new());
+        let ids: Vec<NodeId> = restored.nodes.iter().map(|n| n.id).collect();
+        // The one id that round-trips keeps its key; the rest are numbered above it.
+        assert_eq!(ids, [8, 9, 10, 11, 7]);
+        assert_eq!(restored.next_id, 12);
+    }
+
+    #[test]
+    fn restore_does_not_panic_on_the_largest_id() {
+        // A hand-edited sidecar can name the top of the range. Adding one to it must not
+        // panic in debug or wrap in release.
+        let top = usize::MAX;
+        let doc = graph_doc(
+            vec![
+                doc_node(&format!("n{top}"), None, None),
+                doc_node("x", None, None),
+            ],
+            vec![],
+        );
+        let restored = restore_plan(&doc, &HashMap::new());
+        assert_eq!(restored.nodes.len(), 2);
+        // The named node keeps its key; nothing overlapped it, so both nodes are distinct
+        // and the counter stayed at the top of the range instead of wrapping to zero.
+        assert_eq!(restored.nodes[0].id, usize::MAX);
+        assert_ne!(restored.nodes[1].id, restored.nodes[0].id);
+        assert_eq!(restored.next_id, usize::MAX);
     }
 
     #[test]
