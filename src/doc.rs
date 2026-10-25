@@ -36,10 +36,26 @@ pub struct GraphDoc {
     pub edges: Vec<EdgeDoc>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct View {
     pub pan_x: f32,
     pub pan_y: f32,
+    #[serde(default = "default_zoom")]
+    pub zoom: f32,
+}
+
+fn default_zoom() -> f32 {
+    1.0
+}
+
+impl Default for View {
+    fn default() -> Self {
+        Self {
+            pan_x: 0.0,
+            pan_y: 0.0,
+            zoom: default_zoom(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -541,6 +557,7 @@ mod tests {
             view: View {
                 pan_x: 10.0,
                 pan_y: -5.0,
+                zoom: 1.0,
             },
             nodes: vec![
                 NodeDoc {
@@ -689,6 +706,7 @@ mod tests {
             view: View {
                 pan_x: 123.0,
                 pan_y: 456.0,
+                zoom: 1.0,
             },
             nodes: vec![
                 NodeDoc {

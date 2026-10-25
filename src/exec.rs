@@ -994,6 +994,20 @@ fn known_binary(graph: &GraphIndex<'_>, plans: &calls::Plans, handle: &str) -> b
     false
 }
 
+/// Reuse execution's static output classification for read-only editor validation.
+pub(crate) fn binary_output_handles(
+    doc: &GraphDoc,
+    plans: &calls::Plans,
+    handles: &[String],
+) -> HashSet<String> {
+    let graph = GraphIndex::new(doc);
+    handles
+        .iter()
+        .filter(|handle| known_binary(&graph, plans, handle))
+        .cloned()
+        .collect()
+}
+
 fn validate_binary_bindings(
     id: &str,
     graph: &GraphIndex<'_>,

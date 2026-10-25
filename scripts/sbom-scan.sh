@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export SYFT_GOLANG_CAPTURE_SYMBOLS=all
+
 cd "$(dirname "$0")/.."
 
 for tool in syft grype; do

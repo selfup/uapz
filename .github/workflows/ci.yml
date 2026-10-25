@@ -13,11 +13,17 @@ concurrency:
 
 jobs:
   check:
-    # gpui builds natively on macOS without extra system libraries; the app targets it.
+    # The desktop shell uses macOS's system WebKit. sqlite3 is available for tests.
     runs-on: macos-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
+
+      - name: Install Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
 
       - name: Install the stable toolchain
         run: |
@@ -38,12 +44,32 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Format
-        run: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Check and build frontend
+        run: |
+          npm run check
+          npm run build
+
+      - name: Frontend unit tests
+        run: npm test
+
+      - name: Install browser for interaction tests
+        run: npx playwright install chromium
+
+      - name: Frontend interaction tests
+        run: npm run test:ui
+
+      - name: Check Rust workspace
+        run: cargo check --workspace --all-targets
 
       - name: Clippy, warnings are errors
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Tests
         # sqlite3 ships with macOS, which the database tests require. Live tests stay
         # ignored: they need a model server and PostgreSQL.
-        run: cargo test
+        run: cargo test --workspace

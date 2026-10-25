@@ -1,7 +1,8 @@
 # uapz
 
-A small native node-graph editor built with [gpui-kit](https://gpui-kit.com). Nodes are
-boxes you drag around and wire together; each one can carry typed content: an **agent**,
+A desktop node-graph editor with a Tauri 2 shell, a React and React Flow canvas, and a
+Rust execution core. Nodes are boxes you drag around and wire together; each one can
+carry typed content: an **agent**,
 a **database**, a **script**, a **data** file, a **directory**, a **file to write**, a
 named **Run input** supplied each time the graph runs, or a **Workflow** calling a saved graph.
 Graphs save as a Markdown file with a Mermaid diagram plus a JSON sidecar, and reusable
@@ -16,35 +17,76 @@ depend on changed.
 
 ## Running
 
+Use Node.js 24, npm, stable Rust and the macOS Xcode command-line tools. Install the
+frontend dependencies, then check the Rust workspace before starting the app:
+
 ```sh
-cargo check   # keep it warning-free
-cargo run
+npm ci
+cargo check --workspace --all-targets
+npm run desktop
 ```
+
+`npm run desktop` starts Vite and the Tauri desktop shell together. To build the
+production application and macOS bundles:
+
+```sh
+cargo check --workspace --all-targets
+npm run desktop:build
+```
+
+Development uses the repository root as its workspace by default. Packaged applications
+use a `workspace` directory under Tauri's application-local data directory. Set
+`UAPZ_WORKSPACE_DIR` or pass `--workspace PATH` to select an existing workspace; the command
+line takes precedence. For example:
+
+```sh
+UAPZ_WORKSPACE_DIR=/absolute/path/to/workspace npm run desktop
+```
+
+The workspace holds graphs, presets, scripts, data, cache and history. Existing workspace
+directories can be opened directly; graph and history formats remain compatible.
 
 Tests cover the file formats, the Mermaid parser, every node config's validation, the SQL
 checker, path confinement, the library's on-disk layout, the executor (scripts, SQLite,
 chains, timeouts, the cache, cancellation, write-file nodes), streamed replies in every
-provider's shape and the request shape for every provider:
+provider's shape and the request shape for every provider. Frontend tests cover graph
+editing and mocked IPC interactions, including child navigation and read-only previews:
 
 ```sh
-cargo test
+cargo fmt --all --check
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+npm run check
+npm run build
+npm test
+npx playwright install chromium
+npm run test:ui
 ```
 
-The optional macOS UI check renders the native workspace with Metal and checks child
-navigation, read-only previews and preservation of the parent's pending Run form:
+Playwright runs the frontend in Chromium with mocked Tauri IPC; it does not execute
+fixture workflows or replace testing the native Tauri bridge. Browser failure artifacts
+are written under `test-results/`.
+
+The opt-in native smoke test starts the real Tauri webview and exercises IPC, graph
+save/load, run inputs, file review, execution, output loading and history. It is available
+in debug builds and requires an explicit disposable workspace because it creates a
+fixture graph and output file. Build the frontend assets first, then run:
 
 ```sh
-cargo test --features ui-tests --test workspace_rendering
+npm run build
+cargo check -p uapz-desktop --features custom-protocol --all-targets
+smoke_workspace="$(mktemp -d /private/tmp/uapz-smoke.XXXXXX)"
+cargo run -p uapz-desktop --features custom-protocol -- --workspace "$smoke_workspace" --smoke-test
 ```
 
-It writes screenshots to `/private/tmp/uapz-ui-<pid>/`; set `UAPZ_UI_SCREENSHOT_DIR`
-to choose another directory. It does not open a visible window or execute the fixture
-workflow.
+The application prints the result and exits automatically. The temporary workspace keeps
+the generated fixtures for inspection.
 
-CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets -D
-warnings` and `cargo test` on a macOS runner for every push and pull request.
-`scripts/run-tests.sh` runs the unit suite. `scripts/run-tests.sh local` also starts LM
-Studio, reloads its models and runs the live suite with this machine's defaults.
+CI (`.github/workflows/ci.yml`) runs these Rust and frontend checks on a macOS runner
+for every push and pull request. After installing dependencies and Chromium,
+`scripts/run-tests.sh` runs the same validation locally. `scripts/run-tests.sh local`
+also starts LM Studio, reloads its models and runs the live suite with this machine's defaults.
 
 Live tests drive the executor against a real OpenAI-compatible server and a PostgreSQL
 server; they are ignored by default. With a chat model and an embedding model loaded in LM
@@ -54,7 +96,7 @@ Studio (or any server named by `UAPZ_LIVE_ENDPOINT`) and a local PostgreSQL:
 UAPZ_LIVE_MODEL=mistralai/ministral-3-3b \
 UAPZ_LIVE_EMBED_MODEL=text-embedding-nomic-embed-text-v1.5 \
 UAPZ_LIVE_PG_URL=postgres://localhost/postgres \
-cargo test live_ -- --ignored --nocapture
+cargo test -p uapz live_ -- --ignored --nocapture
 ```
 
 ## Using it
@@ -66,30 +108,32 @@ the footer, including while inspecting a child workflow.
 
 **Canvas**
 
-- Drag a node to move it. Drag empty space to pan.
-- Drag from a node's right-hand port and release on another node to connect them. The
-  wire is dashed until it snaps to a target. Self-connections and duplicates are ignored.
+- Drag a node to move it. Drag empty space to pan; scroll to zoom. Pan and zoom are
+  saved with the graph.
+- Drag from a node's right-hand port to another node's left-hand port to connect them.
+  Self-connections and duplicates are ignored.
 - Click a node or a wire to select it. Backspace or Delete removes it. Deleting a node
   removes its wires.
-- Double-click empty space, press cmd-n, or click **Add node** to add a node of whatever
-  the toolbar dropdown has selected: **Blank**, one of the eight types, **Database
-  (write)**, or a saved kind.
-- Escape cancels a drag and clears the selection.
-- Neutral node cards show their name, type, summary and run status. Type accents keep
-  nodes recognizable; red accents identify write-file nodes and writable databases.
+- Double-click empty space, press cmd-n or ctrl-n, or click **Add node** to add the type
+  selected in the toolbar: **Blank**, one of the eight types, or **Database (write)**.
+  Library rows add presets and saved kinds directly. A writable database starts with its
+  read-only setting off.
+- Escape clears the selection.
+- Neutral node cards show their name, type, summary and run status. Red accents identify
+  write-file nodes and writable databases.
   Workflow cards have a labeled port for each published output. Drag from the specific
   port to choose the value sent along that wire. Two ports can feed the same target.
-- **Center graph** recenters the layout at its existing scale. New graphs start empty.
+- **Fit graph** fits all nodes in the canvas, adjusting pan and zoom. New graphs start empty.
 - Double-click a Workflow card, or choose **Open child graph** in the inspector, to
   inspect its child on the canvas. Breadcrumbs return to any ancestor while preserving
   the parent's draft, selection, view and active run. Child previews are read-only.
   During execution they use prepared snapshots and show live status; from history they
   use the recorded graph, outputs and nested snapshots. **Return to run** and **Review
   changes** bring you back to the parent when it needs attention.
-- The dots in the nodes' corners follow the latest run. Press Run and every node that
-  takes part gets a hollow dot; each turns the accent color while its own step runs, then
-  green when it ran and produced output, grey when its output came from the cache, red
-  when it failed. A node the run never reached loses its dot. Data, directory, database
+- The dots in the nodes' corners follow the latest run. Nodes taking part are marked
+  pending, then amber while their own step runs, green when they produce output, blue
+  when their output comes from the cache, and red when they fail. A node the run never
+  reached loses its dot. Data, directory, database
   and write-file nodes always run, so they are always green; an agent or script that stays
   green on a rerun had something upstream change, and the log says which nodes were
   reused. Loading or clearing the graph removes the dots.
@@ -106,8 +150,9 @@ the footer, including while inspecting a child workflow.
   agent wired after it write `{{name}}` for its output. Names are letters, digits, `_`
   and `-`, start with a letter, and must be unique to be useful; the panel says when one
   is not.
-- A blank node offers buttons to give it content: the eight types plus **Database (write)**,
-  a database node that starts with its read-only switch off. A typed node can change type
+- A blank node offers buttons to give it one of the eight content types, plus
+  **Database (write)** with its read-only setting off.
+  A typed node can change type
   or go back to blank under **Node options** in Configure.
 - Problems are listed under the form as they happen (`model: model is empty`, `query:
   DELETE is not allowed in a read-only query`). A valid config says so.
@@ -121,28 +166,29 @@ the footer, including while inspecting a child workflow.
   under the form shows each wired node, how to address it (`{{schema}}` or `n2`), where
   it ends up, and what it produced last time. A placeholder that names nothing is
   reported as a problem before you run.
-- **Run** executes the selected node after everything wired into it. While it runs, the
+- **Run node** executes the selected node after everything wired into it. While it runs, the
   log grows line by line and an agent's answer streams into a preview as it is generated;
   **Cancel** stops it. The result and the log appear in Results;
   the status line says where an agent's output was saved and how many nodes came from the
   cache. **Run fresh** ignores the cache. See *Running nodes*.
 - Every node that took part in a run keeps its result. Select a node in the middle of the
-  graph and **Last output** shows what it produced (its saved file, a text preview) or why
-  it failed, with a warning when the node has been edited since. Under it, **Previous**
-  shows the same node's output from the run before, or says it was the same, and notes
-  when the node was configured differently then. Loading another graph forgets these.
+  graph and open **Results** to see its saved file, a text preview or its failure, with a
+  warning when the node has been edited since. **Previous output** compares the latest
+  result with an earlier run, including configuration changes and named outputs; partial
+  previews are identified rather than treated as complete matches. Open an earlier run from **History** to
+  inspect its recorded outputs. Loading another graph clears the current result selection.
 - **History** lists the graph's past runs
-  (newest first, times in UTC) with **Run all** and **Clear**. Click a run to bring back
-  its outputs, dots and log without running anything; the status line says so. **Run all**
-  (also cmd-enter and the toolbar button) runs every end node of the graph in one pass.
+  (newest first, times in UTC). Open a run to bring back
+  its outputs, dots and log without running anything; the status line says so. **Run workflow**
+  (also cmd-enter and the header button) runs every end node of the graph in one pass.
   See *Running nodes*.
-- **Run input** nodes turn a saved graph into a reusable tool. Run and Run all first ask
+- **Run input** nodes turn a saved graph into a reusable tool. Run node and Run workflow first ask
   for the named inputs their targets need. Change the values in the Run form and press
   **Start run**; the graph's saved configuration and defaults stay unchanged.
 - **Workflow** nodes call another saved graph. Use its published outputs or select one
   output node, then map named inputs to defaults, values or wired parent outputs.
-  **Open child graph** opens the visual preview. **Show child execution** in Results
-  expands its progress, previews, logs and failures.
+  **Open child graph** opens the visual preview. From **Results**, open the child to
+  inspect its recorded outputs, logs and failures.
 - A write-file node with **Review changes before writing** enabled pauses with a diff
   for every proposed file. **Apply** approves the entire batch and continues downstream;
   **Reject batch** leaves that batch untouched; **Cancel run** stops the whole run.
@@ -152,12 +198,12 @@ the footer, including while inspecting a child workflow.
 Search by name, category or path. Matching sections expand while searching; their
 headers show matching counts. Every section header also collapses on click.
 
-- **Workflows**: saved graphs. Click one to load it; name, Save (Enter, cmd-s) and New
+- **Workflows**: saved graphs. Click one to load it; name, Save (cmd-s) and New
   (cmd-shift-n) are in the project header.
 - **Nodes**: built-in node types, ready to add to the current workflow.
-- **Kinds**: blank, colored node kinds. Name, color, **Save kind**. Click a row to make it
-  current and load it into the creator; **+** adds one; **×** deletes it. Type names are
-  reserved.
+- **Custom nodes**: blank, colored node kinds. **Custom node kind** opens the name and color
+  fields; **Save kind** adds the kind to the library. Click a row to add a node, or use
+  its delete button to remove the kind. Type names are reserved.
 - **Agents** and **Databases**: saved presets. Click one to add a node made from it;
   **×** deletes the preset (an agent's outputs are kept).
 - **Prompts**: click loads the prompt into the selected agent node; **×** deletes it.
@@ -184,7 +230,7 @@ File paths cannot leave `data/`, including through symlinks.
 
 For example, add a Text input named `question` and a File input named `source`, wire both
 to an agent, and use `{{question}}` and `{{source}}` in its prompt or message. Wire the
-agent to a write-file node and enable review there. **Run all** now asks for the question
+agent to a write-file node and enable review there. **Run workflow** now asks for the question
 and document, generates an answer, and pauses for file review before applying it.
 
 Only inputs reachable from the requested targets appear in the form. All their values
@@ -207,7 +253,7 @@ mkdir -p graphs
 cp examples/reviewed-note.json examples/reviewed-note.md graphs/
 ```
 
-Open **reviewed-note** and press **Run all**. Edit `note`, start the run, then inspect
+Open **reviewed-note** and press **Run workflow**. Edit `note`, start the run, then inspect
 and apply or reject the proposed change to `generated/note.md`.
 
 **Workflow**
@@ -228,7 +274,7 @@ an explicitly empty value still fails a required input. The parent Run form only
 for the parent's reachable Run inputs; child values come from these mappings.
 
 To publish multiple outputs, select each result node in the child graph and enter a
-name under **Configure → Publish this output**, then save the child. A comma-separated
+name under **Configure → Published outputs**, then save the child. A comma-separated
 list publishes the same result under multiple names. Names follow the same identifier
 rules as Run inputs and must be unique across the graph. A graph can publish up to 64
 outputs. In the parent Workflow node choose **Published outputs**; its card now exposes
@@ -288,7 +334,7 @@ cp examples/reviewed-note.json examples/reviewed-note.md graphs/
 cp examples/call-reviewed-note.json examples/call-reviewed-note.md graphs/
 ```
 
-Open **call-reviewed-note**, press **Run all**, edit `message`, and start the run.
+Open **call-reviewed-note**, press **Run workflow**, edit `message`, and start the run.
 The child **reviewed-note** asks for review before writing `generated/note.md`.
 Select the parent's **save-note** node and expand **Show child execution** in Results,
 or double-click its Workflow card to inspect the child canvas.
@@ -406,8 +452,9 @@ show their byte counts and are explicitly identified as having no text diff.
 Applying rechecks every destination against its captured contents and resolved path.
 If a file was edited, deleted, created or redirected through a symlink during review,
 the entire batch is refused before its first write; rerun to see the updated diff.
-Rejection stops this node and its dependents; independent Run all targets can continue.
-Cancellation, closing the inspector, or replacing the graph also stops a pending review.
+Rejection stops this node and its dependents; independent workflow targets can continue.
+Cancellation stops a pending review. The footer provides a way back to the review while
+inspecting a child workflow.
 Earlier completed nodes and their saved agent outputs remain available.
 
 Review captures at most 64 MB of original files and produces at most 1 MB of diff text.
@@ -418,12 +465,12 @@ require an interactive reviewer; an executor call without one fails instead of w
 
 ## Running nodes
 
-Press **Run** in the inspector. The executor checks the target's complete dependency graph
+Press **Run node** in the inspector. The executor checks the target's complete dependency graph
 for cycles, missing nodes and invalid configurations before executing any of its steps.
 It then runs upstream nodes first (each once, in a stable order), joins their text outputs
 with blank lines, and hands that to the node. Combined text input is limited to 64 MB,
 including separators. Traversal uses an explicit stack so long chains do not exhaust the
-thread stack. Run all also checks cyclic components with no terminal node, and continues
+thread stack. Running the workflow also checks cyclic components with no terminal node, and continues
 with independent targets after a failure:
 
 | Node | What runs | Takes from the wire | Produces |
@@ -450,7 +497,7 @@ graphs without names or placeholders keep their cached entries. Templates also i
 the upstream node ids in the key, so rewiring an input cannot reuse an answer with a
 different or missing placeholder binding.
 
-**Run all and the run history.** **Run all** picks every node with content that feeds no
+**Run workflow and the run history.** **Run workflow** picks every node with content that feeds no
 other node with content, plus a representative of each otherwise uncovered cyclic
 component. It runs these targets in id order in one pass: a node two of them share runs
 once, a failed node is not tried again for the next target, and a failed target does not
@@ -608,13 +655,15 @@ Configs are checked while editing and again by the executor before running.
 
 ## Files
 
-All directories are created next to the executable's working directory on first use. They
-are plain text, so they are easy to commit, diff or hand-edit.
+All directories are created under the selected workspace on first use. They are plain
+text, so they are easy to commit, diff or hand-edit. Development defaults to the repository
+root; packaged applications default to their application-local data directory's
+`workspace` folder. Override this with `--workspace PATH` or `UAPZ_WORKSPACE_DIR`.
 
 | Path | Contents |
 | --- | --- |
 | `graphs/<name>.md` | Human-readable graph: a Mermaid flowchart |
-| `graphs/<name>.json` | Full editor state: positions, kinds, colors, typed node content |
+| `graphs/<name>.json` | Full editor state: positions, pan/zoom, kinds, colors, typed node content and publications |
 | `nodes/<name>.json` | A blank kind: `{ "name": "Fetch", "color": "#ff8800" }` |
 | `agents/<name>/agent.json` | A saved agent config |
 | `agents/<name>/outputs/<timestamp>.<ext>` | One file per run, `YYYYMMDDTHHMMSSmmmZ` UTC, `.txt`/`.json`/`.png` by output type |
@@ -651,12 +700,15 @@ One object per node with its position, an optional `kind` (the saved kind or pre
 made from), an optional `name` (the node's own, for the canvas and for `{{name}}`), a
 `color` copied at save time, and `data`: `{}` for a blank node, or a typed object tagged
 with `"type"`. An agent's `message` is written only when it is not empty.
+`view.zoom` is optional and defaults to `1`, so existing graphs without a zoom value
+retain their original scale. Named output publications and qualified edges keep their
+existing representation.
 
 ```json
 {
   "version": 1,
   "name": "pipeline",
-  "view": { "pan_x": 0.0, "pan_y": 0.0 },
+  "view": { "pan_x": 0.0, "pan_y": 0.0, "zoom": 1.0 },
   "nodes": [
     {
       "id": "n0", "x": 160.0, "y": 220.0, "kind": "summarizer", "color": "#8b5cf6",
@@ -686,33 +738,44 @@ ids and `-->` edges (node shapes and `|labels|` are tolerated) and laid out left
 | Keys | Action |
 | --- | --- |
 | cmd-s, ctrl-s | Save graph |
-| cmd-shift-n | New graph |
-| cmd-enter, ctrl-enter | Run all |
-| cmd-n, ctrl-n | Add node of the selected kind or type |
+| cmd-shift-n, ctrl-shift-n | New graph |
+| cmd-enter, ctrl-enter | Run workflow |
+| cmd-n, ctrl-n | Add node of the selected type |
 | Backspace, Delete | Delete selection |
-| Escape | Cancel drag, clear selection |
+| Escape | Clear canvas selection |
 | cmd-q | Quit |
 
 ## Layout
 
 | File | Role |
 | --- | --- |
-| `src/main.rs` | App setup, key bindings, window |
-| `src/sidebar.rs` | Workspace header, searchable library, child breadcrumbs and layout |
-| `src/inspector.rs` | The node content editor on the right, with Run |
+| `frontend/App.tsx` | Workspace header, searchable library, child navigation, run state and layout |
+| `frontend/Canvas.tsx`, `frontend/graph.ts` | React Flow cards, ports, wires, view controls and pure graph edits |
+| `frontend/Inspector.tsx` | Node configuration, validation, results, reviews and history |
+| `frontend/api.ts`, `frontend/types.ts` | Typed Tauri IPC boundary and persisted document shapes |
+| `frontend/*.test.ts`, `tests/` | Frontend unit tests and Playwright interaction tests with mocked IPC |
+| `src-tauri/src/main.rs` | Tauri window, workspace selection and native IPC commands |
+| `src-tauri/src/smoke.js` | Opt-in native webview/IPC/execution smoke test |
+| `src-tauri/tauri.conf.json` | Vite integration, window configuration, content security policy and bundling |
+| `src/lib.rs`, `src/app.rs` | UI-independent Rust core and application service for library, runs and reviews |
 | `src/exec.rs` | The executor: upstream ordering, files, child processes, database tools, agent runs |
 | `src/workflow.rs` | Run input definitions, reachable fields, typed values and validation |
 | `src/calls.rs` | Workflow mappings, saved graph snapshots, recursion checks and call limits |
 | `src/review.rs` | File snapshots, bounded diffs, review decisions and stale-file checks |
 | `src/history.rs` | Run records, input values, output previews and history replay |
 | `src/providers.rs` | Provider request builders and reply parsers; the HTTP client, plain and streamed |
-| `.github/workflows/ci.yml` | Format, clippy and tests on every push |
-| `src/graph.rs` | The editor view: nodes, wires, dragging, selection |
+| `.github/workflows/ci.yml`, `scripts/run-tests.sh` | Rust/frontend checks, builds and interaction tests |
 | `src/node_data.rs` | The typed node content: configs, enums, summaries, validation |
 | `src/validate.rs` | Sanitizers and validators: names, paths, env vars, identifiers, SQL |
 | `src/library.rs` | The per-type directories: agents and outputs, prompts, databases, file listings |
 | `src/doc.rs` | Graph file formats, Mermaid writer and parser, kind library |
 | `src/storage.rs` | Bounded reads, managed directories, atomic replacements and exclusive new files |
 
-Dependencies are `gpui-kit` (GPUI plus the component library), `serde` and `serde_json`,
-`ureq` for HTTP, `url` for connection and endpoint URLs, and `base64` for image replies.
+The desktop shell uses Tauri 2. The frontend uses React, React Flow and Lucide icons,
+with Vite, TypeScript, Vitest and Playwright for development and tests. The Rust core
+uses `serde` and `serde_json`, `ureq` for HTTP, `url` for connection and endpoint URLs,
+and `base64` for image replies.
+
+The next pass will harden the TypeScript code, focusing on runtime validation at the IPC
+boundary, asynchronous state handling and failure-path test coverage. Resumable batch
+execution, per-item results, batch review and export remain deferred.
