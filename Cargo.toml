@@ -12,3 +12,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "3", features = ["json"] }
 url = "2"
+
+[features]
+ui-tests = ["gpui-kit/test-support"]
+
+[[test]]
+name = "workspace_rendering"
+path = "src/ui_tests.rs"
+harness = false
+required-features = ["ui-tests"]

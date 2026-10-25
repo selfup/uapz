@@ -294,6 +294,7 @@ mod tests {
         assert!(fields(&doc, &["n0".into()]).unwrap_err().contains("Name"));
         doc.nodes[0].name = Some("question".into());
         doc.edges.push(EdgeDoc {
+            output: None,
             from: "n1".into(),
             to: "n0".into(),
         });

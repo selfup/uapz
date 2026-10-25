@@ -35,6 +35,9 @@ pub const PREVIEW_CHARS: usize = 4000;
 /// One run of a graph.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Run {
+    /// Captured child graphs by relative path, independently of whether they ran.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub workflows: BTreeMap<String, GraphDoc>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub calls: BTreeMap<String, WorkflowRun>,
     /// Values supplied to Run input nodes, including their effective defaults.
@@ -79,6 +82,8 @@ pub enum State {
 /// What one node did in a run.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NodeRun {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub named_outputs: BTreeMap<String, NodeRun>,
     pub state: State,
     /// The node's content when it ran, so a later reader knows which prompt or query
     /// produced the output.
@@ -107,6 +112,7 @@ pub struct NodeRun {
 impl NodeRun {
     fn empty(state: State, data: Option<NodeData>) -> Self {
         Self {
+            named_outputs: BTreeMap::new(),
             state,
             data,
             label: None,
@@ -127,7 +133,7 @@ impl NodeRun {
     /// when it is not the whole output.
     fn preview_output(&self) -> Option<Output> {
         let label = self.label.clone()?;
-        if self.preview.is_empty() {
+        if self.preview.is_empty() && !self.complete {
             return None;
         }
         Some(Output {
@@ -197,6 +203,33 @@ pub fn record(
         nodes.insert(
             id.clone(),
             NodeRun {
+                named_outputs: report
+                    .named_outputs
+                    .get(id)
+                    .into_iter()
+                    .flatten()
+                    .map(|(name, output)| {
+                        let saved = serde_json::to_vec(&output.saved).unwrap_or_default();
+                        let key = exec::key_of(&[
+                            b"workflow-history-port-v1",
+                            name.as_bytes(),
+                            &[u8::from(output.text)],
+                            output.label.as_bytes(),
+                            &saved,
+                            &output.bytes,
+                        ]);
+                        let kept = cache.is_some_and(|cache| exec::lock(cache).keep(key, output));
+                        let mut port = NodeRun::empty(state, None);
+                        port.label = Some(output.label.clone());
+                        port.saved = output.saved.clone();
+                        port.key = kept.then(|| format!("{key:032x}"));
+                        if let Some(text) = output.as_text() {
+                            port.preview = text.chars().take(PREVIEW_CHARS).collect();
+                            port.complete = text.chars().count() <= PREVIEW_CHARS;
+                        }
+                        (name.clone(), port)
+                    })
+                    .collect(),
                 state,
                 data,
                 label: Some(output.label.clone()),
@@ -219,6 +252,7 @@ pub fn record(
         nodes.insert(id.clone(), failed);
     }
     Run {
+        workflows: report.workflows.clone(),
         calls: report.calls.clone(),
         inputs: report.inputs.clone(),
         id: library::timestamp(),
@@ -304,6 +338,19 @@ impl Run {
             Outcome::Cancelled => Err(exec::CANCELLED.to_string()),
         };
         Report {
+            workflows: self.workflows.clone(),
+            named_outputs: self
+                .nodes
+                .iter()
+                .filter_map(|(id, node)| {
+                    let ports: BTreeMap<_, _> = node
+                        .named_outputs
+                        .iter()
+                        .filter_map(|(name, port)| Some((name.clone(), port.output(cache)?)))
+                        .collect();
+                    (!ports.is_empty()).then(|| (id.clone(), ports))
+                })
+                .collect(),
             calls: self.calls.clone(),
             inputs: self.inputs.clone(),
             log: self.log.clone(),
@@ -335,7 +382,12 @@ pub fn save(root: &Path, run: &Run) -> Result<PathBuf, String> {
     if run.id.is_empty() || validate::file_stem(&run.id) != run.id {
         return Err("run id must be a safe file stem".into());
     }
-    let json = serde_json::to_string_pretty(run).map_err(|e| e.to_string())? + "\n";
+    // The root captures the whole tree. Descendant runs retain convenient relative
+    // maps in memory, but writing those copies at every depth can exceed the record
+    // limit even when the prepared call tree fits its snapshot budget.
+    let mut compact = run.clone();
+    prune_workflow_snapshots(&mut compact, "", &run.workflows);
+    let json = serde_json::to_string_pretty(&compact).map_err(|e| e.to_string())? + "\n";
     storage::check_size(json.len(), storage::MAX_DOCUMENT_BYTES)?;
     let dir = graph_dir(root, &run.graph, true)?;
     let path = storage::write_unique(&dir, &run.id, "json", json.as_bytes())?;
@@ -347,6 +399,32 @@ pub fn save(root: &Path, run: &Run) -> Result<PathBuf, String> {
         }
     }
     Ok(path)
+}
+
+fn prune_workflow_snapshots(run: &mut Run, prefix: &str, captured: &BTreeMap<String, GraphDoc>) {
+    for (id, call) in &mut run.calls {
+        let prefix = format!("{prefix}{id}/");
+        // Preserve older or partial records whose descendants have extra captures.
+        call.run
+            .workflows
+            .retain(|path, graph| captured.get(&format!("{prefix}{path}")) != Some(graph));
+        prune_workflow_snapshots(&mut call.run, &prefix, captured);
+    }
+}
+
+fn restore_workflow_snapshots(run: &mut Run) {
+    for (id, call) in &mut run.calls {
+        let prefix = format!("{id}/");
+        for (path, graph) in &run.workflows {
+            if let Some(relative) = path.strip_prefix(&prefix) {
+                call.run
+                    .workflows
+                    .entry(relative.to_string())
+                    .or_insert_with(|| graph.clone());
+            }
+        }
+        restore_workflow_snapshots(&mut call.run);
+    }
 }
 
 /// The `.json` files in a graph's run directory, in no particular order.
@@ -375,6 +453,10 @@ pub fn list(root: &Path, graph: &str) -> Vec<Run> {
         .filter_map(|path| {
             serde_json::from_slice::<Run>(&storage::read(path, storage::MAX_DOCUMENT_BYTES).ok()?)
                 .ok()
+                .map(|mut run| {
+                    restore_workflow_snapshots(&mut run);
+                    run
+                })
         })
         .take(MAX_RUNS)
         .collect()
@@ -432,11 +514,13 @@ mod tests {
             })),
         };
         GraphDoc {
+            outputs: BTreeMap::new(),
             version: 1,
             name: "My Graph".into(),
             view: View::default(),
             nodes: vec![data("n0", "a.txt"), data("n1", "b.txt")],
             edges: vec![EdgeDoc {
+                output: None,
                 from: "n0".into(),
                 to: "n1".into(),
             }],
@@ -450,6 +534,8 @@ mod tests {
             outputs.insert("n1".to_string(), out.clone());
         }
         Report {
+            workflows: BTreeMap::new(),
+            named_outputs: BTreeMap::new(),
             log: vec!["n0: data".into(), "n1: data".into()],
             calls: BTreeMap::new(),
             inputs: crate::workflow::Values::new(),
@@ -478,6 +564,53 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("inputs");
         let legacy: Run = serde_json::from_value(legacy).unwrap();
         assert!(legacy.inputs.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn partial_older_snapshot_maps_survive_compaction_and_hydration() {
+        let root = scratch("partial-snapshots");
+        let mut child = record(
+            &doc(),
+            &["n0".into()],
+            &report(Ok(output("child")), None),
+            None,
+        );
+        let original = GraphDoc {
+            name: "captured-child".into(),
+            ..GraphDoc::default()
+        };
+        child.workflows.insert("n1".into(), original.clone());
+        let mut parent = record(
+            &doc(),
+            &["n0".into()],
+            &report(Ok(output("parent")), None),
+            None,
+        );
+        parent.calls.insert(
+            "n0".into(),
+            WorkflowRun {
+                graph: doc(),
+                run: child,
+            },
+        );
+        let different = GraphDoc {
+            name: "different-root-capture".into(),
+            ..GraphDoc::default()
+        };
+        parent.workflows.insert("n0/n1".into(), different);
+        save(&root, &parent).unwrap();
+        let loaded = list(&root, &parent.graph).pop().unwrap();
+        assert_eq!(
+            loaded, parent,
+            "explicit child captures survive when an ancestor map differs"
+        );
+        assert_eq!(loaded.calls["n0"].run.workflows["n1"], original);
+        let mut legacy = parent.clone();
+        legacy.workflows.clear();
+        legacy.id.push_str("-legacy");
+        save(&root, &legacy).unwrap();
+        assert!(list(&root, &legacy.graph).iter().any(|run| run == &legacy));
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -7,6 +7,7 @@
 //! out automatically.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -20,6 +21,9 @@ pub const VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct GraphDoc {
+    /// Published output ports: stable names mapped to local node ids or named handles.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub outputs: BTreeMap<String, String>,
     #[serde(default = "version")]
     pub version: u32,
     #[serde(default)]
@@ -65,8 +69,18 @@ pub struct NodeDoc {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EdgeDoc {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
     pub from: String,
     pub to: String,
+}
+
+impl EdgeDoc {
+    pub fn handle(&self) -> String {
+        self.output
+            .as_ref()
+            .map_or_else(|| self.from.clone(), |name| format!("{}.{name}", self.from))
+    }
 }
 
 fn version() -> u32 {
@@ -355,7 +369,11 @@ pub fn parse_markdown(text: &str) -> GraphDoc {
             if push_unique(&mut ids, &to) {
                 kinds.push(None);
             }
-            let edge = EdgeDoc { from, to };
+            let edge = EdgeDoc {
+                from,
+                to,
+                output: None,
+            };
             if !edges.contains(&edge) {
                 edges.push(edge);
             }
@@ -364,6 +382,7 @@ pub fn parse_markdown(text: &str) -> GraphDoc {
 
     let positions = auto_layout(&ids, &edges);
     GraphDoc {
+        outputs: BTreeMap::new(),
         version: VERSION,
         name: String::new(),
         view: View::default(),
@@ -516,6 +535,7 @@ mod tests {
 
     fn sample() -> GraphDoc {
         GraphDoc {
+            outputs: BTreeMap::new(),
             version: VERSION,
             name: "demo".into(),
             view: View {
@@ -546,6 +566,7 @@ mod tests {
                 },
             ],
             edges: vec![EdgeDoc {
+                output: None,
                 from: "n0".into(),
                 to: "n1".into(),
             }],
@@ -597,6 +618,8 @@ mod tests {
     #[test]
     fn json_round_trips_including_node_data() {
         let text = serde_json::to_string(&sample()).unwrap();
+        assert!(!text.contains("\"outputs\""));
+        assert!(!text.contains("\"output\""));
         assert!(!text.contains("\"kind\":null"), "absent kinds are omitted");
         let back: GraphDoc = serde_json::from_str(&text).unwrap();
         assert_eq!(back.nodes.len(), 2);
@@ -619,6 +642,13 @@ mod tests {
         assert_eq!(back.version, VERSION);
         assert!(back.nodes[0].data.is_none());
         assert!(back.edges.is_empty());
+        assert!(back.outputs.is_empty());
+        let edge: EdgeDoc = serde_json::from_str(r#"{"from":"n0","to":"n1"}"#).unwrap();
+        assert_eq!(edge.output, None);
+        assert_eq!(edge.handle(), "n0");
+        let edge: EdgeDoc =
+            serde_json::from_str(r#"{"from":"n0","to":"n1","output":"summary"}"#).unwrap();
+        assert_eq!(edge.handle(), "n0.summary");
     }
 
     #[test]
@@ -631,6 +661,7 @@ mod tests {
         assert_eq!(
             doc.edges[1],
             EdgeDoc {
+                output: None,
                 from: "b".into(),
                 to: "c".into()
             }
@@ -652,6 +683,7 @@ mod tests {
         // kind labels have to survive; positions and pan do not, and are documented as
         // living in the sidecar.
         let doc = GraphDoc {
+            outputs: BTreeMap::new(),
             version: VERSION,
             name: "demo".into(),
             view: View {
@@ -679,6 +711,7 @@ mod tests {
                 },
             ],
             edges: vec![EdgeDoc {
+                output: None,
                 from: "n0".into(),
                 to: "n1".into(),
             }],
@@ -704,6 +737,7 @@ mod tests {
         // `mermaid()` escapes a quote as `#quot;`; the reader must undo it, or a kind
         // named with a quote would come back with the escape left in its name.
         let doc = GraphDoc {
+            outputs: BTreeMap::new(),
             version: VERSION,
             name: "q".into(),
             view: View::default(),
