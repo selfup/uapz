@@ -183,6 +183,33 @@ fn has_drive_prefix(raw: &str) -> bool {
     bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
+/// A directory node's path: `.` or empty for the working directory itself, otherwise a
+/// [`relative_path`].
+pub fn directory_path(raw: &str) -> Result<PathBuf, String> {
+    match raw.trim() {
+        "" | "." => Ok(PathBuf::new()),
+        other => relative_path(other),
+    }
+}
+
+/// A glob pattern for a directory node, checked by compiling it. `*` matches across `/`,
+/// so `*.rs` takes Rust files at any depth and `src/**/*.rs` only those under `src/`.
+pub fn glob(pattern: &str) -> Result<(), String> {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return Err("pattern is empty".into());
+    }
+    if pattern.len() > MAX_PATH_LEN {
+        return Err(format!("pattern is longer than {MAX_PATH_LEN} characters"));
+    }
+    if pattern.chars().any(char::is_control) {
+        return Err("pattern contains a control character".into());
+    }
+    globset::Glob::new(pattern)
+        .map(|_| ())
+        .map_err(|e| format!("`{pattern}` is not a valid pattern: {}", e.kind()))
+}
+
 /// [`relative_path`] joined onto `root`. Pure: the file need not exist.
 pub fn path_inside(root: &str, raw: &str) -> Result<PathBuf, String> {
     relative_path(raw).map(|rel| Path::new(root).join(rel))
@@ -206,6 +233,47 @@ pub fn resolve_inside(root: &Path, raw: &str) -> Result<PathBuf, String> {
             real.display(),
             root.display()
         ));
+    }
+    Ok(real)
+}
+
+/// Model output with a surrounding Markdown code fence removed: "```sql\n…\n```" becomes
+/// "…". Text without a fence is only trimmed.
+pub fn unfenced(text: &str) -> String {
+    let text = text.trim();
+    let Some(rest) = text.strip_prefix("```") else {
+        return text.to_string();
+    };
+    // The opening fence may carry a language tag; it ends at the first newline.
+    let body = match rest.find('\n') {
+        Some(i) => &rest[i + 1..],
+        None => rest,
+    };
+    let body = body.trim_end().strip_suffix("```").unwrap_or(body);
+    body.trim().to_string()
+}
+
+/// Resolve a directory node's path inside `root` and prove, with symlinks followed, that
+/// it is a directory still under the real root. `.` is the root itself.
+pub fn resolve_directory_inside(root: &Path, raw: &str) -> Result<PathBuf, String> {
+    let rel = directory_path(raw)?;
+    let root = root
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", root.display()))?;
+    let path = root.join(&rel);
+    let real = path
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if !real.starts_with(&root) {
+        return Err(format!(
+            "{} resolves to {}, outside {}",
+            rel.display(),
+            real.display(),
+            root.display()
+        ));
+    }
+    if !real.is_dir() {
+        return Err(format!("{} is not a directory", real.display()));
     }
     Ok(real)
 }
@@ -256,6 +324,88 @@ pub fn args(args: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Split an arguments line the way a shell does: whitespace separates arguments, double
+/// or single quotes group words into one, and a backslash escapes the next character
+/// outside single quotes. An unterminated quote is an error.
+pub fn split_args(line: &str) -> Result<Vec<String>, String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_arg = false;
+    let mut quote: Option<char> = None;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some('\'') => match c {
+                '\'' => quote = None,
+                _ => current.push(c),
+            },
+            Some(_) => match c {
+                '"' => quote = None,
+                '\\' => match chars.next() {
+                    Some(next @ ('"' | '\\' | '$' | '`')) => current.push(next),
+                    Some(next) => {
+                        current.push('\\');
+                        current.push(next);
+                    }
+                    None => current.push('\\'),
+                },
+                _ => current.push(c),
+            },
+            None => match c {
+                c if c.is_whitespace() => {
+                    if in_arg {
+                        args.push(std::mem::take(&mut current));
+                        in_arg = false;
+                    }
+                }
+                '"' | '\'' => {
+                    quote = Some(c);
+                    in_arg = true;
+                }
+                '\\' => {
+                    in_arg = true;
+                    match chars.next() {
+                        Some(next) => current.push(next),
+                        None => return Err("arguments end with a lone backslash".into()),
+                    }
+                }
+                _ => {
+                    in_arg = true;
+                    current.push(c);
+                }
+            },
+        }
+    }
+    match quote {
+        Some('"') => return Err("arguments have an unclosed double quote".into()),
+        Some(_) => return Err("arguments have an unclosed single quote".into()),
+        None => {}
+    }
+    if in_arg {
+        args.push(current);
+    }
+    Ok(args)
+}
+
+/// Arguments joined into one line that [`split_args`] reads back unchanged: those with
+/// whitespace, quotes or backslashes (or nothing at all) go in double quotes.
+pub fn join_args(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| {
+            let plain = !arg.is_empty()
+                && !arg
+                    .chars()
+                    .any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '\\'));
+            if plain {
+                arg.clone()
+            } else {
+                format!("\"{}\"", arg.replace('\\', "\\\\").replace('"', "\\\""))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Free text such as a prompt: bounded and without NUL bytes.
@@ -830,5 +980,64 @@ mod tests {
         );
         assert!(tokenize("/* open").is_err());
         assert!(tokenize("\"open").is_err());
+    }
+
+    #[test]
+    fn fences_are_stripped() {
+        assert_eq!(unfenced("```sql\nSELECT 1;\n```"), "SELECT 1;");
+        assert_eq!(unfenced("```\nSELECT 1\n```\n"), "SELECT 1");
+        assert_eq!(unfenced("  SELECT 1  "), "SELECT 1");
+        assert_eq!(unfenced("```SELECT 1```"), "SELECT 1");
+        assert_eq!(unfenced(""), "");
+    }
+
+    #[test]
+    fn directory_paths_and_globs() {
+        assert_eq!(directory_path(".").unwrap(), PathBuf::new());
+        assert_eq!(directory_path("  ").unwrap(), PathBuf::new());
+        assert_eq!(directory_path("src/bin").unwrap(), PathBuf::from("src/bin"));
+        assert!(directory_path("..").is_err());
+        assert!(directory_path("/etc").is_err());
+        assert!(directory_path("./src").is_err());
+        assert!(glob("src/**/*.rs").is_ok());
+        assert!(glob("*.{rs,md}").is_ok());
+        assert!(glob("").is_err());
+        assert!(glob("src/[").unwrap_err().contains("not a valid pattern"));
+        assert!(glob("a\nb").is_err());
+    }
+
+    #[test]
+    fn argument_lines_honor_quotes_and_round_trip() {
+        let v = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(split_args("a  b\tc").unwrap(), v(&["a", "b", "c"]));
+        assert_eq!(
+            split_args(r#""read the changes" --fast 'it''s' x\ y"#).unwrap(),
+            v(&["read the changes", "--fast", "its", "x y"])
+        );
+        assert_eq!(
+            split_args(r#""say \"hi\" \$HOME \n""#).unwrap(),
+            v(&[r#"say "hi" $HOME \n"#])
+        );
+        assert_eq!(split_args(r#""" ''"#).unwrap(), v(&["", ""]));
+        assert_eq!(split_args("   ").unwrap(), Vec::<String>::new());
+        assert!(split_args(r#""open"#).unwrap_err().contains("double quote"));
+        assert!(split_args("'open").unwrap_err().contains("single quote"));
+        assert!(split_args("trailing\\").unwrap_err().contains("backslash"));
+
+        for args in [
+            v(&[
+                "plain",
+                "two words",
+                "",
+                r#"with "quotes""#,
+                "back\\slash",
+                "it's",
+            ]),
+            v(&["-p", "read the uncommitted changes and do a security pass"]),
+        ] {
+            let line = join_args(&args);
+            assert_eq!(split_args(&line).unwrap(), args, "{line}");
+        }
+        assert_eq!(join_args(&v(&["a", "b c"])), r#"a "b c""#);
     }
 }

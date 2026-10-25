@@ -112,18 +112,38 @@ pub fn sanitize_name(raw: &str) -> String {
     validate::file_stem(raw)
 }
 
-pub fn paths(name: &str) -> (PathBuf, PathBuf) {
-    let dir = Path::new(DIR);
+fn paths_in(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
     (
         dir.join(format!("{name}.md")),
         dir.join(format!("{name}.json")),
     )
 }
 
-/// Write both files, returning their paths.
+/// A name that is its own sanitized form can't leave the directory it is joined to.
+fn safe_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || sanitize_name(name) != name {
+        return Err(format!("`{name}` is not a safe file name"));
+    }
+    Ok(())
+}
+
+/// A name from a listing: a bare file stem, never a path.
+fn listed_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.contains(['/', '\\']) || name.starts_with('.') {
+        return Err(format!("`{name}` is not a graph name"));
+    }
+    Ok(())
+}
+
+/// Write both files, returning their paths. The name must already be sanitized.
 pub fn save(doc: &GraphDoc) -> Result<(PathBuf, PathBuf), String> {
-    fs::create_dir_all(DIR).map_err(|e| format!("create {DIR}/: {e}"))?;
-    let (md, json) = paths(&doc.name);
+    save_in(Path::new(DIR), doc)
+}
+
+fn save_in(dir: &Path, doc: &GraphDoc) -> Result<(PathBuf, PathBuf), String> {
+    safe_name(&doc.name)?;
+    fs::create_dir_all(dir).map_err(|e| format!("create {}/: {e}", dir.display()))?;
+    let (md, json) = paths_in(dir, &doc.name);
     fs::write(&md, doc.markdown()).map_err(|e| format!("write {}: {e}", md.display()))?;
     let text = serde_json::to_string_pretty(doc).map_err(|e| e.to_string())?;
     fs::write(&json, text + "\n").map_err(|e| format!("write {}: {e}", json.display()))?;
@@ -132,7 +152,12 @@ pub fn save(doc: &GraphDoc) -> Result<(PathBuf, PathBuf), String> {
 
 /// Read a graph by name: the JSON sidecar when present, else the markdown's mermaid block.
 pub fn load(name: &str) -> Result<GraphDoc, String> {
-    let (md, json) = paths(name);
+    load_in(Path::new(DIR), name)
+}
+
+fn load_in(dir: &Path, name: &str) -> Result<GraphDoc, String> {
+    listed_name(name)?;
+    let (md, json) = paths_in(dir, name);
     let mut doc = if json.exists() {
         let text =
             fs::read_to_string(&json).map_err(|e| format!("read {}: {e}", json.display()))?;
@@ -148,7 +173,11 @@ pub fn load(name: &str) -> Result<GraphDoc, String> {
 
 /// Names of every saved graph (markdown files in `graphs/`), sorted.
 pub fn list() -> Vec<String> {
-    let Ok(entries) = fs::read_dir(DIR) else {
+    list_in(Path::new(DIR))
+}
+
+fn list_in(dir: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
     let mut names: Vec<String> = entries
@@ -160,6 +189,7 @@ pub fn list() -> Vec<String> {
             }
             path.file_stem()
                 .and_then(|s| s.to_str())
+                .filter(|stem| listed_name(stem).is_ok())
                 .map(str::to_string)
         })
         .collect();
@@ -181,26 +211,37 @@ pub struct NodeKind {
     pub color: String,
 }
 
-pub fn kind_path(name: &str) -> PathBuf {
-    Path::new(NODES_DIR).join(format!("{name}.json"))
+/// Write the kind's file. The name must already be sanitized.
+pub fn save_kind(kind: &NodeKind) -> Result<PathBuf, String> {
+    save_kind_in(Path::new(NODES_DIR), kind)
 }
 
-pub fn save_kind(kind: &NodeKind) -> Result<PathBuf, String> {
-    fs::create_dir_all(NODES_DIR).map_err(|e| format!("create {NODES_DIR}/: {e}"))?;
-    let path = kind_path(&kind.name);
+fn save_kind_in(dir: &Path, kind: &NodeKind) -> Result<PathBuf, String> {
+    safe_name(&kind.name)?;
+    fs::create_dir_all(dir).map_err(|e| format!("create {}/: {e}", dir.display()))?;
+    let path = dir.join(format!("{}.json", kind.name));
     let text = serde_json::to_string_pretty(kind).map_err(|e| e.to_string())?;
     fs::write(&path, text + "\n").map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok(path)
 }
 
 pub fn delete_kind(name: &str) -> Result<(), String> {
-    let path = kind_path(name);
+    delete_kind_in(Path::new(NODES_DIR), name)
+}
+
+fn delete_kind_in(dir: &Path, name: &str) -> Result<(), String> {
+    listed_name(name)?;
+    let path = dir.join(format!("{name}.json"));
     fs::remove_file(&path).map_err(|e| format!("delete {}: {e}", path.display()))
 }
 
 /// Every saved kind, sorted by name. Files that don't parse are skipped.
 pub fn list_kinds() -> Vec<NodeKind> {
-    let Ok(entries) = fs::read_dir(NODES_DIR) else {
+    list_kinds_in(Path::new(NODES_DIR))
+}
+
+fn list_kinds_in(dir: &Path) -> Vec<NodeKind> {
+    let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
     let mut kinds: Vec<NodeKind> = entries
@@ -329,9 +370,7 @@ fn parse_statement(line: &str) -> Option<(String, Option<String>)> {
     if !rest.starts_with(['-', '=', '.']) {
         return Some((from, None));
     }
-    let rest = rest
-        .trim_start_matches(|c: char| matches!(c, '-' | '=' | '.' | '>'))
-        .trim_start();
+    let rest = rest.trim_start_matches(['-', '=', '.', '>']).trim_start();
     // Arrow heads `--x` / `--o`, then an optional `|label|`.
     let rest = match rest.strip_prefix(['x', 'o']) {
         Some(after) if after.starts_with(char::is_whitespace) => after.trim_start(),
@@ -548,5 +587,84 @@ mod tests {
         assert_eq!(sanitize_name("../etc/passwd"), "---etc-passwd");
         assert_eq!(sanitize_name("  My Graph 2 "), "My Graph 2");
         assert_eq!(sanitize_name(""), "untitled");
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("uapz-doc-{tag}-{}-{nanos}", std::process::id()))
+    }
+
+    #[test]
+    fn graphs_save_load_and_list_on_disk() {
+        let dir = scratch("graphs");
+        let mut doc = sample();
+        doc.name = "demo".into();
+        let (md, json) = save_in(&dir, &doc).unwrap();
+        assert_eq!(md, dir.join("demo.md"));
+        assert_eq!(json, dir.join("demo.json"));
+        assert!(fs::read_to_string(&md).unwrap().contains("```mermaid"));
+
+        let loaded = load_in(&dir, "demo").unwrap();
+        assert_eq!(loaded.name, "demo");
+        assert_eq!(
+            serde_json::to_value(&loaded).unwrap(),
+            serde_json::to_value(&doc).unwrap()
+        );
+
+        let mut other = sample();
+        other.name = "alpha".into();
+        save_in(&dir, &other).unwrap();
+        fs::write(dir.join("notes.txt"), "x").unwrap();
+        fs::write(dir.join(".hidden.md"), "x").unwrap();
+        assert_eq!(list_in(&dir), ["alpha", "demo"]);
+
+        // Without the sidecar the markdown's mermaid block is enough for the shape.
+        fs::remove_file(&json).unwrap();
+        let fallback = load_in(&dir, "demo").unwrap();
+        assert_eq!(fallback.name, "demo");
+        let ids = |d: &GraphDoc| d.nodes.iter().map(|n| n.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&fallback), ids(&doc));
+        assert_eq!(fallback.edges, doc.edges);
+
+        let mut evil = sample();
+        evil.name = "../evil".into();
+        assert!(save_in(&dir, &evil).unwrap_err().contains("not a safe"));
+        assert!(!dir.parent().unwrap().join("evil.md").exists());
+        assert!(load_in(&dir, "../demo").is_err());
+        assert!(load_in(&dir, "missing").unwrap_err().contains("missing.md"));
+        assert!(list_in(&dir.join("nope")).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn kinds_save_list_and_delete_on_disk() {
+        let dir = scratch("kinds");
+        let alpha = NodeKind {
+            name: "Alpha".into(),
+            color: "#ff0000".into(),
+        };
+        let beta = NodeKind {
+            name: "Beta 2".into(),
+            color: "#00ff00".into(),
+        };
+        save_kind_in(&dir, &beta).unwrap();
+        assert_eq!(save_kind_in(&dir, &alpha).unwrap(), dir.join("Alpha.json"));
+        fs::write(dir.join("broken.json"), "{").unwrap();
+        fs::write(dir.join("readme.txt"), "x").unwrap();
+        assert_eq!(list_kinds_in(&dir), vec![alpha.clone(), beta.clone()]);
+        delete_kind_in(&dir, "Beta 2").unwrap();
+        assert_eq!(list_kinds_in(&dir), vec![alpha]);
+        assert!(delete_kind_in(&dir, "Beta 2").is_err());
+        assert!(delete_kind_in(&dir, "../x").is_err());
+        let evil = NodeKind {
+            name: "../x".into(),
+            color: "#000000".into(),
+        };
+        assert!(save_kind_in(&dir, &evil).is_err());
+        assert!(list_kinds_in(&dir.join("nope")).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

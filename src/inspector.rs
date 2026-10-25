@@ -17,15 +17,17 @@ use gpui_kit::*;
 use std::str::FromStr;
 
 use crate::exec::{self, Report};
-use crate::graph::{Graph, GraphEvent, NodeId, type_color};
+use crate::graph::{Graph, GraphEvent, NodeId, data_color};
 use crate::library;
 use crate::node_data::{
-    AgentConfig, Auth, DataConfig, DataFormat, DatabaseConfig, DbEngine, ModelType, NodeData,
-    NodeType, OutputType, Provider, Runtime, ScriptConfig,
+    AgentConfig, Auth, DataConfig, DataFormat, DatabaseConfig, DbEngine, DirectoryConfig,
+    ModelType, NodeData, NodeType, OutputType, Provider, Runtime, ScriptConfig,
+    WRITABLE_DATABASE_LABEL,
 };
 use crate::providers::{self, UreqHttp};
 use crate::validate::{self, Issue};
 
+/// Initial inspector width; the divider next to it resizes it.
 pub const INSPECTOR_W: f32 = 320.0;
 
 pub enum InspectorEvent {
@@ -75,6 +77,11 @@ pub struct Inspector {
     input_table: Entity<InputState>,
     query: Entity<TextareaState>,
     read_only: bool,
+    /// Saved agents offered to write the query, the pick, the request and progress.
+    sql_agents: Vec<library::Preset<AgentConfig>>,
+    sql_agent: Entity<StrSelect>,
+    sql_request: Entity<TextareaState>,
+    writing_sql: bool,
     // script
     runtime: Entity<StrSelect>,
     script_path: Entity<InputState>,
@@ -83,6 +90,14 @@ pub struct Inspector {
     // data
     data_path: Entity<InputState>,
     format: Entity<StrSelect>,
+    // directory
+    dir_path: Entity<InputState>,
+    dir_include: Entity<InputState>,
+    dir_exclude: Entity<InputState>,
+    dir_gitignore: bool,
+    dir_contents: bool,
+    dir_max_files: Entity<InputState>,
+    dir_max_bytes: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -196,12 +211,23 @@ impl Inspector {
         let input = text("optional: table.csv (inside data/)", window, cx);
         let input_table = text("input", window, cx);
         let query = area("SELECT …", 5, window, cx);
+        let sql_agent = cx.new(|cx| SelectState::new(Vec::<SharedString>::new(), None, window, cx));
+        let sql_request = area("What should the query do?", 3, window, cx);
         let runtime = enum_select(&Runtime::ALL, Runtime::label, window, cx);
         let script_path = text("etl.py (inside scripts/)", window, cx);
-        let args = text("arguments, space separated", window, cx);
+        let args = text(
+            r#"arguments: quote "words that belong together""#,
+            window,
+            cx,
+        );
         let timeout = text("60", window, cx);
         let data_path = text("sales.csv (inside data/)", window, cx);
         let format = enum_select(&DataFormat::ALL, DataFormat::label, window, cx);
+        let dir_path = text(". (the working directory)", window, cx);
+        let dir_include = text("src/**/*.rs *.md (empty takes every file)", window, cx);
+        let dir_exclude = text("patterns to skip", window, cx);
+        let dir_max_files = text("200", window, cx);
+        let dir_max_bytes = text("262144", window, cx);
 
         let mut subscriptions =
             vec![
@@ -225,6 +251,11 @@ impl Inspector {
             &input_table,
             &args,
             &timeout,
+            &dir_path,
+            &dir_include,
+            &dir_exclude,
+            &dir_max_files,
+            &dir_max_bytes,
         ] {
             subscriptions.push(cx.subscribe_in(
                 state,
@@ -335,12 +366,23 @@ impl Inspector {
             input_table,
             query,
             read_only: true,
+            sql_agents: Vec::new(),
+            sql_agent,
+            sql_request,
+            writing_sql: false,
             runtime,
             script_path,
             args,
             timeout,
             data_path,
             format,
+            dir_path,
+            dir_include,
+            dir_exclude,
+            dir_gitignore: true,
+            dir_contents: true,
+            dir_max_files,
+            dir_max_bytes,
             _subscriptions: subscriptions,
         };
         inspector.reload(window, cx);
@@ -382,6 +424,9 @@ impl Inspector {
                     cx,
                 );
                 self.kind = data.as_ref().map(NodeData::node_type);
+                if self.kind == Some(NodeType::Database) {
+                    self.refresh_sql_agents(window, cx);
+                }
                 self.output_count = match (&preset, &self.kind) {
                     (Some(name), Some(NodeType::Agent)) => library::agent_output_count(name),
                     _ => 0,
@@ -427,12 +472,21 @@ impl Inspector {
             NodeData::Script(s) => {
                 choose(&self.runtime, &Runtime::ALL, s.runtime, window, cx);
                 set_text(&self.script_path, s.path.clone(), window, cx);
-                set_text(&self.args, s.args.join(" "), window, cx);
+                set_text(&self.args, validate::join_args(&s.args), window, cx);
                 set_text(&self.timeout, s.timeout_secs.to_string(), window, cx);
             }
             NodeData::Data(d) => {
                 set_text(&self.data_path, d.path.clone(), window, cx);
                 choose(&self.format, &DataFormat::ALL, d.format, window, cx);
+            }
+            NodeData::Directory(d) => {
+                set_text(&self.dir_path, d.path.clone(), window, cx);
+                set_text(&self.dir_include, d.include.join(" "), window, cx);
+                set_text(&self.dir_exclude, d.exclude.join(" "), window, cx);
+                self.dir_gitignore = d.gitignore;
+                self.dir_contents = d.contents;
+                set_text(&self.dir_max_files, d.max_files.to_string(), window, cx);
+                set_text(&self.dir_max_bytes, d.max_bytes.to_string(), window, cx);
             }
         }
     }
@@ -521,10 +575,13 @@ impl Inspector {
                     runtime: chosen(&self.runtime, &Runtime::ALL, Runtime::label, cx)
                         .unwrap_or(prev.runtime),
                     path: text_of(&self.script_path, cx),
-                    args: text_of(&self.args, cx)
-                        .split_whitespace()
-                        .map(str::to_string)
-                        .collect(),
+                    args: match validate::split_args(&text_of(&self.args, cx)) {
+                        Ok(args) => args,
+                        Err(e) => {
+                            issues.push(Issue::new("arguments", e));
+                            prev.args
+                        }
+                    },
                     timeout_secs: parse_field(
                         &self.timeout,
                         prev.timeout_secs,
@@ -543,6 +600,39 @@ impl Inspector {
                     path: text_of(&self.data_path, cx),
                     format: chosen(&self.format, &DataFormat::ALL, DataFormat::label, cx)
                         .unwrap_or(prev.format),
+                })
+            }
+            NodeType::Directory => {
+                let prev = match prev {
+                    Some(NodeData::Directory(d)) => d,
+                    _ => DirectoryConfig::default(),
+                };
+                let patterns = |state: &Entity<InputState>| -> Vec<String> {
+                    text_of(state, cx)
+                        .split_whitespace()
+                        .map(str::to_string)
+                        .collect()
+                };
+                NodeData::Directory(DirectoryConfig {
+                    path: text_of(&self.dir_path, cx),
+                    include: patterns(&self.dir_include),
+                    exclude: patterns(&self.dir_exclude),
+                    gitignore: self.dir_gitignore,
+                    contents: self.dir_contents,
+                    max_files: parse_field(
+                        &self.dir_max_files,
+                        prev.max_files,
+                        "max files",
+                        &mut issues,
+                        cx,
+                    ),
+                    max_bytes: parse_field(
+                        &self.dir_max_bytes,
+                        prev.max_bytes,
+                        "max bytes",
+                        &mut issues,
+                        cx,
+                    ),
                 })
             }
         };
@@ -631,13 +721,23 @@ impl Inspector {
         self.sync(cx);
     }
 
+    fn set_dir_gitignore(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.dir_gitignore = on;
+        self.sync(cx);
+    }
+
+    fn set_dir_contents(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.dir_contents = on;
+        self.sync(cx);
+    }
+
     // ----- actions -----
 
-    /// Give a blank node content of a type, or replace a typed node's content.
-    fn convert(&mut self, ty: NodeType, window: &mut Window, cx: &mut Context<Self>) {
+    /// Give a blank node content, or replace a typed node's content.
+    fn set_content(&mut self, data: NodeData, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.node else { return };
         self.graph.update(cx, |graph, cx| {
-            graph.set_node_data(id, Some(ty.default_data()), cx);
+            graph.set_node_data(id, Some(data), cx);
             graph.set_node_label(id, None, cx);
         });
         self.reload(window, cx);
@@ -680,10 +780,10 @@ impl Inspector {
         let result = match &data {
             NodeData::Agent(a) => library::save_agent(&name, a),
             NodeData::Database(d) => library::save_database(&name, d),
-            NodeData::Script(_) | NodeData::Data(_) => {
+            NodeData::Script(_) | NodeData::Data(_) | NodeData::Directory(_) => {
                 self.status(
                     format!(
-                        "Scripts and data are files: put them in {}/ or {}/ and they appear in the sidebar",
+                        "Scripts, data and directories are paths: put files in {}/ or {}/ and they appear in the sidebar",
                         library::SCRIPTS_DIR,
                         library::DATA_DIR
                     ),
@@ -770,7 +870,7 @@ impl Inspector {
                 set_text(&self.data_path, path.to_string(), window, cx);
                 self.on_data_path_change(window, cx);
             }
-            NodeType::Agent | NodeType::Database => return false,
+            NodeType::Agent | NodeType::Database | NodeType::Directory => return false,
         }
         true
     }
@@ -826,6 +926,102 @@ impl Inspector {
                 }
                 this.report = Some(report);
                 this.status(text, error, cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Re-list the saved generative agents for the SQL helper, keeping the pick when that
+    /// agent still exists.
+    fn refresh_sql_agents(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let chosen = self.sql_agent.read(cx).selected_value().cloned();
+        self.sql_agents = library::list_agents()
+            .into_iter()
+            .filter(|p| p.config.model_type == ModelType::Generative)
+            .collect();
+        let items: Vec<SharedString> = self
+            .sql_agents
+            .iter()
+            .map(|p| SharedString::from(p.name.clone()))
+            .collect();
+        let index = chosen
+            .and_then(|name| items.iter().position(|i| *i == name))
+            .or_else(|| (!items.is_empty()).then_some(0));
+        self.sql_agent.update(cx, |select, cx| {
+            select.set_items(items, window, cx);
+            select.set_selected_index(index.map(IndexPath::new), window, cx);
+        });
+    }
+
+    /// Ask the chosen agent to write the query from the schema and the request, then put
+    /// its answer into the query field, where the usual checks run on it.
+    fn write_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.writing_sql {
+            return;
+        }
+        let Some(id) = self.node else { return };
+        let Some(NodeData::Database(config)) = self.graph.read(cx).node_data(id).cloned() else {
+            return;
+        };
+        self.refresh_sql_agents(window, cx);
+        let agent = self
+            .sql_agent
+            .read(cx)
+            .selected_index(cx)
+            .and_then(|i| self.sql_agents.get(i.row).cloned());
+        let Some(agent) = agent else {
+            self.status("Save an agent first, then pick it here".into(), true, cx);
+            return;
+        };
+        let request = self.sql_request.read(cx).value().to_string();
+        if request.trim().is_empty() {
+            self.status("Describe what the query should do first".into(), true, cx);
+            return;
+        }
+        self.writing_sql = true;
+        self.status(
+            format!("Asking {} to write the query…", agent.name),
+            false,
+            cx,
+        );
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let http = UreqHttp::new(exec::HTTP_TIMEOUT);
+                    exec::write_sql(
+                        &agent.config,
+                        &config,
+                        &request,
+                        &exec::Dirs::from_cwd(),
+                        &http,
+                        &exec::process_env,
+                    )
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.writing_sql = false;
+                match result {
+                    Ok(sql) => {
+                        set_textarea(&this.query, sql, window, cx);
+                        this.sync(cx);
+                        match this.issues.iter().find(|i| i.field == "query") {
+                            Some(issue) => this.status(
+                                format!("The agent's query was refused: {}", issue.message),
+                                true,
+                                cx,
+                            ),
+                            None => this.status(
+                                "Query written; read it before you run it".into(),
+                                false,
+                                cx,
+                            ),
+                        }
+                    }
+                    Err(e) => this.status(format!("Writing the query failed: {e}"), true, cx),
+                }
                 cx.notify();
             })
             .ok();
@@ -925,6 +1121,9 @@ impl Inspector {
         let file_based = chosen(&self.engine, &DbEngine::ALL, DbEngine::label, cx)
             .is_none_or(DbEngine::is_file_based);
         let read_only = self.read_only;
+        let muted = cx.theme().muted_foreground;
+        let danger = cx.theme().danger;
+        let has_agents = !self.sql_agents.is_empty();
         v_form()
             .small()
             .child(
@@ -961,20 +1160,65 @@ impl Inspector {
                     .child(Input::new(&self.input_table).small()),
             )
             .child(
-                field().label("Query").child(
-                    v_flex()
-                        .gap_1()
-                        .child(Textarea::new(&self.query).small())
-                        .child(
-                            Switch::new("read-only")
-                                .small()
-                                .checked(read_only)
-                                .label("Read-only: SELECT-style statements only")
-                                .on_change(cx.listener(|this, checked: &bool, _, cx| {
-                                    this.set_read_only(*checked, cx)
-                                })),
-                        ),
-                ),
+                field()
+                    .label("Query")
+                    .description(
+                        "One statement. Leave it empty to run the SQL arriving on the wire, for example from an agent.",
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(Textarea::new(&self.query).small())
+                            .child(
+                                Switch::new("read-only")
+                                    .small()
+                                    .checked(read_only)
+                                    .label("Read-only: SELECT-style statements only")
+                                    .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                                        this.set_read_only(*checked, cx)
+                                    })),
+                            )
+                            .when(!read_only, |d| {
+                                d.child(div().text_xs().text_color(danger).child(
+                                    "Writes allowed: the node is red on the canvas and runs whatever SQL it is given.",
+                                ))
+                            }),
+                    ),
+            )
+            .child(
+                field()
+                    .label("Write the query with an agent")
+                    .description(
+                        "A saved agent gets the schema and your request; its answer lands in the query above for you to check.",
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .when(has_agents, |d| {
+                                d.child(Select::new(&self.sql_agent).small().w_full())
+                            })
+                            .when(!has_agents, |d| {
+                                d.child(div().text_xs().text_color(muted).child(
+                                    "No saved agents yet: press Save agent on an agent node and it appears here.",
+                                ))
+                            })
+                            .child(Textarea::new(&self.sql_request).small())
+                            .child(
+                                Button::new("write-sql")
+                                    .outline()
+                                    .small()
+                                    .label(if self.writing_sql {
+                                        "Writing…"
+                                    } else {
+                                        "Write query"
+                                    })
+                                    .disabled(self.writing_sql || !has_agents)
+                                    .loading(self.writing_sql)
+                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                        this.write_query(window, cx)
+                                    })),
+                            ),
+                    ),
             )
     }
 
@@ -998,6 +1242,9 @@ impl Inspector {
             .child(
                 field()
                     .label("Arguments")
+                    .description(
+                        "Split like a shell: spaces separate, double or single quotes keep words together, a backslash escapes.",
+                    )
                     .child(Input::new(&self.args).small()),
             )
             .child(
@@ -1026,17 +1273,96 @@ impl Inspector {
             )
     }
 
+    fn render_directory(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let gitignore = self.dir_gitignore;
+        let contents = self.dir_contents;
+        v_form()
+            .small()
+            .child(
+                field()
+                    .label("Directory")
+                    .description(
+                        "Relative to the working directory the app runs in; `.` is that directory itself, so a graph can read the repository it lives in. Hidden entries and symlinks are never read.",
+                    )
+                    .child(Input::new(&self.dir_path).small()),
+            )
+            .child(
+                field()
+                    .label("Include patterns")
+                    .description(
+                        "Space-separated globs relative to the directory. `*` crosses `/`, so `*.rs` takes Rust files at any depth and `src/**/*.rs` only those under src/.",
+                    )
+                    .child(Input::new(&self.dir_include).small()),
+            )
+            .child(
+                field()
+                    .label("Exclude patterns")
+                    .child(Input::new(&self.dir_exclude).small()),
+            )
+            .child(
+                field().label("Options").child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            Switch::new("dir-gitignore")
+                                .small()
+                                .checked(gitignore)
+                                .label("Respect .gitignore files (skips build output)")
+                                .on_change(cx.listener(|this, on: &bool, _, cx| {
+                                    this.set_dir_gitignore(*on, cx)
+                                })),
+                        )
+                        .child(
+                            Switch::new("dir-contents")
+                                .small()
+                                .checked(contents)
+                                .label("Include file contents after the listing")
+                                .on_change(cx.listener(|this, on: &bool, _, cx| {
+                                    this.set_dir_contents(*on, cx)
+                                })),
+                        ),
+                ),
+            )
+            .child(
+                field()
+                    .label("Max files")
+                    .child(Input::new(&self.dir_max_files).small()),
+            )
+            .child(
+                field()
+                    .label("Content budget (bytes)")
+                    .description(
+                        "Contents stop when the budget is spent. The agent downstream must still fit all of it in its context size.",
+                    )
+                    .child(Input::new(&self.dir_max_bytes).small()),
+            )
+    }
+
+    /// One button per content type, with the writable database after the read-only one.
     fn render_type_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let choices: Vec<(&'static str, NodeData)> = NodeType::ALL
+            .into_iter()
+            .flat_map(|ty| {
+                let mut choices = vec![(ty.label(), ty.default_data())];
+                if ty == NodeType::Database {
+                    choices.push((
+                        WRITABLE_DATABASE_LABEL,
+                        NodeData::Database(DatabaseConfig::writable()),
+                    ));
+                }
+                choices
+            })
+            .collect();
         h_flex()
             .flex_wrap()
             .gap_2()
-            .children(NodeType::ALL.into_iter().enumerate().map(|(i, ty)| {
+            .children(choices.into_iter().enumerate().map(|(i, (label, data))| {
                 Button::new(("make", i))
                     .outline()
                     .small()
-                    .label(ty.label())
+                    .label(label)
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        this.convert(ty, window, cx)
+                        this.set_content(data.clone(), window, cx)
                     }))
             }))
     }
@@ -1053,10 +1379,13 @@ impl Render for Inspector {
         let success = theme.success;
         let panel = theme.background;
 
-        let (title, swatch) = match (self.node, self.kind) {
+        let data = self
+            .node
+            .and_then(|id| self.graph.read(cx).node_data(id).cloned());
+        let (title, swatch) = match (self.node, &data) {
             (None, _) => ("Inspector", None),
             (Some(_), None) => ("Blank node", None),
-            (Some(_), Some(ty)) => (ty.label(), Some(type_color(ty))),
+            (Some(_), Some(data)) => (data.label(), Some(data_color(data))),
         };
         let header = h_flex()
             .flex_shrink_0()
@@ -1117,6 +1446,7 @@ impl Render for Inspector {
                     NodeType::Database => self.render_database(cx).into_any_element(),
                     NodeType::Script => self.render_script(cx).into_any_element(),
                     NodeType::Data => self.render_data(cx).into_any_element(),
+                    NodeType::Directory => self.render_directory(cx).into_any_element(),
                 };
                 let issues: Vec<AnyElement> = if self.issues.is_empty() {
                     vec![
@@ -1239,9 +1569,8 @@ impl Render for Inspector {
         };
 
         v_flex()
-            .w(px(INSPECTOR_W))
-            .h_full()
-            .flex_shrink_0()
+            .size_full()
+            .min_w_0()
             .bg(bg)
             .border_l_1()
             .border_color(border)

@@ -16,7 +16,7 @@ use gpui_kit::*;
 use std::collections::{HashMap, HashSet};
 
 use crate::doc::{self, EdgeDoc, GraphDoc, NodeDoc, NodeKind, View};
-use crate::node_data::{NodeData, NodeType};
+use crate::node_data::{DatabaseConfig, NodeData, NodeType};
 
 gpui_kit::actions!(graph, [AddNode, DeleteSelection, ClearAll, Cancel]);
 
@@ -44,6 +44,8 @@ pub enum Current {
     #[default]
     Blank,
     Type(NodeType),
+    /// A database node whose read-only flag starts off: the red one.
+    WritableDatabase,
     /// A saved blank kind by name. Unknown names make blank nodes.
     Kind(String),
 }
@@ -337,7 +339,7 @@ impl Graph {
                 });
             }
             Drag::Pan { last } => {
-                self.pan = self.pan + (ev.position - last);
+                self.pan += ev.position - last;
                 self.drag = Some(Drag::Pan { last: ev.position });
             }
         }
@@ -412,6 +414,9 @@ impl Graph {
         match &self.current {
             Current::Blank => (None, None),
             Current::Type(ty) => (None, Some(ty.default_data())),
+            Current::WritableDatabase => {
+                (None, Some(NodeData::Database(DatabaseConfig::writable())))
+            }
             Current::Kind(name) => {
                 let style = self.kinds.get(name).map(|color| NodeStyle {
                     name: name.clone().into(),
@@ -452,7 +457,7 @@ impl Graph {
     pub fn add_preset(&mut self, name: &str, data: NodeData, cx: &mut Context<Self>) {
         let style = NodeStyle {
             name: name.to_string().into(),
-            color: type_color(data.node_type()),
+            color: data_color(&data),
         };
         let pos = self.spawn_pos();
         self.insert_node(pos, Some(style), Some(data), cx);
@@ -501,7 +506,7 @@ impl Graph {
         };
         node.style = label.map(|name| {
             let color = match &node.data {
-                Some(data) => type_color(data.node_type()),
+                Some(data) => data_color(data),
                 None => FALLBACK_KIND_COLOR,
             };
             NodeStyle {
@@ -512,30 +517,11 @@ impl Graph {
         cx.notify();
     }
 
-    /// The node's style for display. Typed content wins: its type sets the color and, when
-    /// the node has no preset name, the label. Otherwise the live kind color wins over the
-    /// one captured at load time.
+    /// The node's style for display. Typed content wins: it sets the color (its type's, or
+    /// red for a database that may write) and, when the node has no preset name, the
+    /// label. Otherwise the live kind color wins over the one captured at load time.
     fn resolved_style(&self, node: &Node) -> Option<NodeStyle> {
-        if let Some(data) = &node.data {
-            let ty = data.node_type();
-            return Some(NodeStyle {
-                name: node
-                    .style
-                    .as_ref()
-                    .map(|s| s.name.clone())
-                    .unwrap_or_else(|| ty.label().into()),
-                color: type_color(ty),
-            });
-        }
-        let style = node.style.as_ref()?;
-        Some(NodeStyle {
-            name: style.name.clone(),
-            color: self
-                .kinds
-                .get(style.name.as_ref())
-                .copied()
-                .unwrap_or(style.color),
-        })
+        resolve_style(node, &self.kinds)
     }
 
     // ----- persistence -----
@@ -543,83 +529,15 @@ impl Graph {
     /// The editor state as a document ready to be written to disk. Nodes and edges are
     /// sorted by id so the files don't churn when a node is dragged to the front.
     pub fn snapshot(&self, name: &str) -> GraphDoc {
-        let mut nodes: Vec<&Node> = self.nodes.iter().collect();
-        nodes.sort_by_key(|n| n.id);
-        let mut edges = self.edges.clone();
-        edges.sort_by_key(|e| (e.from, e.to));
-        GraphDoc {
-            version: doc::VERSION,
-            name: name.to_string(),
-            view: View {
-                pan_x: self.pan.x.as_f32(),
-                pan_y: self.pan.y.as_f32(),
-            },
-            nodes: nodes
-                .into_iter()
-                .map(|n| NodeDoc {
-                    id: node_key(n.id),
-                    x: n.pos.x.as_f32(),
-                    y: n.pos.y.as_f32(),
-                    kind: n.style.as_ref().map(|s| s.name.to_string()),
-                    color: self.resolved_style(n).map(|s| hex_of(s.color)),
-                    data: n.data.clone(),
-                })
-                .collect(),
-            edges: edges
-                .iter()
-                .map(|e| EdgeDoc {
-                    from: node_key(e.from),
-                    to: node_key(e.to),
-                })
-                .collect(),
-        }
+        snapshot_doc(name, &self.nodes, &self.edges, self.pan, &self.kinds)
     }
 
-    /// Replace the editor state with a document. Ids of the form `n<number>` are kept so
-    /// the JSON stays stable across a load/save cycle; anything else gets a fresh id.
+    /// Replace the editor state with a document; see [`restore_plan`] for the rules.
     pub fn restore(&mut self, doc: &GraphDoc, cx: &mut Context<Self>) {
-        let mut taken: HashSet<NodeId> = HashSet::new();
-        let parsed: Vec<Option<NodeId>> = doc
-            .nodes
-            .iter()
-            .map(|n| parse_key(&n.id).filter(|id| taken.insert(*id)))
-            .collect();
-        let mut next = taken.iter().max().map_or(0, |max| max + 1);
-
-        let mut ids: HashMap<&str, NodeId> = HashMap::new();
-        self.nodes = doc
-            .nodes
-            .iter()
-            .zip(parsed)
-            .map(|(n, parsed)| {
-                let id = parsed.unwrap_or_else(|| {
-                    next += 1;
-                    next - 1
-                });
-                ids.insert(n.id.as_str(), id);
-                Node {
-                    id,
-                    pos: point(px(n.x), px(n.y)),
-                    style: style_from_doc(n, &self.kinds),
-                    data: n.data.clone(),
-                }
-            })
-            .collect();
-
-        let mut edges = Vec::with_capacity(doc.edges.len());
-        for e in &doc.edges {
-            let (Some(&from), Some(&to)) = (ids.get(e.from.as_str()), ids.get(e.to.as_str()))
-            else {
-                continue;
-            };
-            let edge = Edge { from, to };
-            if from != to && !edges.contains(&edge) {
-                edges.push(edge);
-            }
-        }
-        self.edges = edges;
-
-        self.next_id = next;
+        let restored = restore_plan(doc, &self.kinds);
+        self.nodes = restored.nodes;
+        self.edges = restored.edges;
+        self.next_id = restored.next_id;
         self.pan = point(px(doc.view.pan_x), px(doc.view.pan_y));
         self.selection = None;
         self.drag = None;
@@ -858,6 +776,128 @@ impl Render for Graph {
     }
 }
 
+// ----- documents -----
+
+/// See [`Graph::resolved_style`].
+fn resolve_style(node: &Node, kinds: &HashMap<String, Hsla>) -> Option<NodeStyle> {
+    if let Some(data) = &node.data {
+        return Some(NodeStyle {
+            name: node
+                .style
+                .as_ref()
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| data.label().into()),
+            color: data_color(data),
+        });
+    }
+    let style = node.style.as_ref()?;
+    Some(NodeStyle {
+        name: style.name.clone(),
+        color: kinds
+            .get(style.name.as_ref())
+            .copied()
+            .unwrap_or(style.color),
+    })
+}
+
+/// The editor state as a document ready for disk: nodes and edges sorted by id so the
+/// files don't churn when a node is dragged to the front, and each node's display color
+/// captured so the graph renders without its kind library.
+fn snapshot_doc(
+    name: &str,
+    nodes: &[Node],
+    edges: &[Edge],
+    pan: Point<Pixels>,
+    kinds: &HashMap<String, Hsla>,
+) -> GraphDoc {
+    let mut nodes: Vec<&Node> = nodes.iter().collect();
+    nodes.sort_by_key(|n| n.id);
+    let mut edges = edges.to_vec();
+    edges.sort_by_key(|e| (e.from, e.to));
+    GraphDoc {
+        version: doc::VERSION,
+        name: name.to_string(),
+        view: View {
+            pan_x: pan.x.as_f32(),
+            pan_y: pan.y.as_f32(),
+        },
+        nodes: nodes
+            .into_iter()
+            .map(|n| NodeDoc {
+                id: node_key(n.id),
+                x: n.pos.x.as_f32(),
+                y: n.pos.y.as_f32(),
+                kind: n.style.as_ref().map(|s| s.name.to_string()),
+                color: resolve_style(n, kinds).map(|s| hex_of(s.color)),
+                data: n.data.clone(),
+            })
+            .collect(),
+        edges: edges
+            .iter()
+            .map(|e| EdgeDoc {
+                from: node_key(e.from),
+                to: node_key(e.to),
+            })
+            .collect(),
+    }
+}
+
+/// What [`Graph::restore`] installs from a document.
+struct Restored {
+    nodes: Vec<Node>,
+    edges: Vec<Edge>,
+    next_id: NodeId,
+}
+
+/// Ids of the form `n<number>` are kept, the first time each appears, so the JSON stays
+/// stable across a load/save cycle; anything else gets a fresh id above them. Edges that
+/// name unknown nodes, loop on one node or repeat an earlier edge are dropped.
+fn restore_plan(doc: &GraphDoc, kinds: &HashMap<String, Hsla>) -> Restored {
+    let mut taken: HashSet<NodeId> = HashSet::new();
+    let parsed: Vec<Option<NodeId>> = doc
+        .nodes
+        .iter()
+        .map(|n| parse_key(&n.id).filter(|id| taken.insert(*id)))
+        .collect();
+    let mut next = taken.iter().max().map_or(0, |max| max + 1);
+
+    let mut ids: HashMap<&str, NodeId> = HashMap::new();
+    let nodes: Vec<Node> = doc
+        .nodes
+        .iter()
+        .zip(parsed)
+        .map(|(n, parsed)| {
+            let id = parsed.unwrap_or_else(|| {
+                next += 1;
+                next - 1
+            });
+            ids.insert(n.id.as_str(), id);
+            Node {
+                id,
+                pos: point(px(n.x), px(n.y)),
+                style: style_from_doc(n, kinds),
+                data: n.data.clone(),
+            }
+        })
+        .collect();
+
+    let mut edges = Vec::with_capacity(doc.edges.len());
+    for e in &doc.edges {
+        let (Some(&from), Some(&to)) = (ids.get(e.from.as_str()), ids.get(e.to.as_str())) else {
+            continue;
+        };
+        let edge = Edge { from, to };
+        if from != to && !edges.contains(&edge) {
+            edges.push(edge);
+        }
+    }
+    Restored {
+        nodes,
+        edges,
+        next_id: next,
+    }
+}
+
 // ----- geometry helpers -----
 
 fn paint_grid(bounds: Bounds<Pixels>, pan: Point<Pixels>, color: Hsla, window: &mut Window) {
@@ -869,16 +909,17 @@ fn paint_grid(bounds: Bounds<Pixels>, pan: Point<Pixels>, color: Hsla, window: &
         while y < bounds.bottom() {
             let dot_bounds = Bounds::new(point(x - px(1.0), y - px(1.0)), dot);
             window.paint_quad(fill(dot_bounds, color).corner_radii(Corners::all(px(1.0))));
-            y = y + grid;
+            y += grid;
         }
-        x = x + grid;
+        x += grid;
     }
 }
 
-/// `v` modulo `grid`, always in `0..grid` even for negative `v`.
+/// `v` modulo `grid`, always in `0..grid` even for negative `v`. Negative zero (from
+/// `-24 % 24`) is folded into zero, since `Pixels` orders it below zero.
 fn wrap(v: Pixels, grid: Pixels) -> Pixels {
-    let r = v % grid;
-    if r < px(0.0) { r + grid } else { r }
+    let r = v.as_f32().rem_euclid(grid.as_f32());
+    px(if r == 0.0 { 0.0 } else { r })
 }
 
 /// Bezier control points for a wire leaving `a` to the right and entering `b` from the left.
@@ -973,6 +1014,11 @@ pub(crate) fn type_color(ty: NodeType) -> Hsla {
     hsla_of(ty.color()).unwrap_or(FALLBACK_KIND_COLOR)
 }
 
+/// The fill color for a node with this content: see [`NodeData::color`].
+pub(crate) fn data_color(data: &NodeData) -> Hsla {
+    hsla_of(data.color()).unwrap_or(FALLBACK_KIND_COLOR)
+}
+
 fn hex_of(color: Hsla) -> String {
     let rgb = Rgba::from(color);
     doc::rgb_to_hex(rgb.r, rgb.g, rgb.b)
@@ -988,5 +1034,230 @@ fn darken(color: Hsla) -> Hsla {
     Hsla {
         l: color.l * 0.75,
         ..color
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // `use super::*` would also import gpui's `test` attribute macro, which shadows the
+    // standard one, so the module names what it needs.
+    use super::{
+        Edge, FALLBACK_KIND_COLOR, Node, NodeId, NodeStyle, hex_of, hsla_of, node_key, parse_key,
+        restore_plan, segment_distance, snapshot_doc, style_from_doc, wire_distance, wrap,
+    };
+    use crate::doc::{self, EdgeDoc, GraphDoc, NodeDoc, View};
+    use crate::node_data::{
+        DataConfig, DataFormat, DatabaseConfig, NodeData, NodeType, WRITE_COLOR,
+    };
+    use gpui_kit::{Hsla, point, px};
+    use std::collections::HashMap;
+
+    fn doc_node(id: &str, kind: Option<&str>, color: Option<&str>) -> NodeDoc {
+        NodeDoc {
+            id: id.into(),
+            x: 10.0,
+            y: 20.0,
+            kind: kind.map(String::from),
+            color: color.map(String::from),
+            data: None,
+        }
+    }
+
+    fn edge_doc(from: &str, to: &str) -> EdgeDoc {
+        EdgeDoc {
+            from: from.into(),
+            to: to.into(),
+        }
+    }
+
+    fn kinds(pairs: &[(&str, &str)]) -> HashMap<String, Hsla> {
+        pairs
+            .iter()
+            .map(|(name, hex)| (name.to_string(), hsla_of(hex).unwrap()))
+            .collect()
+    }
+
+    fn graph_doc(nodes: Vec<NodeDoc>, edges: Vec<EdgeDoc>) -> GraphDoc {
+        GraphDoc {
+            version: doc::VERSION,
+            name: "t".into(),
+            view: View::default(),
+            nodes,
+            edges,
+        }
+    }
+
+    #[test]
+    fn wrap_keeps_values_inside_the_grid() {
+        let grid = px(24.0);
+        assert_eq!(wrap(px(0.0), grid), px(0.0));
+        assert_eq!(wrap(px(30.0), grid), px(6.0));
+        assert_eq!(wrap(px(-6.0), grid), px(18.0));
+        assert_eq!(wrap(px(-24.0), grid), px(0.0));
+        assert_eq!(wrap(px(-25.0), grid), px(23.0));
+    }
+
+    #[test]
+    fn wire_distance_is_zero_on_the_curve_and_grows_away_from_it() {
+        let a = point(px(0.0), px(0.0));
+        let b = point(px(200.0), px(0.0));
+        assert!(wire_distance(a, b, point(px(100.0), px(0.0))) < 0.01);
+        assert!((wire_distance(a, b, point(px(100.0), px(30.0))) - 30.0).abs() < 0.01);
+        assert!((wire_distance(a, b, point(px(-10.0), px(0.0))) - 10.0).abs() < 0.01);
+        // An S-curve between (0,0) and (200,100) passes through (100,50) at its middle.
+        let c = point(px(200.0), px(100.0));
+        assert!(wire_distance(a, c, point(px(100.0), px(50.0))) < 1.0);
+        assert!(wire_distance(a, c, point(px(100.0), px(0.0))) > 20.0);
+    }
+
+    #[test]
+    fn segment_distance_handles_degenerate_segments() {
+        assert_eq!(segment_distance((1.0, 1.0), (1.0, 1.0), (4.0, 5.0)), 5.0);
+        assert_eq!(segment_distance((0.0, 0.0), (10.0, 0.0), (5.0, 3.0)), 3.0);
+        assert_eq!(segment_distance((0.0, 0.0), (10.0, 0.0), (13.0, 4.0)), 5.0);
+    }
+
+    #[test]
+    fn node_keys_round_trip() {
+        assert_eq!(node_key(7), "n7");
+        assert_eq!(parse_key("n7"), Some(7));
+        assert_eq!(parse_key("n"), None);
+        assert_eq!(parse_key("x7"), None);
+        assert_eq!(parse_key("n-1"), None);
+        assert_eq!(parse_key("n7a"), None);
+    }
+
+    #[test]
+    fn styles_prefer_the_live_kind_then_the_saved_color_then_the_fallback() {
+        let live = kinds(&[("Note", "#ff0000")]);
+        let s = style_from_doc(&doc_node("n0", Some("Note"), Some("#00ff00")), &live).unwrap();
+        assert_eq!(s.name.as_ref(), "Note");
+        assert_eq!(hex_of(s.color), "#ff0000");
+        let s = style_from_doc(&doc_node("n0", Some("Gone"), Some("#00ff00")), &live).unwrap();
+        assert_eq!(hex_of(s.color), "#00ff00");
+        let s = style_from_doc(&doc_node("n0", Some("Gone"), Some("nope")), &live).unwrap();
+        assert_eq!(s.color, FALLBACK_KIND_COLOR);
+        assert!(style_from_doc(&doc_node("n0", None, Some("#00ff00")), &live).is_none());
+    }
+
+    #[test]
+    fn restore_keeps_numeric_ids_once_and_numbers_the_rest_above_them() {
+        let doc = graph_doc(
+            vec![
+                doc_node("n5", None, None),
+                doc_node("n2", None, None),
+                doc_node("n5", None, None),
+                doc_node("x", None, None),
+            ],
+            vec![],
+        );
+        let restored = restore_plan(&doc, &HashMap::new());
+        let ids: Vec<NodeId> = restored.nodes.iter().map(|n| n.id).collect();
+        assert_eq!(ids, [5, 2, 6, 7]);
+        assert_eq!(restored.next_id, 8);
+        assert_eq!(restored.nodes[0].pos, point(px(10.0), px(20.0)));
+        assert_eq!(
+            restore_plan(&graph_doc(vec![], vec![]), &HashMap::new()).next_id,
+            0
+        );
+    }
+
+    #[test]
+    fn restore_drops_dangling_self_and_duplicate_edges() {
+        let doc = graph_doc(
+            vec![
+                doc_node("n0", None, None),
+                doc_node("n1", None, None),
+                doc_node("n2", None, None),
+            ],
+            vec![
+                edge_doc("n0", "n1"),
+                edge_doc("n0", "n1"),
+                edge_doc("n1", "n1"),
+                edge_doc("n1", "ghost"),
+                edge_doc("ghost", "n2"),
+                edge_doc("n1", "n2"),
+            ],
+        );
+        let restored = restore_plan(&doc, &HashMap::new());
+        assert_eq!(
+            restored.edges,
+            [Edge { from: 0, to: 1 }, Edge { from: 1, to: 2 }]
+        );
+    }
+
+    #[test]
+    fn snapshots_are_sorted_and_colored_by_content_and_round_trip() {
+        let kinds = kinds(&[("Note", "#112233")]);
+        let style = |name: &str, hex: &str| {
+            Some(NodeStyle {
+                name: name.to_string().into(),
+                color: hsla_of(hex).unwrap(),
+            })
+        };
+        let nodes = vec![
+            Node {
+                id: 3,
+                pos: point(px(1.0), px(2.0)),
+                style: None,
+                data: Some(NodeData::Database(DatabaseConfig::writable())),
+            },
+            Node {
+                id: 1,
+                pos: point(px(0.0), px(0.0)),
+                style: style("Note", "#999999"),
+                data: None,
+            },
+            Node {
+                id: 2,
+                pos: point(px(5.0), px(5.0)),
+                style: style("Gone", "#abcdef"),
+                data: Some(NodeData::Data(DataConfig {
+                    path: "a.csv".into(),
+                    format: DataFormat::Csv,
+                })),
+            },
+        ];
+        let edges = vec![
+            Edge { from: 3, to: 1 },
+            Edge { from: 1, to: 2 },
+            Edge { from: 1, to: 3 },
+        ];
+        let doc = snapshot_doc("g", &nodes, &edges, point(px(5.0), px(-6.0)), &kinds);
+        assert_eq!(doc.name, "g");
+        assert_eq!((doc.view.pan_x, doc.view.pan_y), (5.0, -6.0));
+        let ids: Vec<&str> = doc.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, ["n1", "n2", "n3"]);
+        // The live kind color wins; typed content colors by content, keeping its preset
+        // name; a writable database is red.
+        assert_eq!(doc.nodes[0].color.as_deref(), Some("#112233"));
+        assert_eq!(doc.nodes[1].kind.as_deref(), Some("Gone"));
+        assert_eq!(doc.nodes[1].color.as_deref(), Some(NodeType::Data.color()));
+        assert_eq!(doc.nodes[2].kind, None);
+        assert_eq!(doc.nodes[2].color.as_deref(), Some(WRITE_COLOR));
+        let edges: Vec<(&str, &str)> = doc
+            .edges
+            .iter()
+            .map(|e| (e.from.as_str(), e.to.as_str()))
+            .collect();
+        assert_eq!(edges, [("n1", "n2"), ("n1", "n3"), ("n3", "n1")]);
+
+        let restored = restore_plan(&doc, &kinds);
+        let ids: Vec<NodeId> = restored.nodes.iter().map(|n| n.id).collect();
+        assert_eq!(ids, [1, 2, 3]);
+        assert_eq!(restored.edges.len(), 3);
+        assert_eq!(restored.next_id, 4);
+        assert_eq!(restored.nodes[2].data, nodes[0].data);
+        let again = snapshot_doc(
+            "g",
+            &restored.nodes,
+            &restored.edges,
+            point(px(5.0), px(-6.0)),
+            &kinds,
+        );
+        assert_eq!(
+            serde_json::to_value(&again).unwrap(),
+            serde_json::to_value(&doc).unwrap()
+        );
     }
 }

@@ -6602,7 +6602,9 @@ name = "uapz"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "globset",
  "gpui-kit",
+ "ignore",
  "serde",
  "serde_json",
  "ureq",
