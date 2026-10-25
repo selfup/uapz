@@ -3,6 +3,7 @@
 mod doc;
 mod exec;
 mod graph;
+mod history;
 mod inspector;
 mod library;
 mod node_data;
@@ -12,7 +13,7 @@ mod validate;
 
 use gpui_kit::*;
 use graph::{AddNode, Cancel, DeleteSelection};
-use sidebar::{NewGraph, Save, Workspace};
+use sidebar::{NewGraph, RunAll, Save, Workspace};
 
 gpui_kit::actions!(app, [Quit]);
 
@@ -26,6 +27,8 @@ fn main() {
             KeyBinding::new("cmd-s", Save, Some(sidebar::KEY_CONTEXT)),
             KeyBinding::new("ctrl-s", Save, Some(sidebar::KEY_CONTEXT)),
             KeyBinding::new("cmd-shift-n", NewGraph, Some(sidebar::KEY_CONTEXT)),
+            KeyBinding::new("cmd-enter", RunAll, Some(sidebar::KEY_CONTEXT)),
+            KeyBinding::new("ctrl-enter", RunAll, Some(sidebar::KEY_CONTEXT)),
             KeyBinding::new("cmd-n", AddNode, Some(graph::KEY_CONTEXT)),
             KeyBinding::new("ctrl-n", AddNode, Some(graph::KEY_CONTEXT)),
             KeyBinding::new("backspace", DeleteSelection, Some(graph::KEY_CONTEXT)),

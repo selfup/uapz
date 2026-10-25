@@ -21,7 +21,13 @@
 //! Text flows along the wires: a node's upstream outputs are joined and become a script's
 //! stdin, an agent's user message or a write-file node's content. Database nodes take data
 //! from their input file; the wire can only supply their SQL, and only when the node's own
-//! query is empty.
+//! query is empty. An agent can also place its inputs by name: `{{schema}}` in its prompt
+//! or message stands for the output of the upstream node named `schema` (or the node
+//! `n3` for `{{n3}}`), and the inputs no placeholder names follow as before.
+//!
+//! [`run_all_with`] runs several targets in one pass, and [`sinks`] picks the targets
+//! that cover the whole graph, for the inspector's Run all. Every output's
+//! [`content_key`] is what the run history keeps it under, through [`Cache::keep`].
 //!
 //! The [`Control`] carries a [`Cache`] of earlier outputs so a downstream run does not
 //! re-call every upstream agent, a cancel flag checked between steps and inside
@@ -54,7 +60,7 @@ use crate::doc::{GraphDoc, NodeDoc};
 use crate::library;
 use crate::node_data::{
     AgentConfig, Auth, DataConfig, DatabaseConfig, DbEngine, DirectoryConfig, FileConfig,
-    ModelType, NodeData, OutputType, Runtime, ScriptConfig, WriteMode,
+    ModelType, NodeData, NodeType, OutputType, Runtime, ScriptConfig, WriteMode,
 };
 use crate::providers::{self, Http};
 use crate::validate;
@@ -78,6 +84,9 @@ static NEVER: AtomicBool = AtomicBool::new(false);
 pub const MAX_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
 /// Most files one bundled write-file answer may create.
 pub const MAX_BUNDLE_FILES: usize = 500;
+/// Outputs over this size are not copied into the cache for the run history; the record
+/// keeps a preview of them instead.
+pub const MAX_HISTORY_BYTES: usize = 8 * 1024 * 1024;
 
 /// Where the executor looks for files and writes outputs. `root` is the working
 /// directory, which directory nodes read and write-file nodes write under.
@@ -287,6 +296,40 @@ impl Cache {
         self.entries.insert(id.to_string(), Entry { key, output });
     }
 
+    /// Keep an output under its [`content_key`] so the run history can show it later.
+    /// Only a persistent cache keeps anything, and nothing over [`MAX_HISTORY_BYTES`].
+    /// An entry already there is touched so pruning treats it as recent. Returns whether
+    /// the bytes are on disk.
+    pub fn keep(&mut self, key: Key, output: &Output) -> bool {
+        let Some((meta_path, bin_path)) = self.paths(key) else {
+            return false;
+        };
+        if output.bytes.len() > MAX_HISTORY_BYTES {
+            return false;
+        }
+        if meta_path.is_file() && bin_path.is_file() {
+            let now = std::time::SystemTime::now();
+            for path in [&meta_path, &bin_path] {
+                if let Ok(file) = std::fs::File::options().append(true).open(path) {
+                    let _ = file.set_modified(now);
+                }
+            }
+            return true;
+        }
+        match self.write(key, output) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("cache: {e}");
+                false
+            }
+        }
+    }
+
+    /// The output kept under a key, when its files are still there.
+    pub fn fetch(&self, key: Key) -> Option<Output> {
+        self.read(key)
+    }
+
     fn paths(&self, key: Key) -> Option<(PathBuf, PathBuf)> {
         let dir = self.dir.as_ref()?;
         Some((
@@ -402,8 +445,14 @@ struct Done {
     key: Key,
 }
 
-fn lock(cache: &Mutex<Cache>) -> std::sync::MutexGuard<'_, Cache> {
+pub(crate) fn lock(cache: &Mutex<Cache>) -> std::sync::MutexGuard<'_, Cache> {
     cache.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The content key of a node's output: what it contributes to the keys of the nodes after
+/// it, and what the run history keeps the output under in the cache.
+pub fn content_key(node_type: NodeType, output: &Output) -> Key {
+    key_of(&[node_type.label().as_bytes(), &output.bytes])
 }
 
 /// One key over several byte strings, with lengths mixed in so the boundaries count.
@@ -451,6 +500,21 @@ pub fn run_with(
     env: Env,
     control: &Control,
 ) -> Report {
+    run_all_with(doc, &[id.to_string()], dirs, http, env, control)
+}
+
+/// Run several targets in order, each after everything wired into it, in one pass over
+/// the graph: a node feeding two targets runs once, and a node that failed is not tried
+/// again for the next target. A failed target does not stop the others; a cancel does.
+/// The result is the last target's output, or the first error.
+pub fn run_all_with(
+    doc: &GraphDoc,
+    targets: &[String],
+    dirs: Dirs,
+    http: &dyn Http,
+    env: Env,
+    control: &Control,
+) -> Report {
     let start = Instant::now();
     let mut runner = Runner {
         doc,
@@ -460,11 +524,39 @@ pub fn run_with(
         control,
         log: Vec::new(),
         done: HashMap::new(),
+        errors: HashMap::new(),
         active: HashSet::new(),
         reused: Vec::new(),
         failed: None,
     };
-    let result = runner.run_node(id).map(|done| done.output);
+    let all = targets.len() != 1;
+    if all {
+        runner.log(format!("run all: {}", targets.join(", ")));
+    }
+    let mut result: Result<Output, String> = Err("nothing to run: no node has content".to_string());
+    let mut first_error: Option<String> = None;
+    for target in targets {
+        match runner.run_node(target) {
+            Ok(done) => result = Ok(done.output),
+            Err(e) => {
+                let cancelled = e == CANCELLED;
+                first_error.get_or_insert(e);
+                if cancelled {
+                    break;
+                }
+            }
+        }
+    }
+    if let Some(e) = first_error {
+        result = Err(e);
+    }
+    if all {
+        let finished = targets
+            .iter()
+            .filter(|t| runner.done.contains_key(*t))
+            .count();
+        runner.log(format!("run all: {finished} of {} finished", targets.len()));
+    }
     Report {
         log: runner.log,
         result,
@@ -488,6 +580,9 @@ struct Runner<'a> {
     log: Vec<String>,
     /// Nodes already run this time, so a node feeding two others runs once.
     done: HashMap<String, Done>,
+    /// Nodes that failed this time (or could not run because an input did), so a later
+    /// target does not try them again.
+    errors: HashMap<String, String>,
     /// Nodes on the current path, for cycle detection.
     active: HashSet<String>,
     /// Nodes served from the cache.
@@ -553,6 +648,9 @@ impl Runner<'_> {
         if let Some(done) = self.done.get(id) {
             return Ok(done.clone());
         }
+        if let Some(e) = self.errors.get(id) {
+            return Err(e.clone());
+        }
         if !self.active.insert(id.to_string()) {
             return Err(format!("{id} is wired in a cycle"));
         }
@@ -562,16 +660,24 @@ impl Runner<'_> {
             Ok(done) => {
                 self.done.insert(id.to_string(), done.clone());
             }
-            // An upstream failure arrives here already attributed to its node.
-            Err(e) if self.failed.is_none() => {
-                self.failed = Some(id.to_string());
-                if e != CANCELLED {
-                    self.state(id, NodeState::Failed);
+            Err(e) => {
+                self.errors.insert(id.to_string(), e.clone());
+                // An upstream failure arrives here already attributed to its node.
+                if self.failed.is_none() {
+                    self.failed = Some(id.to_string());
+                    if e != CANCELLED {
+                        self.state(id, NodeState::Failed);
+                    }
                 }
             }
-            Err(_) => {}
         }
         result
+    }
+
+    /// A node's name as a placeholder may use it: set and valid, else none.
+    fn input_name(&self, id: &str) -> Option<String> {
+        let name = self.node(id).ok()?.name.as_deref()?.trim();
+        validate::node_name(name).ok().map(|()| name.to_string())
     }
 
     fn run_fresh(&mut self, id: &str) -> Result<Done, String> {
@@ -614,7 +720,20 @@ impl Runner<'_> {
             .map(|(_, done)| done.key.to_le_bytes().to_vec())
             .collect();
         let cache_key = match data {
-            NodeData::Agent(_) => Some(cache_key(&config_json, b"", &upstream_keys)),
+            NodeData::Agent(_) => {
+                // Which input is which matters once names are in play. They only enter
+                // the key when one is set, so graphs without names keep their entries.
+                let names: Vec<String> = upstream
+                    .iter()
+                    .map(|from| self.input_name(from).unwrap_or_default())
+                    .collect();
+                let extra = if names.iter().all(String::is_empty) {
+                    Vec::new()
+                } else {
+                    names.join("\n").into_bytes()
+                };
+                Some(cache_key(&config_json, &extra, &upstream_keys))
+            }
             NodeData::Script(config) => {
                 let path = validate::resolve_inside(&self.dirs.scripts, &config.path)?;
                 let source = read_bounded(&path, MAX_FILE_BYTES)?;
@@ -634,7 +753,7 @@ impl Runner<'_> {
             self.reused.push(id.to_string());
             self.state(id, NodeState::Reused);
             return Ok(Done {
-                key: key_of(&[data.node_type().label().as_bytes(), &output.bytes]),
+                key: content_key(data.node_type(), &output),
                 output,
             });
         }
@@ -651,7 +770,20 @@ impl Runner<'_> {
                 self.run_database(config, &join_text(id, &upstream, &outputs)?)
             }
             NodeData::Agent(config) => {
-                self.run_agent(config, id, &name, &join_text(id, &upstream, &outputs)?)
+                let inputs: Vec<Input> = upstream
+                    .iter()
+                    .zip(outputs)
+                    .map(|(from, output)| Input {
+                        id: from.clone(),
+                        name: self.input_name(from),
+                        output,
+                    })
+                    .collect();
+                let filled = fill_agent(id, config, &inputs)?;
+                if let Some(note) = &filled.note {
+                    self.log(format!("{id}: {note}"));
+                }
+                self.run_agent(&filled.config, id, &name, &filled.input)
             }
             NodeData::Directory(config) => self.run_directory(config),
             NodeData::File(config) if config.bundle => {
@@ -672,7 +804,7 @@ impl Runner<'_> {
         }
         self.state(id, NodeState::Done);
         Ok(Done {
-            key: key_of(&[data.node_type().label().as_bytes(), &output.bytes]),
+            key: content_key(data.node_type(), &output),
             output,
         })
     }
@@ -1102,6 +1234,160 @@ fn split_sections(text: &str) -> Vec<(String, String)> {
         }
     }
     sections
+}
+
+/// What Run all starts from: every node with content that feeds no other node with
+/// content, in id order. Running them runs the whole graph.
+pub fn sinks(doc: &GraphDoc) -> Vec<String> {
+    let has_content = |id: &str| doc.nodes.iter().any(|n| n.id == id && n.data.is_some());
+    let mut sinks: Vec<&str> = doc
+        .nodes
+        .iter()
+        .filter(|n| n.data.is_some())
+        .filter(|n| {
+            !doc.edges
+                .iter()
+                .any(|e| e.from == n.id && has_content(&e.to))
+        })
+        .map(|n| n.id.as_str())
+        .collect();
+    sinks.sort_by_key(|id| id_order(id));
+    sinks.dedup();
+    sinks.into_iter().map(str::to_string).collect()
+}
+
+/// Node ids in numeric order (`n2` before `n10`); ids of another shape after, by text.
+fn id_order(id: &str) -> (u8, u128, &str) {
+    match id
+        .strip_prefix('n')
+        .filter(|_| validate::is_node_id(id))
+        .and_then(|digits| digits.parse::<u128>().ok())
+    {
+        Some(n) => (0, n, id),
+        None => (1, 0, id),
+    }
+}
+
+/// An upstream output as an agent's templates see it.
+struct Input {
+    id: String,
+    /// The node's name, when it has a valid one.
+    name: Option<String>,
+    output: Output,
+}
+
+/// An agent's prompt and message with their placeholders filled.
+struct Filled {
+    /// The config with the filled prompt in place of the template.
+    config: AgentConfig,
+    /// The user message: the filled message, the inputs nothing named, or both.
+    input: String,
+    /// What went where, for the log, once any placeholder was filled.
+    note: Option<String>,
+}
+
+/// Fill the `{{name}}` placeholders of an agent's prompt and message from its inputs. A
+/// placeholder names an input by the node's name, else by its id. The inputs nothing
+/// names are joined with blank lines: on their own they are the message, as for every
+/// other node; after a message with text they follow it. Binary output has no place in
+/// text.
+fn fill_agent(id: &str, config: &AgentConfig, inputs: &[Input]) -> Result<Filled, String> {
+    let mut used: Vec<usize> = Vec::new();
+    let mut lookup = |hole: &str| -> Result<String, String> {
+        let by_name: Vec<usize> = inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, input)| input.name.as_deref() == Some(hole))
+            .map(|(n, _)| n)
+            .collect();
+        let index = match by_name.as_slice() {
+            [one] => *one,
+            [] => inputs
+                .iter()
+                .position(|input| input.id == hole)
+                .ok_or_else(|| {
+                    let available: Vec<&str> = inputs
+                        .iter()
+                        .map(|input| input.name.as_deref().unwrap_or(&input.id))
+                        .collect();
+                    if available.is_empty() {
+                        format!("{id}: {{{{{hole}}}}} names no input: nothing is wired into {id}")
+                    } else {
+                        format!(
+                            "{id}: {{{{{hole}}}}} names no input; the inputs are {}",
+                            available.join(", ")
+                        )
+                    }
+                })?,
+            many => {
+                let ids: Vec<&str> = many.iter().map(|&n| inputs[n].id.as_str()).collect();
+                return Err(format!(
+                    "{id}: {{{{{hole}}}}} is ambiguous: {} share the name {hole}",
+                    ids.join(" and ")
+                ));
+            }
+        };
+        let input = &inputs[index];
+        let text = input.output.as_text().ok_or_else(|| {
+            format!(
+                "{} produced binary output ({}), which {id} can't place in text",
+                input.id, input.output.label
+            )
+        })?;
+        if !used.contains(&index) {
+            used.push(index);
+        }
+        Ok(text.to_string())
+    };
+    let prompt = validate::render(&config.prompt, &mut lookup)?;
+    let message = validate::render(&config.message, &mut lookup)?;
+
+    let mut rest: Vec<&str> = Vec::with_capacity(inputs.len());
+    for (n, input) in inputs.iter().enumerate() {
+        if used.contains(&n) {
+            continue;
+        }
+        rest.push(input.output.as_text().ok_or_else(|| {
+            format!(
+                "{} produced binary output ({}), which {id} can't take as text",
+                input.id, input.output.label
+            )
+        })?);
+    }
+    let rest = rest.join("\n\n");
+    let input = if message.trim().is_empty() {
+        rest
+    } else if rest.is_empty() {
+        message
+    } else {
+        format!("{message}\n\n{rest}")
+    };
+    let note = (!used.is_empty()).then(|| {
+        let parts: Vec<String> = inputs
+            .iter()
+            .enumerate()
+            .map(|(n, input)| {
+                if used.contains(&n) {
+                    format!(
+                        "{{{{{}}}}} from {}",
+                        input.name.as_deref().unwrap_or(&input.id),
+                        input.id
+                    )
+                } else {
+                    format!("{} appended", input.id)
+                }
+            })
+            .collect();
+        format!("placed inputs: {}", parts.join(" · "))
+    });
+    Ok(Filled {
+        config: AgentConfig {
+            prompt,
+            ..config.clone()
+        },
+        input,
+        note,
+    })
 }
 
 /// The upstream outputs as one text, blank-line separated. Binary output is an error:
@@ -1971,6 +2257,7 @@ mod tests {
             x: 0.0,
             y: 0.0,
             kind: None,
+            name: None,
             color: None,
             data,
         }
@@ -2728,6 +3015,7 @@ mod tests {
             model,
             auth: Auth::None,
             prompt: String::new(),
+            message: String::new(),
             context_size: 4096,
             temperature: 0.0,
             output,
@@ -3430,6 +3718,235 @@ mod tests {
             "{user}"
         );
         assert!(user.contains("=== src/add.rs ===\npub fn add"), "{user}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn agents_place_named_inputs_where_their_templates_say() {
+        let root = scratch("named");
+        fs::write(root.join("data/schema.txt"), "CREATE TABLE t(a)").unwrap();
+        fs::write(root.join("data/question.txt"), "how many rows?").unwrap();
+        fs::write(root.join("data/notes.txt"), "notes").unwrap();
+        let http = FakeHttp::new(
+            200,
+            r#"{"choices":[{"message":{"content":"SELECT count(*) FROM t"}}]}"#,
+        );
+        let agent = |prompt: &str, message: &str| {
+            Some(NodeData::Agent(AgentConfig {
+                prompt: prompt.into(),
+                message: message.into(),
+                ..fake_agent()
+            }))
+        };
+        let doc = |agent: Option<NodeData>, names: [Option<&str>; 3]| {
+            let mut nodes = vec![
+                node("n0", data("schema.txt", DataFormat::Text)),
+                node("n1", data("question.txt", DataFormat::Text)),
+                node("n2", data("notes.txt", DataFormat::Text)),
+            ];
+            for (n, name) in nodes.iter_mut().zip(names) {
+                n.name = name.map(str::to_string);
+            }
+            nodes.push(node("n3", agent));
+            graph(nodes, &[("n0", "n3"), ("n1", "n3"), ("n2", "n3")])
+        };
+        let go = |doc: &GraphDoc| run(doc, "n3", Dirs::under(&root), &http, &with_key);
+        let messages = |i: usize| -> Vec<(String, String)> {
+            http.seen.lock().unwrap()[i].body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| {
+                    (
+                        m["role"].as_str().unwrap().to_string(),
+                        m["content"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect()
+        };
+        let names = [Some("schema"), Some("question"), None];
+        let pair = |role: &str, text: &str| (role.to_string(), text.to_string());
+
+        // Placeholders in the prompt and the message; the unnamed input follows the
+        // message; the log says what went where.
+        let report = go(&doc(
+            agent("Schema:\n{{schema}}", "Q: {{ question }}"),
+            names,
+        ));
+        report.result.as_ref().expect("agent run");
+        assert_eq!(
+            messages(0),
+            [
+                pair("system", "Schema:\nCREATE TABLE t(a)"),
+                pair("user", "Q: how many rows?\n\nnotes"),
+            ]
+        );
+        assert!(
+            report.log.iter().any(|l| l
+                == "n3: placed inputs: {{schema}} from n0 · {{question}} from n1 · n2 appended"),
+            "{:?}",
+            report.log
+        );
+
+        // An id works as a name, and a prompt that places every input with no message
+        // left becomes the user message, as a prompt with no input always has.
+        go(&doc(agent("{{schema}} {{n1}} {{n2}}", ""), names))
+            .result
+            .expect("ids as names");
+        assert_eq!(
+            messages(1),
+            [pair("user", "CREATE TABLE t(a) how many rows? notes")]
+        );
+
+        // No placeholders: the inputs joined in id order, and nothing to say about it.
+        let plain = go(&doc(agent("Summarize.", ""), names));
+        plain.result.as_ref().expect("plain run");
+        assert_eq!(
+            messages(2)[1],
+            pair("user", "CREATE TABLE t(a)\n\nhow many rows?\n\nnotes")
+        );
+        assert!(!plain.log.iter().any(|l| l.contains("placed inputs")));
+
+        // Unknown and ambiguous placeholders are errors before anything is sent.
+        let calls = http.seen.lock().unwrap().len();
+        assert_eq!(
+            go(&doc(agent("{{nope}}", ""), names)).result.unwrap_err(),
+            "n3: {{nope}} names no input; the inputs are schema, question, n2"
+        );
+        assert_eq!(
+            go(&doc(
+                agent("{{schema}}", ""),
+                [Some("schema"), Some("schema"), None]
+            ))
+            .result
+            .unwrap_err(),
+            "n3: {{schema}} is ambiguous: n0 and n1 share the name schema"
+        );
+        let alone = graph(vec![node("n3", agent("{{x}}", ""))], &[]);
+        assert_eq!(
+            go(&alone).result.unwrap_err(),
+            "n3: {{x}} names no input: nothing is wired into n3"
+        );
+        assert_eq!(http.seen.lock().unwrap().len(), calls);
+
+        // A name that does not validate is no name: the node is still reachable by id,
+        // and unnamed inputs follow a message that has text.
+        go(&doc(agent("{{n0}}", "ask"), [Some("bad name"), None, None]))
+            .result
+            .expect("invalid names are ignored");
+        assert_eq!(
+            messages(calls)[1],
+            pair("user", "ask\n\nhow many rows?\n\nnotes")
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn naming_an_input_is_part_of_the_agents_cache_key() {
+        let root = scratch("named-cache");
+        fs::write(root.join("data/a.txt"), "v1").unwrap();
+        let http = FakeHttp::new(200, r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+        let mut doc = graph(
+            vec![
+                node("n0", data("a.txt", DataFormat::Text)),
+                node("n1", Some(NodeData::Agent(fake_agent()))),
+            ],
+            &[("n0", "n1")],
+        );
+        let (control, _) = recording_control();
+        let calls = || http.seen.lock().unwrap().len();
+        let reused = |doc: &GraphDoc| {
+            run_with(doc, "n1", Dirs::under(&root), &http, &with_key, &control)
+                .reused
+                .len()
+        };
+        assert_eq!((reused(&doc), calls()), (0, 1));
+        assert_eq!((reused(&doc), calls()), (1, 1));
+        doc.nodes[0].name = Some("schema".into());
+        assert_eq!((reused(&doc), calls()), (0, 2), "the name enters the key");
+        assert_eq!((reused(&doc), calls()), (1, 2));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn run_all_covers_every_sink_once_and_outlives_a_failure() {
+        let root = scratch("run-all");
+        fs::write(root.join("data/a.txt"), "v1").unwrap();
+        fs::write(root.join("scripts/count.sh"), "wc -c | tr -d ' '\n").unwrap();
+        fs::write(root.join("scripts/fail.sh"), "exit 2\n").unwrap();
+        let http = FakeHttp::new(200, "{}");
+        // n0 feeds n1 and n2; n2 fails and feeds n3; n1 feeds n10, which feeds only the
+        // blank n4. The sinks are n3 and n10, in numeric order.
+        let doc = graph(
+            vec![
+                node("n0", data("a.txt", DataFormat::Text)),
+                node("n1", shell("count.sh", &[], 10)),
+                node("n2", shell("fail.sh", &[], 10)),
+                node("n3", shell("count.sh", &[], 10)),
+                node("n4", None),
+                node("n10", shell("count.sh", &[], 10)),
+            ],
+            &[
+                ("n0", "n1"),
+                ("n0", "n2"),
+                ("n2", "n3"),
+                ("n1", "n10"),
+                ("n10", "n4"),
+            ],
+        );
+        assert_eq!(sinks(&doc), ["n3", "n10"]);
+        assert!(sinks(&graph(vec![node("n0", None)], &[])).is_empty());
+        let states = |seen: &Arc<Mutex<Vec<Progress>>>, id: &str| -> Vec<NodeState> {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter_map(|p| match p {
+                    Progress::Node { id: i, state } if i == id => Some(*state),
+                    _ => None,
+                })
+                .collect()
+        };
+        let (control, seen) = recording_control();
+        let go = |targets: &[String], control: &Control| {
+            run_all_with(&doc, targets, Dirs::under(&root), &http, &no_env, control)
+        };
+
+        let report = go(&sinks(&doc), &control);
+        let err = report.result.unwrap_err();
+        assert!(err.contains("fail.sh"), "{err}");
+        assert_eq!(report.failed.as_deref(), Some("n2"));
+        let mut ran: Vec<&str> = report.outputs.keys().map(String::as_str).collect();
+        ran.sort();
+        assert_eq!(ran, ["n0", "n1", "n10"]);
+        assert_eq!(report.log[0], "run all: n3, n10");
+        assert_eq!(report.log.last().unwrap(), "run all: 1 of 2 finished");
+        // The shared input ran once; the failure was marked once.
+        assert_eq!(states(&seen, "n0"), [NodeState::Running, NodeState::Done]);
+        assert_eq!(states(&seen, "n2"), [NodeState::Running, NodeState::Failed]);
+
+        // A target asked for twice, or after a failed input, is not run or retried.
+        seen.lock().unwrap().clear();
+        let twice: Vec<String> = ["n3", "n10", "n3", "n10"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let report = go(&twice, &control);
+        assert_eq!(report.log.last().unwrap(), "run all: 2 of 4 finished");
+        assert_eq!(states(&seen, "n2").len(), 2);
+        assert_eq!(states(&seen, "n10"), [NodeState::Reused]);
+
+        // A cancel stops before the first target; nothing to run is an error.
+        let cancelled = Control {
+            cancel: Arc::new(AtomicBool::new(true)),
+            ..control.clone()
+        };
+        let report = go(&sinks(&doc), &cancelled);
+        assert_eq!(report.result.unwrap_err(), CANCELLED);
+        assert!(report.outputs.is_empty());
+        assert_eq!(
+            go(&[], &control).result.unwrap_err(),
+            "nothing to run: no node has content"
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 

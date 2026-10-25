@@ -61,10 +61,10 @@ an inspector on the right. Drag the divider beside either side panel to resize i
   the toolbar dropdown has selected: **Blank**, one of the six types, **Database
   (write)**, or a saved kind.
 - Escape cancels a drag and clears the selection.
-- A typed node shows its label (its type, or the preset it came from) and a one-line
-  summary such as `Ollama · llama3.1` or `SQLite · sales.sqlite`. Red nodes write: a
-  database node whose read-only switch is off (its summary says `· write`) and a **Write
-  file** node.
+- A typed node shows its label (its name if it has one, else its type or the preset it
+  came from) and a one-line summary such as `Ollama · llama3.1` or `SQLite ·
+  sales.sqlite`. Red nodes write: a database node whose read-only switch is off (its
+  summary says `· write`) and a **Write file** node.
 - The dots in the nodes' corners follow the latest run. Press Run and every node that
   takes part gets a hollow dot; each turns the accent color while its own step runs, then
   green when it ran and produced output, grey when its output came from the cache, red
@@ -77,6 +77,10 @@ an inspector on the right. Drag the divider beside either side panel to resize i
 
 - Select a node and its content appears as a form. Every edit writes straight back into
   the node; nothing is saved to disk until you save the graph or a preset.
+- **Name**, at the top of every node's form, labels the node on the canvas and lets an
+  agent wired after it write `{{name}}` for its output. Names are letters, digits, `_`
+  and `-`, start with a letter, and must be unique to be useful; the panel says when one
+  is not.
 - A blank node offers buttons to give it content: the six types plus **Database (write)**,
   a database node that starts with its read-only switch off. A typed node can change type
   or go back to blank at the bottom of the panel.
@@ -86,6 +90,12 @@ an inspector on the right. Drag the divider beside either side panel to resize i
   the field next to it and labels the node with that name. Invalid configs are refused.
 - In an agent, **Save prompt** writes the prompt text to `prompts/<name>.md`. Clicking a
   prompt in the sidebar loads it into the selected agent.
+- An agent's **Message** is the user message. Empty sends the inputs joined with blank
+  lines, as before. Otherwise `{{name}}` in it, or in the prompt, is replaced by that
+  input's output, and the inputs nothing names follow the message. The **Inputs** list
+  under the form shows each wired node, how to address it (`{{schema}}` or `n2`), where
+  it ends up, and what it produced last time. A placeholder that names nothing is
+  reported as a problem before you run.
 - **Run** executes the selected node after everything wired into it. While it runs, the
   log grows line by line and an agent's answer streams into a preview as it is generated;
   **Cancel** stops it. The result and the log appear under the form of the node you ran;
@@ -93,8 +103,14 @@ an inspector on the right. Drag the divider beside either side panel to resize i
   cache. **Run fresh** ignores the cache. See *Running nodes*.
 - Every node that took part in a run keeps its result. Select a node in the middle of the
   graph and **Last output** shows what it produced (its saved file, a text preview) or why
-  it failed, with a warning when the node has been edited since. Loading another graph
-  forgets these.
+  it failed, with a warning when the node has been edited since. Under it, **Previous**
+  shows the same node's output from the run before, or says it was the same, and notes
+  when the node was configured differently then. Loading another graph forgets these.
+- **Runs**, at the bottom of the panel whatever is selected, lists the graph's past runs
+  (newest first, times in UTC) with **Run all** and **Clear**. Click a run to bring back
+  its outputs, dots and log without running anything; the status line says so. **Run all**
+  (also cmd-enter and the toolbar button) runs every end node of the graph in one pass.
+  See *Running nodes*.
 
 **Sidebar**
 
@@ -221,9 +237,32 @@ and hands that to the node:
 | Data | Reads the file (up to 64 MB) | nothing | the file; text for CSV, TSV, JSON, Text and Markdown, binary otherwise |
 | Script | `uv run --quiet <file>`, `sh`/`bash`/`zsh <file>` or `node <file>` with the arguments, in `scripts/` | stdin | stdout as text; non-zero exit or the timeout is an error |
 | Database | `sqlite3 -json`, `duckdb -json`, `psql --csv` or `mysql --batch` with the query on stdin | the SQL to run, only when the node's own query is empty; data comes from the input file | rows as JSON (file engines) or CSV/TSV (server engines) |
-| Agent | One request to the provider | the user message | text, JSON, an embedding vector or an image, saved to `agents/<name>/outputs/` |
+| Agent | One request to the provider | the user message, or the `{{name}}` placeholders of its prompt and message | text, JSON, an embedding vector or an image, saved to `agents/<name>/outputs/` |
 | Directory | Walks the directory (hidden entries and symlinks skipped, `.gitignore` honored when asked, 32 levels deep) | nothing | text: `Directory <path>: N files matched`, one line per file with its size, then `=== path ===` sections with contents until the budget is spent; binary files are named, not shown |
 | Write file | Creates, replaces or appends to the file, after checking the path again and resolving symlinks | the content | the content it wrote, with the file's path in the status line |
+
+**Named inputs.** Give an upstream node a name in the inspector and an agent after it can
+write `{{name}}` in its prompt or its message; `{{n2}}` addresses a node by id. Each
+placeholder is replaced by that input's text, and the inputs no placeholder names are
+joined with blank lines and follow the message (or are the message when the message is
+empty, which is what every other node gets). A prompt that places every input and leaves
+no message becomes the user message, as a prompt with no input always has. A placeholder
+that names nothing, or a name two inputs share, is an error before anything is sent; a
+name that does not validate is ignored, and the node stays reachable by id. The log says
+what went where: `n3: placed inputs: {{schema}} from n0 · {{question}} from n1 · n2
+appended`. Names are part of an agent's cache key, so naming an input is an edit;
+graphs without names keep their cached entries.
+
+**Run all and the run history.** **Run all** picks every node with content that feeds no
+other node with content (the end nodes, in id order) and runs them in one pass: a node two
+of them share runs once, a failed node is not tried again for the next target, and a
+failed target does not stop the others. Every finished run is written to
+`runs/<graph>/<timestamp>.json` with its log, outcome, targets, and for every node its
+state, its content at the time, the label and a 4000-character preview of its output, and
+the content key under which `cache/` holds the full bytes (outputs over 8 MB keep only the
+preview). Two hundred records are kept per graph; unsaved graphs file under `untitled`.
+The **Runs** list in the inspector reopens any of them without running, and **Previous**
+under a node's last output compares the two runs.
 
 **Streaming.** Generative agents are asked for a streamed reply (`stream: true`, or
 Google's `streamGenerateContent`), the body is read as it arrives, and every piece of text
@@ -323,7 +362,7 @@ enforced now, at edit time, and are meant to be re-checked at run time.
   only point at an existing file with a runtime-matching extension and pass bounded
   arguments. Write-file nodes refuse `scripts/` and every other directory the app manages,
   at edit time and again at run time, so a run can never create a script, an agent, a
-  prompt, a database preset, a kind or a graph.
+  prompt, a database preset, a kind, a graph, a cache entry or a run record.
 - **Write-file paths are the user's.** The path is a setting on the node; nothing on the
   wire can choose it. It is resolved with symlinks followed and must stay under the working
   directory, missing directories included.
@@ -355,11 +394,13 @@ are plain text, so they are easy to commit, diff or hand-edit.
 | `scripts/` | Script files for script nodes (`.py`, `.sh`, `.js`, …) |
 | `data/` | Data files and database files for data and database nodes; write-file nodes may write here |
 | `cache/<key>.json`, `cache/<key>.bin` | The executor's output cache, by content hash; safe to delete |
+| `runs/<graph>/<timestamp>.json` | One record per run: log, outcome, every node's state, content and output preview; safe to delete |
 
 ### `graphs/<name>.md`
 
-Node ids are stable, labeled nodes carry a `style` line with their color, and GitHub,
-VS Code and most Markdown tools render the block.
+Node ids are stable, a node's label is its name (else the kind it was made from), labeled
+nodes carry a `style` line with their color, and GitHub, VS Code and most Markdown tools
+render the block.
 
 ````markdown
 # pipeline
@@ -378,8 +419,9 @@ flowchart LR
 ### `graphs/<name>.json`
 
 One object per node with its position, an optional `kind` (the saved kind or preset it was
-made from), a `color` copied at save time, and `data`: `{}` for a blank node, or a typed
-object tagged with `"type"`.
+made from), an optional `name` (the node's own, for the canvas and for `{{name}}`), a
+`color` copied at save time, and `data`: `{}` for a blank node, or a typed object tagged
+with `"type"`. An agent's `message` is written only when it is not empty.
 
 ```json
 {
@@ -395,15 +437,15 @@ object tagged with `"type"`.
         "model_type": "generative",
         "model": "claude-opus-5-5",
         "auth": { "kind": "env", "var": "ANTHROPIC_API_KEY" },
-        "prompt": "Summarize the input in three bullets.",
+        "prompt": "Summarize {{notes}} in three bullets.",
         "context_size": 8192,
         "temperature": 0.3,
         "output": "text"
       }
     },
-    { "id": "n1", "x": 460.0, "y": 330.0, "data": {} }
+    { "id": "n1", "x": 460.0, "y": 330.0, "name": "notes", "data": {} }
   ],
-  "edges": [{ "from": "n0", "to": "n1" }]
+  "edges": [{ "from": "n1", "to": "n0" }]
 }
 ```
 
@@ -416,6 +458,7 @@ ids and `-->` edges (node shapes and `|labels|` are tolerated) and laid out left
 | --- | --- |
 | cmd-s, ctrl-s | Save graph |
 | cmd-shift-n | New graph |
+| cmd-enter, ctrl-enter | Run all |
 | cmd-n, ctrl-n | Add node of the selected kind or type |
 | Backspace, Delete | Delete selection |
 | Escape | Cancel drag, clear selection |

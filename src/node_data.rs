@@ -375,8 +375,14 @@ pub struct AgentConfig {
     pub model_type: ModelType,
     pub model: String,
     pub auth: Auth,
-    /// System prompt. Reusable prompts live in `prompts/` and are copied in.
+    /// System prompt. Reusable prompts live in `prompts/` and are copied in. `{{name}}`
+    /// stands for the output of the upstream node with that name (or id).
     pub prompt: String,
+    /// The user message. Empty sends the inputs joined with blank lines. Otherwise this
+    /// text is sent with its `{{name}}` placeholders filled, followed by the inputs that
+    /// neither it nor the prompt names.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub message: String,
     /// Context window to request, in tokens.
     pub context_size: u32,
     pub temperature: f32,
@@ -392,6 +398,7 @@ impl Default for AgentConfig {
             model: Provider::Ollama.default_model().to_string(),
             auth: Auth::None,
             prompt: String::new(),
+            message: String::new(),
             context_size: 8192,
             temperature: 0.7,
             output: OutputType::Text,
@@ -484,6 +491,9 @@ impl AgentConfig {
         }
         if let Err(e) = validate::text("prompt", &self.prompt, MAX_PROMPT_LEN) {
             issues.push(Issue::new("prompt", e));
+        }
+        if let Err(e) = validate::text("message", &self.message, MAX_PROMPT_LEN) {
+            issues.push(Issue::new("message", e));
         }
         issues
     }

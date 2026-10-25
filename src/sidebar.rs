@@ -15,12 +15,12 @@ use gpui_kit::component::color_picker::{ColorPicker, ColorPickerState};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
-use gpui_kit::component::{ActiveTheme, IndexPath, Sizable, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Disableable, IndexPath, Sizable, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::collections::HashSet;
 
-gpui_kit::actions!(workspace, [Save, NewGraph]);
+gpui_kit::actions!(workspace, [Save, NewGraph, RunAll]);
 
 pub const KEY_CONTEXT: &str = "Workspace";
 /// Initial sidebar width; the divider next to it resizes it.
@@ -227,6 +227,8 @@ impl Workspace {
         let snapshot = self.graph.read(cx).snapshot(&name);
         match doc::save(&snapshot) {
             Ok((md, json)) => {
+                self.inspector
+                    .update(cx, |inspector, cx| inspector.set_graph_name(&name, cx));
                 self.current = Some(name);
                 self.ok(format!("Saved {} and {}", md.display(), json.display()));
             }
@@ -242,6 +244,8 @@ impl Workspace {
             Ok(doc) => {
                 let (nodes, edges) = (doc.nodes.len(), doc.edges.len());
                 self.graph.update(cx, |graph, cx| graph.restore(&doc, cx));
+                self.inspector
+                    .update(cx, |inspector, cx| inspector.set_graph_name(name, cx));
                 self.name.update(cx, |input, cx| {
                     input.set_value(name.to_string(), window, cx)
                 });
@@ -257,6 +261,8 @@ impl Workspace {
 
     fn new_graph(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.graph.update(cx, |graph, cx| graph.clear(cx));
+        self.inspector
+            .update(cx, |inspector, cx| inspector.set_graph_name("untitled", cx));
         self.name
             .update(cx, |input, cx| input.set_value("untitled", window, cx));
         self.current = None;
@@ -266,6 +272,11 @@ impl Workspace {
 
     fn on_save(&mut self, _: &Save, _: &mut Window, cx: &mut Context<Self>) {
         self.save_now(cx);
+    }
+
+    fn on_run_all(&mut self, _: &RunAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.inspector
+            .update(cx, |inspector, cx| inspector.run_all(false, cx));
     }
 
     fn on_new(&mut self, _: &NewGraph, window: &mut Window, cx: &mut Context<Self>) {
@@ -840,6 +851,7 @@ impl Render for Workspace {
             let graph = self.graph.read(cx);
             (graph.node_count(), graph.edge_count())
         };
+        let running = self.inspector.read(cx).running();
         let toolbar = h_flex()
             .flex_shrink_0()
             .gap_2()
@@ -870,6 +882,17 @@ impl Render for Workspace {
                     .label("Clear")
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.graph.update(cx, |graph, cx| graph.clear(cx))
+                    })),
+            )
+            .child(
+                Button::new("run-all")
+                    .outline()
+                    .small()
+                    .label(if running { "Running…" } else { "Run all" })
+                    .disabled(running || node_count == 0)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.inspector
+                            .update(cx, |inspector, cx| inspector.run_all(false, cx))
                     })),
             )
             .child(
@@ -964,6 +987,7 @@ impl Render for Workspace {
             .key_context(KEY_CONTEXT)
             .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::on_new))
+            .on_action(cx.listener(Self::on_run_all))
             .size_full()
             .child(
                 h_resizable("layout")

@@ -46,6 +46,10 @@ pub struct NodeDoc {
     /// Name of the custom node kind this node was created from, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// The node's own name: its canvas label, and what `{{name}}` in an agent's prompt
+    /// refers to. See [`validate::node_name`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// `#rrggbb` fill, copied from the kind at save time so the graph renders without it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
@@ -69,11 +73,16 @@ fn version() -> u32 {
 }
 
 impl GraphDoc {
-    /// The diagram as a mermaid flowchart. Nodes are empty, so each gets a blank label.
+    /// The diagram as a mermaid flowchart. A node is labeled with its name, else the kind
+    /// it was made from, else a blank.
     pub fn mermaid(&self) -> String {
         let mut out = String::from("flowchart LR\n");
         for node in &self.nodes {
-            let label = node.kind.as_deref().map_or(" ".to_string(), mermaid_label);
+            let label = node
+                .name
+                .as_deref()
+                .or(node.kind.as_deref())
+                .map_or(" ".to_string(), mermaid_label);
             out.push_str(&format!("    {}[\"{label}\"]\n", node.id));
         }
         for edge in &self.edges {
@@ -359,6 +368,7 @@ pub fn parse_markdown(text: &str) -> GraphDoc {
                 color: None,
                 data: None,
                 kind,
+                name: None,
             })
             .collect(),
         edges,
@@ -508,6 +518,7 @@ mod tests {
                     x: 1.0,
                     y: 2.0,
                     kind: None,
+                    name: None,
                     color: None,
                     data: None,
                 },
@@ -516,6 +527,7 @@ mod tests {
                     x: 3.0,
                     y: 4.0,
                     kind: Some("Fetch".into()),
+                    name: None,
                     color: Some("#ff8800".into()),
                     data: Some(NodeData::Data(DataConfig {
                         path: "a.csv".into(),
@@ -642,6 +654,7 @@ mod tests {
                     x: 400.0,
                     y: 250.0,
                     kind: Some("My Agent".into()),
+                    name: None,
                     color: None,
                     data: None,
                 },
@@ -650,6 +663,7 @@ mod tests {
                     x: 900.0,
                     y: 600.0,
                     kind: None,
+                    name: None,
                     color: None,
                     data: None,
                 },
@@ -688,6 +702,7 @@ mod tests {
                 x: 0.0,
                 y: 0.0,
                 kind: Some(r#"a "quoted" name"#.into()),
+                name: None,
                 color: None,
                 data: None,
             }],
