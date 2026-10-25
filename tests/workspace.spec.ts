@@ -1,318 +1,5 @@
-import { test, expect, type Page } from "@playwright/test";
+import { test, expect, parent } from "./support/workspace";
 import { defaultNodeData } from "../frontend/graph";
-import type { GraphDoc, NodeType } from "../frontend/types";
-
-const leaf: GraphDoc = {
-  version: 1,
-  name: "Extract",
-  view: { pan_x: 50, pan_y: 30, zoom: 1 },
-  nodes: [
-    {
-      id: "n0",
-      name: "Original source",
-      x: 50,
-      y: 70,
-      data: {
-        ...defaultNodeData("input"),
-        type: "input",
-        kind: "text",
-        default: "Example",
-        required: true,
-      },
-    },
-  ],
-  edges: [],
-  outputs: { heading: "n0", body: "n0" },
-};
-const child: GraphDoc = {
-  version: 1,
-  name: "Parts",
-  view: { pan_x: 40, pan_y: 30, zoom: 1 },
-  nodes: [
-    {
-      id: "n4",
-      name: "Extract content",
-      x: 80,
-      y: 70,
-      data: { type: "workflow", graph: "Extract", output: "", inputs: {} },
-    },
-  ],
-  edges: [],
-  outputs: { heading: "n4.heading", body: "n4.body" },
-};
-const parent: GraphDoc = {
-  version: 1,
-  name: "Demo",
-  view: { pan_x: 30, pan_y: 30, zoom: 1 },
-  nodes: [
-    {
-      id: "n0",
-      name: "message",
-      x: 20,
-      y: 60,
-      data: {
-        type: "input",
-        kind: "text",
-        default: "Draft text",
-        required: true,
-      },
-    },
-    {
-      id: "n1",
-      name: "Create parts",
-      x: 320,
-      y: 60,
-      data: { type: "workflow", graph: "Parts", output: "", inputs: {} },
-    },
-    {
-      id: "n2",
-      name: "Save heading",
-      x: 320,
-      y: 340,
-      data: {
-        type: "file",
-        path: "heading.md",
-        mode: "overwrite",
-        unfence: false,
-        bundle: false,
-        review: true,
-      },
-    },
-  ],
-  edges: [
-    { from: "n0", to: "n1" },
-    { from: "n1", output: "heading", to: "n2" },
-  ],
-  outputs: { heading: "n1.heading", body: "n1.body" },
-};
-
-async function mockService(page: Page) {
-  const catalog = (
-    [
-      "input",
-      "workflow",
-      "agent",
-      "database",
-      "script",
-      "data",
-      "directory",
-      "file",
-    ] as NodeType[]
-  ).map((type) => ({
-    type,
-    label: type,
-    color: "#8888cc",
-    data: defaultNodeData(type),
-  }));
-  await page.addInitScript(
-    ({ parent, child, leaf, catalog }) => {
-      const host = window as unknown as {
-        isTauri: boolean;
-        __TAURI_INTERNALS__: {
-          invoke: (
-            command: string,
-            payload: { method: string; args: Record<string, any> },
-          ) => Promise<any>;
-        };
-        __testState: any;
-      };
-      host.isTauri = true;
-      const state: any = {
-        graphs: { Demo: parent, Parts: child, Extract: leaf },
-        runtime: null,
-        history: [],
-        calls: [],
-        saved: null,
-      };
-      host.__testState = state;
-      host.__TAURI_INTERNALS__ = {
-        invoke: async (command, { method, args = {} }) => {
-          if (command !== "request")
-            throw new Error(`Unexpected IPC ${command}`);
-          state.calls.push({ method, args: structuredClone(args) });
-          switch (method) {
-            case "bootstrap":
-              return {
-                workspace: "/test/workspace",
-                graphs: Object.keys(state.graphs),
-                kinds: [],
-                agents: [],
-                databases: [],
-                prompts: [],
-                scripts: [],
-                data: [],
-                catalog: {
-                  nodes: catalog,
-                  providers: [],
-                  model_types: [],
-                  outputs: [],
-                  engines: [],
-                  runtimes: [],
-                  formats: [],
-                  write_modes: [],
-                  input_types: [],
-                },
-              };
-            case "load_graph":
-              return structuredClone(state.graphs[args.name]);
-            case "save_graph":
-              state.saved = structuredClone(args.doc);
-              state.graphs[args.doc.name] = state.saved;
-              return {
-                name: args.doc.name,
-                json: "graphs/Demo.json",
-                markdown: "graphs/Demo.md",
-              };
-            case "validate_node":
-              return [];
-            case "validate_graph":
-              return { issues: [], fields: [], sinks: ["n2"] };
-            case "workflow_fields":
-              return [];
-            case "history":
-              return structuredClone(state.history);
-            case "runtime_state":
-              return structuredClone(state.runtime);
-            case "prepare_run":
-              return {
-                targets: args.targets || ["n2"],
-                fields: [
-                  {
-                    node: "n0",
-                    name: "message",
-                    config: {
-                      kind: "text",
-                      default: "Draft text",
-                      required: true,
-                    },
-                  },
-                ],
-                inputs: { message: "Draft text" },
-              };
-            case "start_run":
-              state.runtime = {
-                run_id: "live-1",
-                running: true,
-                cancelling: false,
-                graph: structuredClone(args.doc),
-                targets: ["n2"],
-                marks: { n0: "ran", n1: "ran", n2: "running", "n1/n4": "ran" },
-                log: ["n1/n4: completed"],
-                stream: null,
-                workflows: {
-                  n1: structuredClone(child),
-                  "n1/n4": structuredClone(leaf),
-                },
-                review: {
-                  id: "review-1",
-                  node: "n2",
-                  files: [
-                    {
-                      path: "heading.md",
-                      before_bytes: null,
-                      after_bytes: 8,
-                      diff: "+ Example\n",
-                    },
-                  ],
-                },
-                run: null,
-                error: null,
-              };
-              return { run_id: "live-1" };
-            case "review": {
-              if (args.review_id !== "review-1" || args.run_id !== "live-1")
-                throw new Error("Stale review");
-              state.runtime.running = false;
-              state.runtime.review = null;
-              const result = {
-                state: "ran",
-                preview: "Example",
-                label: "Text · 7 bytes",
-                complete: true,
-              };
-              state.runtime.run = {
-                id: "20261025T120000000Z",
-                graph: "Demo",
-                targets: ["n2"],
-                elapsed_ms: 100,
-                inputs: { message: "Keep this input" },
-                nodes: {
-                  n0: result,
-                  n1: {
-                    ...result,
-                    named_outputs: {
-                      heading: result,
-                      body: { ...result, preview: "Body text" },
-                    },
-                  },
-                  n2: result,
-                },
-                log: ["Completed"],
-                outcome: { kind: args.decision === "apply" ? "ok" : "failed" },
-                workflows: state.runtime.workflows,
-                calls: {},
-              };
-              state.history = [state.runtime.run];
-              return null;
-            }
-            case "cancel_run":
-              state.runtime.running = false;
-              state.runtime.review = null;
-              state.runtime.run = {
-                id: "cancelled",
-                graph: "Demo",
-                targets: ["n2"],
-                elapsed_ms: 10,
-                inputs: {},
-                nodes: {},
-                log: [],
-                outcome: { kind: "cancelled" },
-                workflows: state.runtime.workflows,
-              };
-              state.history = [state.runtime.run];
-              return null;
-            case "clear_cache":
-              return 3;
-            case "clear_history":
-              state.history = [];
-              return 1;
-            case "output":
-              return {
-                text: "Example full output",
-                base64: null,
-                label: "Text",
-                saved: null,
-                complete: true,
-              };
-            default:
-              throw new Error(`Unexpected method ${method}`);
-          }
-        },
-      };
-    },
-    { parent, child, leaf, catalog },
-  );
-}
-
-const browserErrors = new WeakMap<Page, string[]>();
-test.beforeEach(async ({ page }) => {
-  const errors: string[] = [];
-  browserErrors.set(page, errors);
-  page.on("pageerror", (error) => errors.push(error.message));
-  page.on("console", (message) => {
-    if (["error", "warning"].includes(message.type()))
-      errors.push(message.text());
-  });
-  await mockService(page);
-  await page.goto("/");
-  await page
-    .locator(".library")
-    .getByRole("button", { name: "Demo", exact: true })
-    .click();
-});
-test.afterEach(async ({ page }) => {
-  expect(browserErrors.get(page)).toEqual([]);
-});
 
 test("named ports, searchable library and graph edits roundtrip without changing wire handles", async ({
   page,
@@ -504,4 +191,140 @@ test("unsaved edits can be kept or discarded in the desktop confirmation dialog"
   await expect(
     page.getByRole("heading", { name: "Build a workflow" }),
   ).toBeVisible();
+});
+
+test("saved preset labels and colors survive editing and reopening typed nodes", async ({
+  page,
+}, testInfo) => {
+  const nodes = [
+    {
+      id: "n0",
+      x: 20,
+      y: 60,
+      color: "#22c55e",
+      data: { type: "data", path: "cities.csv", format: "csv" },
+    },
+    {
+      id: "n1",
+      x: 320,
+      y: 60,
+      kind: "Name Every City",
+      color: "#ab67cd",
+      data: defaultNodeData("agent"),
+    },
+    {
+      id: "n2",
+      x: 320,
+      y: 340,
+      color: "#f59e0b",
+      data: defaultNodeData("script"),
+    },
+  ];
+  await page.evaluate((nodes) => {
+    (window as any).__testState.graphs.Demo.nodes = nodes;
+  }, nodes);
+  await page
+    .locator(".library")
+    .getByRole("button", { name: "Demo", exact: true })
+    .click();
+  const card = page.locator('[data-id="n1"] .graph-card');
+  await expect(card.locator(".graph-card-title")).toHaveText("Name Every City");
+  await expect(card).toHaveCSS("border-left-color", "rgb(171, 103, 205)");
+  await expect(page.locator('[data-id="n0"] .graph-card')).toHaveCSS(
+    "border-left-color",
+    "rgb(34, 197, 94)",
+  );
+  await expect(page.locator('[data-id="n2"] .graph-card')).toHaveCSS(
+    "border-left-color",
+    "rgb(245, 158, 11)",
+  );
+  await card.click();
+  await expect(page.locator(".inspector h2")).toHaveText("Name Every City");
+  await page
+    .getByLabel("System prompt", { exact: true })
+    .fill("List each city.");
+  await expect(card).toHaveCSS("border-left-color", "rgb(171, 103, 205)");
+  await page.screenshot({
+    path: testInfo.outputPath("node-labels-and-colors.png"),
+    fullPage: true,
+  });
+  await page.getByLabel("Name", { exact: true }).fill("cityNames");
+  await expect(card.locator(".graph-card-title")).toHaveText("cityNames");
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  const saved = await page.evaluate(() =>
+    (window as any).__testState.saved.nodes.find(
+      (node: any) => node.id === "n1",
+    ),
+  );
+  expect(saved).toMatchObject({
+    name: "cityNames",
+    kind: "Name Every City",
+    color: "#ab67cd",
+    data: { prompt: "List each city." },
+  });
+  await page
+    .locator(".library")
+    .getByRole("button", { name: "Demo", exact: true })
+    .click();
+  await expect(card.locator(".graph-card-title")).toHaveText("cityNames");
+  await expect(card).toHaveCSS("border-left-color", "rgb(171, 103, 205)");
+});
+
+test("adding and loading presets retains their labels without assigning template names", async ({
+  page,
+}) => {
+  await page.evaluate(
+    ({ agent, database }) => {
+      const { type: agentType, ...agentConfig } = agent;
+      const { type: databaseType, ...databaseConfig } = database;
+      const state = (window as any).__testState;
+      state.agents = [
+        { name: "Name Every City", config: agentConfig },
+        { name: "Summarize", config: agentConfig },
+      ];
+      state.databases = [{ name: "City Database", config: databaseConfig }];
+    },
+    { agent: defaultNodeData("agent"), database: defaultNodeData("database") },
+  );
+  await page.getByRole("button", { name: "Refresh library" }).click();
+  await page.getByLabel("Search library").fill("Name Every City");
+  await page
+    .locator(".library")
+    .getByRole("button", { name: "Name Every City", exact: true })
+    .click();
+  await expect(page.locator('[data-id="n3"] .graph-card-title')).toHaveText(
+    "Name Every City",
+  );
+  await page
+    .locator(".inspector summary")
+    .filter({ hasText: "Reusable agent preset" })
+    .click();
+  await page
+    .getByLabel("Load preset", { exact: true })
+    .selectOption("Summarize");
+  await expect(page.locator('[data-id="n3"] .graph-card-title')).toHaveText(
+    "Summarize",
+  );
+  await page.getByLabel("Search library").fill("City Database");
+  await page
+    .locator(".library")
+    .getByRole("button", { name: "City Database", exact: true })
+    .click();
+  await expect(page.locator('[data-id="n4"] .graph-card-title')).toHaveText(
+    "City Database",
+  );
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  const saved = await page.evaluate(
+    () => (window as any).__testState.saved.nodes,
+  );
+  expect(saved.find((node: any) => node.id === "n3")).toMatchObject({
+    kind: "Summarize",
+    color: "#8b5cf6",
+  });
+  expect(saved.find((node: any) => node.id === "n4")).toMatchObject({
+    kind: "City Database",
+    color: "#0ea5e9",
+  });
+  expect(saved.find((node: any) => node.id === "n3").name).toBeUndefined();
+  expect(saved.find((node: any) => node.id === "n4").name).toBeUndefined();
 });

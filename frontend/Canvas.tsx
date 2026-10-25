@@ -79,6 +79,9 @@ function Card({ id, data, selected }: NodeProps<CardNode>) {
     updateInternals(id);
   }, [id, portSignature, updateInternals]);
   const config = typedData(data.node);
+  const writes =
+    config?.type === "file" ||
+    (config?.type === "database" && !config.read_only);
   const aliases = (port?: string) =>
     Object.entries(data.exports)
       .filter(
@@ -88,7 +91,7 @@ function Card({ id, data, selected }: NodeProps<CardNode>) {
       .join(", ");
   return (
     <article
-      className={`graph-card${selected ? " is-selected" : ""}${nodeColor(data.node) === "#ef4444" ? " writes" : ""}`}
+      className={`graph-card${selected ? " is-selected" : ""}${writes ? " writes" : ""}`}
       style={{ "--node-accent": nodeColor(data.node) } as CSSProperties}
     >
       <Handle
@@ -110,7 +113,9 @@ function Card({ id, data, selected }: NodeProps<CardNode>) {
           />
         )}
       </div>
-      <strong className="graph-card-title">{nodeLabel(data.node)}</strong>
+      <strong className="graph-card-title" title={nodeLabel(data.node)}>
+        {nodeLabel(data.node)}
+      </strong>
       <div className="graph-card-summary" title={nodeSummary(data.node)}>
         {nodeSummary(data.node)}
       </div>

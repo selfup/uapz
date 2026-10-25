@@ -50,6 +50,58 @@ describe("node result configuration comparison", () => {
     expect(sameNodeConfig(file, { ...file, review: false })).toBe(true);
     expect(sameNodeConfig(file, { ...file, review: true })).toBe(false);
   });
+
+  it("tracks nested workflow bindings independently of their property order", () => {
+    const workflow: NodeData = {
+      type: "workflow",
+      graph: "summarize",
+      output: "summary",
+      inputs: {
+        source: { kind: "output", node: "source-node" },
+        language: { kind: "value", value: "English" },
+      },
+    };
+    expect(
+      sameNodeConfig(workflow, {
+        ...workflow,
+        inputs: {
+          language: { value: "English", kind: "value" },
+          source: { node: "source-node", kind: "output" },
+        },
+      }),
+    ).toBe(true);
+    expect(
+      sameNodeConfig(workflow, {
+        ...workflow,
+        inputs: {
+          ...workflow.inputs,
+          source: { kind: "output", node: "other-node" },
+        },
+      }),
+    ).toBe(false);
+    expect(
+      sameNodeConfig(workflow, {
+        ...workflow,
+        inputs: {
+          ...workflow.inputs,
+          language: { kind: "value", value: "Spanish" },
+        },
+      }),
+    ).toBe(false);
+  });
+
+  it("invalidates a script result when positional arguments are reordered", () => {
+    const script: NodeData = {
+      type: "script",
+      runtime: "python",
+      path: "compare.py",
+      args: ["before.json", "after.json"],
+      timeout_secs: 30,
+    };
+    expect(
+      sameNodeConfig(script, { ...script, args: [...script.args].reverse() }),
+    ).toBe(false);
+  });
 });
 
 describe("previous output comparison", () => {
@@ -78,5 +130,27 @@ describe("previous output comparison", () => {
     expect(
       compareNodeOutputs({ key: "a" }, { key: "a", error: "failed" }),
     ).toBe("different");
+  });
+
+  it("compares empty complete outputs without treating an absent preview as empty text", () => {
+    const empty = { label: "Text", preview: "", complete: true };
+    expect(compareNodeOutputs(empty, { ...empty })).toBe("same");
+    expect(compareNodeOutputs(empty, { label: "Text" })).toBe("different");
+    expect(compareNodeOutputs(empty, { ...empty, complete: false })).toBe(
+      "unknown",
+    );
+  });
+
+  it("detects differing truncated previews and respects output types without keys", () => {
+    const truncated = { label: "Text", preview: "first", complete: false };
+    expect(
+      compareNodeOutputs(truncated, { ...truncated, preview: "second" }),
+    ).toBe("different");
+    expect(compareNodeOutputs(truncated, { ...truncated, label: "JSON" })).toBe(
+      "different",
+    );
+    expect(
+      compareNodeOutputs({ label: "Image", key: "image" }, { label: "Image" }),
+    ).toBe("unknown");
   });
 });

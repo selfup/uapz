@@ -9,6 +9,7 @@ import {
   graphToFlowPoint,
   nextNodeId,
   nodeColor,
+  nodeLabel,
   publishOutput,
   sinkIds,
   visibleEdgeHandle,
@@ -189,10 +190,43 @@ describe("graph mutations", () => {
     expect(sinkIds(graph)).toEqual(["n2"]);
   });
 
-  it("keeps neutral typed nodes and red accents for writes", () => {
+  it("uses saved labels before type names without changing template names", () => {
+    const node = {
+      id: "n1",
+      x: 0,
+      y: 0,
+      kind: "Name Every City",
+      data: defaultNodeData("agent"),
+    };
+    expect(nodeLabel(node)).toBe("Name Every City");
+    expect(nodeLabel({ ...node, name: "cities" })).toBe("cities");
+    expect(nodeLabel({ ...node, name: "  " })).toBe("Name Every City");
+    expect(nodeLabel({ ...node, kind: "  " })).toBe("Agent");
+    expect(node).not.toHaveProperty("name");
+  });
+
+  it("keeps saved typed-node colors and falls back to type colors", () => {
+    expect(
+      nodeColor({
+        id: "n1",
+        x: 0,
+        y: 0,
+        color: "#ab67cd",
+        data: defaultNodeData("agent"),
+      }),
+    ).toBe("#ab67cd");
+    expect(
+      nodeColor({
+        id: "n1",
+        x: 0,
+        y: 0,
+        color: "invalid",
+        data: defaultNodeData("data"),
+      }),
+    ).toBe("#22c55e");
     expect(
       nodeColor({ id: "n1", x: 0, y: 0, data: defaultNodeData("agent") }),
-    ).toBe("#9ca3af");
+    ).toBe("#8b5cf6");
     expect(
       nodeColor({ id: "n1", x: 0, y: 0, data: defaultNodeData("file") }),
     ).toBe("#ef4444");

@@ -17,8 +17,26 @@ depend on changed.
 
 ## Running
 
-Use Node.js 24, npm, stable Rust and the macOS Xcode command-line tools. Install the
-frontend dependencies, then check the Rust workspace before starting the app:
+Use Node.js 24, npm, stable Rust and the macOS Xcode command-line tools. To build and
+run the app with its frontend embedded:
+
+```sh
+./scripts/run-app.sh
+```
+
+The script installs frontend dependencies if `node_modules` is missing, checks Rust
+formatting, builds the frontend, checks the Rust code, then builds and launches the
+release executable. It uses this repository's workspace by default and works from any
+current directory. Use `--debug` for faster builds, or select another workspace:
+
+```sh
+./scripts/run-app.sh --debug
+./scripts/run-app.sh --workspace /absolute/path/to/workspace
+```
+
+`UAPZ_WORKSPACE_DIR` also overrides the script's default workspace; an explicit
+`--workspace` takes precedence. Run `npm ci` again after dependency lockfile changes.
+For development with frontend hot reload:
 
 ```sh
 npm ci
@@ -49,8 +67,10 @@ directories can be opened directly; graph and history formats remain compatible.
 Tests cover the file formats, the Mermaid parser, every node config's validation, the SQL
 checker, path confinement, the library's on-disk layout, the executor (scripts, SQLite,
 chains, timeouts, the cache, cancellation, write-file nodes), streamed replies in every
-provider's shape and the request shape for every provider. Frontend tests cover graph
-editing and mocked IPC interactions, including child navigation and read-only previews:
+provider's shape and the request shape for every provider. Frontend unit tests cover
+graph edits, snapshot selection, output comparisons and the IPC wrapper. Browser tests
+cover named-port wiring, labels and colors, keyboard edits, read-only children, saved
+positions, run and review recovery, and delayed save, navigation and output responses:
 
 ```sh
 cargo fmt --all --check
@@ -66,18 +86,19 @@ npm run test:ui
 
 Playwright runs the frontend in Chromium with mocked Tauri IPC; it does not execute
 fixture workflows or replace testing the native Tauri bridge. Browser failure artifacts
-are written under `test-results/`.
+are written under `test-results/`. The shared fixture in `tests/support/workspace.ts`
+can fail individual requests or hold them until explicitly released, so response-order
+regressions do not depend on arbitrary delays. Unexpected browser errors and warnings
+fail the tests.
 
 The opt-in native smoke test starts the real Tauri webview and exercises IPC, graph
 save/load, run inputs, file review, execution, output loading and history. It is available
 in debug builds and requires an explicit disposable workspace because it creates a
-fixture graph and output file. Build the frontend assets first, then run:
+fixture graph and output file. Run:
 
 ```sh
-npm run build
-cargo check -p uapz-desktop --features custom-protocol --all-targets
 smoke_workspace="$(mktemp -d /private/tmp/uapz-smoke.XXXXXX)"
-cargo run -p uapz-desktop --features custom-protocol -- --workspace "$smoke_workspace" --smoke-test
+./scripts/run-app.sh --debug --workspace "$smoke_workspace" --smoke-test
 ```
 
 The application prints the result and exits automatically. The temporary workspace keeps
@@ -119,8 +140,10 @@ the footer, including while inspecting a child workflow.
   Library rows add presets and saved kinds directly. A writable database starts with its
   read-only setting off.
 - Escape clears the selection.
-- Neutral node cards show their name, type, summary and run status. Red accents identify
-  write-file nodes and writable databases.
+- Neutral node cards show their name, type, summary and run status, with a slim accent
+  in the saved node color (or the type's default color). Titles use the node's own name,
+  then its preset or kind label, then its type. Red type labels identify write-file
+  nodes and writable databases.
   Workflow cards have a labeled port for each published output. Drag from the specific
   port to choose the value sent along that wire. Two ports can feed the same target.
 - **Fit graph** fits all nodes in the canvas, adjusting pan and zoom. New graphs start empty.

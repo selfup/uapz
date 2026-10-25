@@ -50,6 +50,34 @@ describe("child workflow navigation", () => {
     expect(callAt(parent, "n1/missing")).toBeUndefined();
     expect(childInterfaces({}, "", parent)).toEqual({ n1: graph });
   });
+  it("prefers captured interfaces while recovering uncaptured children from history", () => {
+    const captured = { ...emptyGraph(), name: "captured before execution" };
+    const historical = { ...emptyGraph(), name: "historical call" };
+    const childRun: Run = {
+      id: "child",
+      graph: "parent",
+      targets: [],
+      elapsed_ms: 0,
+      outcome: { kind: "ok" },
+      nodes: {},
+      log: [],
+    };
+    const run: Run = {
+      ...childRun,
+      id: "parent",
+      calls: {
+        n2: { graph: historical, run: childRun },
+        n3: { graph: historical, run: childRun },
+      },
+    };
+    expect(
+      childInterfaces(
+        { "n1/n2": captured, "n1/n4": captured, "n10/n2": historical },
+        "n1",
+        run,
+      ),
+    ).toEqual({ n2: captured, n3: historical, n4: captured });
+  });
   it("restores old view scale and selects owners of forwarded published ports", () => {
     const graph = {
       ...emptyGraph(),
@@ -64,5 +92,33 @@ describe("child workflow navigation", () => {
     });
     expect(firstSelection(graph)).toBe("n5");
     expect(graph.view).not.toHaveProperty("zoom");
+  });
+  it("skips deleted history targets and output owners when choosing a visible node", () => {
+    const graph = {
+      ...emptyGraph(),
+      nodes: [
+        { id: "first", x: 0, y: 0 },
+        { id: "published", x: 0, y: 0 },
+        { id: "target", x: 0, y: 0 },
+      ],
+      outputs: { stale: "deleted.text", summary: "published.summary" },
+    };
+    const run: Run = {
+      id: "old-run",
+      graph: "old-graph",
+      targets: ["deleted", "target"],
+      elapsed_ms: 0,
+      outcome: { kind: "ok" },
+      nodes: {},
+      log: [],
+    };
+    expect(firstSelection(graph, run)).toBe("target");
+    expect(firstSelection(graph, { ...run, targets: ["deleted"] })).toBe(
+      "published",
+    );
+    expect(
+      firstSelection({ ...graph, outputs: { stale: "deleted.text" } }),
+    ).toBe("first");
+    expect(firstSelection(emptyGraph(), run)).toBeNull();
   });
 });
