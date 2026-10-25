@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "name": "call-reviewed-note",
+  "view": { "pan_x": 0.0, "pan_y": 0.0 },
+  "nodes": [
+    {
+      "id": "n0",
+      "x": 80.0,
+      "y": 100.0,
+      "name": "message",
+      "data": {
+        "type": "input",
+        "kind": "text",
+        "default": "# A note from another workflow\n\nThis text is passed to reviewed-note.\n",
+        "required": true
+      }
+    },
+    {
+      "id": "n1",
+      "x": 380.0,
+      "y": 100.0,
+      "name": "save-note",
+      "data": {
+        "type": "workflow",
+        "graph": "reviewed-note",
+        "output": "n1",
+        "inputs": {
+          "note": { "kind": "output", "node": "n0" }
+        }
+      }
+    }
+  ],
+  "edges": [{ "from": "n0", "to": "n1" }]
+}

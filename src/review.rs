@@ -20,7 +20,7 @@ pub enum Decision {
     Reject,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct FileReview {
     pub path: String,
     pub before_bytes: Option<usize>,

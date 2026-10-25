@@ -2,8 +2,8 @@
 
 A small native node-graph editor built with [gpui-kit](https://gpui-kit.com). Nodes are
 boxes you drag around and wire together; each one can carry typed content: an **agent**,
-a **database**, a **script**, a **data** file, a **directory**, a **file to write**, or a
-named **Run input** supplied each time the graph runs.
+a **database**, a **script**, a **data** file, a **directory**, a **file to write**, a
+named **Run input** supplied each time the graph runs, or a **Workflow** calling a saved graph.
 Graphs save as a Markdown file with a Mermaid diagram plus a JSON sidecar, and reusable
 agents, prompts and databases save into their own directories so they show up in the
 sidebar.
@@ -59,7 +59,7 @@ an inspector on the right. Drag the divider beside either side panel to resize i
 - Click a node or a wire to select it. Backspace or Delete removes it. Deleting a node
   removes its wires.
 - Double-click empty space, press cmd-n, or click **Add node** to add a node of whatever
-  the toolbar dropdown has selected: **Blank**, one of the seven types, **Database
+  the toolbar dropdown has selected: **Blank**, one of the eight types, **Database
   (write)**, or a saved kind.
 - Escape cancels a drag and clears the selection.
 - A typed node shows its label (its name if it has one, else its type or the preset it
@@ -82,7 +82,7 @@ an inspector on the right. Drag the divider beside either side panel to resize i
   agent wired after it write `{{name}}` for its output. Names are letters, digits, `_`
   and `-`, start with a letter, and must be unique to be useful; the panel says when one
   is not.
-- A blank node offers buttons to give it content: the seven types plus **Database (write)**,
+- A blank node offers buttons to give it content: the eight types plus **Database (write)**,
   a database node that starts with its read-only switch off. A typed node can change type
   or go back to blank at the bottom of the panel.
 - Problems are listed under the form as they happen (`model: model is empty`, `query:
@@ -115,6 +115,9 @@ an inspector on the right. Drag the divider beside either side panel to resize i
 - **Run input** nodes turn a saved graph into a reusable tool. Run and Run all first ask
   for the named inputs their targets need. Change the values in the Run form and press
   **Start run**; the graph's saved configuration and defaults stay unchanged.
+- **Workflow** nodes call another saved graph. Select its output and map its named
+  inputs to defaults, values, or wired parent outputs. **Show child execution** expands
+  its progress, output previews, logs and failures, including in reopened run history.
 - A write-file node with **Review changes before writing** enabled pauses with a diff
   for every proposed file. **Apply** approves the entire batch and continues downstream;
   **Reject batch** leaves that batch untouched; **Cancel run** stops the whole run.
@@ -179,6 +182,64 @@ cp examples/reviewed-note.json examples/reviewed-note.md graphs/
 
 Open **reviewed-note** and press **Run all**. Edit `note`, start the run, then inspect
 and apply or reject the proposed change to `generated/note.md`.
+
+**Workflow**
+
+| Field | Notes |
+| --- | --- |
+| Saved workflow | A graph in `graphs/`; save the child before calling it |
+| Return output | One child node. Executes that node and its dependencies, then returns its text or binary output on the parent wire |
+| Named input mappings | Only inputs reachable from that output. Choose **Use default**, **Value**, or a directly wired parent node; wires are identified by node ID and labeled with their names |
+| Refresh workflows and wires | Re-reads the saved graph and available parent wires after edits |
+
+For example, save a graph with a Run input named `question`, wire that input to an
+agent, and select that agent as the return output of a Workflow node in another graph.
+Wire the parent's source into the Workflow node and select it for `question`. You can
+also enter a fixed value or use the child's default. Omitted mappings use defaults;
+an explicitly empty value still fails a required input. The parent Run form only asks
+for the parent's reachable Run inputs; child values come from these mappings.
+
+Values retain the Run input limits and type checks: up to 64 fields, 256 KB per value,
+and 1 MB combined per invocation. File mappings supply a path relative to the shared
+`data/` directory, not file bytes; select **Value** to enter a path, or wire a Text
+input or other node that returns the path. A File Run input itself returns file bytes.
+Binary outputs can be returned from a child, but cannot be mapped into a named input.
+
+Before execution, the executor snapshots reachable called graphs and checks their
+dependency graphs, mappings, defaults and literal values. Missing graphs or outputs,
+invalid configurations, unwired mappings and recursive calls fail the calling target
+before its upstream steps run. Recursion includes indirect calls; nesting is capped
+at eight calls, with at most 128 calls and 4 MB of graph snapshots per run. Graph files
+and the `graphs/` directory must be ordinary files/directories, not symlinks. Dynamic
+mapped values are checked together after parent inputs finish and before any child step.
+Independent parent targets retain the normal behavior of continuing after a failure.
+
+Calls use saved snapshots for that entire run, even if a graph is edited while it runs.
+The parent's history contains each child's snapshot, effective inputs, node results,
+logs and nested runs. Reopening history displays those recorded results; a new run reads
+the current saved graphs. All paths use the parent's working directory. Child node IDs
+are qualified by their callers in progress, reviews and cache bookkeeping, for example
+`n3/n1`; unassigned agent outputs use a corresponding folder such as `agents/n3-n1/`.
+
+Workflow nodes always enter the child, so reads, databases and file writes still run.
+Agents and scripts inside it can reuse cached outputs. Called graph contents (including
+nested snapshots), mappings and effective input values enter cache keys; file inputs
+also contribute their contents. Changing a called graph invalidates affected child
+and downstream caches even when the returned bytes stay the same. **Run fresh** and
+**Cancel** apply through the entire call tree. Child file reviews use the same Apply,
+Reject and Cancel controls; a rejected child stops its calling node and dependents.
+
+Try a complete offline parent/child example:
+
+```sh
+mkdir -p graphs
+cp examples/reviewed-note.json examples/reviewed-note.md graphs/
+cp examples/call-reviewed-note.json examples/call-reviewed-note.md graphs/
+```
+
+Open **call-reviewed-note**, press **Run all**, edit `message`, and start the run.
+The child **reviewed-note** asks for review before writing `generated/note.md`.
+Select the parent's **save-note** node and expand **Show child execution** to inspect it.
 
 **Agent**
 
@@ -583,6 +644,7 @@ ids and `-->` edges (node shapes and `|labels|` are tolerated) and laid out left
 | `src/inspector.rs` | The node content editor on the right, with Run |
 | `src/exec.rs` | The executor: upstream ordering, files, child processes, database tools, agent runs |
 | `src/workflow.rs` | Run input definitions, reachable fields, typed values and validation |
+| `src/calls.rs` | Workflow mappings, saved graph snapshots, recursion checks and call limits |
 | `src/review.rs` | File snapshots, bounded diffs, review decisions and stale-file checks |
 | `src/history.rs` | Run records, input values, output previews and history replay |
 | `src/providers.rs` | Provider request builders and reply parsers; the HTTP client, plain and streamed |

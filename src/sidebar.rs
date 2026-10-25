@@ -1034,6 +1034,7 @@ mod tests {
             [
                 "Blank",
                 "Run input",
+                "Workflow",
                 "Agent",
                 "Database",
                 "Database (write)",
@@ -1046,6 +1047,7 @@ mod tests {
         );
         assert_eq!(current_of("Blank"), Current::Blank);
         assert_eq!(current_of("Run input"), Current::Type(NodeType::Input));
+        assert_eq!(current_of("Workflow"), Current::Type(NodeType::Workflow));
         assert_eq!(current_of("Database"), Current::Type(NodeType::Database));
         assert_eq!(current_of("Database (write)"), Current::WritableDatabase);
         assert_eq!(current_of("Directory"), Current::Type(NodeType::Directory));

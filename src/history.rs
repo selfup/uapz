@@ -35,6 +35,8 @@ pub const PREVIEW_CHARS: usize = 4000;
 /// One run of a graph.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Run {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub calls: BTreeMap<String, WorkflowRun>,
     /// Values supplied to Run input nodes, including their effective defaults.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub inputs: crate::workflow::Values,
@@ -50,6 +52,12 @@ pub struct Run {
     pub log: Vec<String>,
     /// Every node that ran, was reused or failed, by document id.
     pub nodes: BTreeMap<String, NodeRun>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowRun {
+    pub graph: GraphDoc,
+    pub run: Run,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -211,6 +219,7 @@ pub fn record(
         nodes.insert(id.clone(), failed);
     }
     Run {
+        calls: report.calls.clone(),
         inputs: report.inputs.clone(),
         id: library::timestamp(),
         graph: graph_name(&doc.name),
@@ -295,6 +304,7 @@ impl Run {
             Outcome::Cancelled => Err(exec::CANCELLED.to_string()),
         };
         Report {
+            calls: self.calls.clone(),
             inputs: self.inputs.clone(),
             log: self.log.clone(),
             result,
@@ -441,6 +451,7 @@ mod tests {
         }
         Report {
             log: vec!["n0: data".into(), "n1: data".into()],
+            calls: BTreeMap::new(),
             inputs: crate::workflow::Values::new(),
             result,
             elapsed: Duration::from_millis(1500),
