@@ -110,6 +110,105 @@ pub fn identifier(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ----- node names and templates -----
+
+/// A node's name, as `{{name}}` in an agent's prompt refers to it: letters, digits, `_`
+/// and `-`, starting with a letter or `_`, at most [`MAX_NAME_LEN`] characters. A name
+/// shaped like a node id (`n3`) is refused, since a placeholder may also hold an id.
+pub fn node_name(name: &str) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("name is empty".into());
+    }
+    if name.chars().count() > MAX_NAME_LEN {
+        return Err(format!("name is longer than {MAX_NAME_LEN} characters"));
+    }
+    let mut chars = name.chars();
+    let first = chars.next().unwrap_or('0');
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return Err("name must start with a letter or `_`".into());
+    }
+    if let Some(bad) = chars.find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))) {
+        return Err(format!(
+            "name contains `{bad}`; only letters, digits, `_` and `-` are allowed"
+        ));
+    }
+    if is_node_id(name) {
+        return Err(format!("`{name}` looks like a node id; pick another name"));
+    }
+    Ok(())
+}
+
+/// `n` followed by digits: the shape of a node id in a graph file.
+pub fn is_node_id(s: &str) -> bool {
+    s.strip_prefix('n')
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// What may stand between the braces of a placeholder: a node name or a node id.
+fn is_placeholder_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+}
+
+/// A template split into plain text and `{{name}}` holes. A hole is `{{`, optional
+/// spaces, a name or id, optional spaces, `}}`; braces around anything else are text.
+enum Piece<'a> {
+    Text(&'a str),
+    Hole(&'a str),
+}
+
+fn pieces(template: &str) -> Vec<Piece<'_>> {
+    let mut out = Vec::new();
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else { break };
+        let inner = after[..end].trim();
+        if is_placeholder_name(inner) {
+            out.push(Piece::Text(&rest[..start]));
+            out.push(Piece::Hole(inner));
+        } else {
+            out.push(Piece::Text(&rest[..start + 2 + end + 2]));
+        }
+        rest = &after[end + 2..];
+    }
+    out.push(Piece::Text(rest));
+    out
+}
+
+/// The names a template's placeholders refer to, in order of first appearance.
+pub fn placeholders(template: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for piece in pieces(template) {
+        if let Piece::Hole(name) = piece
+            && !found.iter().any(|f| f == name)
+        {
+            found.push(name.to_string());
+        }
+    }
+    found
+}
+
+/// The template with every placeholder replaced by what `lookup` returns for its name.
+/// The first lookup error ends the rendering.
+pub fn render(
+    template: &str,
+    lookup: &mut dyn FnMut(&str) -> Result<String, String>,
+) -> Result<String, String> {
+    let mut out = String::with_capacity(template.len());
+    for piece in pieces(template) {
+        match piece {
+            Piece::Text(text) => out.push_str(text),
+            Piece::Hole(name) => out.push_str(&lookup(name)?),
+        }
+    }
+    Ok(out)
+}
+
 /// A model id as providers write them: `llama3.1`, `claude-opus-5-5`, `org/model:tag`.
 pub fn model_id(id: &str) -> Result<(), String> {
     let id = id.trim();
@@ -1012,6 +1111,57 @@ mod tests {
         assert!(identifier("t; drop table x").is_err());
         assert!(identifier("a.b").is_err());
         assert!(identifier(&"a".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn node_names_are_identifiers_that_are_not_ids() {
+        assert!(node_name("schema").is_ok());
+        assert!(node_name("_x-1").is_ok());
+        assert!(node_name("  schema ").is_ok());
+        assert!(node_name("n3x").is_ok());
+        assert!(node_name("").is_err());
+        assert!(node_name("2fast").is_err());
+        assert!(node_name("a b").is_err());
+        assert!(node_name("a.b").is_err());
+        assert!(node_name("n3").unwrap_err().contains("node id"));
+        assert!(node_name(&"a".repeat(MAX_NAME_LEN + 1)).is_err());
+        assert!(is_node_id("n0"));
+        assert!(is_node_id("n42"));
+        assert!(!is_node_id("n"));
+        assert!(!is_node_id("x1"));
+        assert!(!is_node_id("n-1"));
+    }
+
+    #[test]
+    fn templates_find_and_fill_placeholders() {
+        assert_eq!(
+            placeholders(
+                "Use {{schema}} and {{ question }}; {{schema}} again. {{not a name}}, {{}} and {{ stay."
+            ),
+            ["schema", "question"]
+        );
+        assert_eq!(placeholders("{{n3}} {{{x}}}"), ["n3"]);
+        assert!(placeholders("no holes").is_empty());
+
+        let filled = render(
+            "A: {{a}}, B: {{ b }}, {{not a name}}, {{a}}",
+            &mut |name| match name {
+                "a" => Ok("1".into()),
+                "b" => Ok("2".into()),
+                other => Err(format!("no {other}")),
+            },
+        )
+        .unwrap();
+        assert_eq!(filled, "A: 1, B: 2, {{not a name}}, 1");
+        assert_eq!(
+            render("x {{missing}}", &mut |n| Err(format!("no {n}"))).unwrap_err(),
+            "no missing"
+        );
+        assert_eq!(
+            render("plain {{ text", &mut |_| Ok(String::new())).unwrap(),
+            "plain {{ text"
+        );
+        assert_eq!(render("", &mut |_| Ok(String::new())).unwrap(), "");
     }
 
     #[test]

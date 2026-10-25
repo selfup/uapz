@@ -15,6 +15,15 @@
 //! Every node that took part in a run keeps its result here, so selecting a node in the
 //! middle of a graph shows what it produced (or why it failed) in the last run that
 //! included it, with a note when the node has been edited since.
+//!
+//! Every finished run is also written to the run history ([`history`]), listed at the
+//! bottom of the panel. Opening one brings its outputs, dots and log back without running
+//! anything, and the selected node's previous output is shown under its current one. Run
+//! all starts every end node of the graph in one pass.
+//!
+//! The Name field at the top of the form names the node for the canvas and for the
+//! `{{name}}` placeholders of agents wired after it; an agent's Message field is the user
+//! message template, and its Inputs list says where each input ends up.
 
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::form::{field, v_form};
@@ -25,6 +34,7 @@ use gpui_kit::component::{ActiveTheme, Disableable, IndexPath, Sizable, h_flex, 
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::collections::HashMap;
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -33,6 +43,7 @@ use std::time::Duration;
 use crate::doc::GraphDoc;
 use crate::exec::{self, Cache, Control, NodeState, Progress, Report};
 use crate::graph::{Graph, GraphEvent, Mark, NodeId, data_color};
+use crate::history;
 use crate::library;
 use crate::node_data::{
     AgentConfig, Auth, DataConfig, DataFormat, DatabaseConfig, DbEngine, DirectoryConfig,
@@ -47,7 +58,9 @@ pub const INSPECTOR_W: f32 = 320.0;
 /// How often the panel pulls progress from a running job.
 const PROGRESS_POLL: Duration = Duration::from_millis(80);
 /// Characters of a text preview, streamed or final.
-const PREVIEW_CHARS: usize = 4000;
+const PREVIEW_CHARS: usize = history::PREVIEW_CHARS;
+/// Past runs listed in the panel; the rest stay on disk.
+const RUNS_SHOWN: usize = 12;
 
 /// What the executor's thread writes and the panel reads while a run is going.
 #[derive(Default)]
@@ -57,8 +70,8 @@ struct Live {
     stream: Option<(String, String)>,
     /// Node state changes, in order.
     states: Vec<(String, NodeState)>,
-    /// Set once by the thread when the run is over.
-    report: Option<Report>,
+    /// Set once by the thread when the run is over, with the record it wrote.
+    report: Option<(Report, history::Run)>,
 }
 
 impl Live {
@@ -78,8 +91,8 @@ impl Live {
 struct Job {
     cancel: Arc<AtomicBool>,
     live: Arc<Mutex<Live>>,
-    /// The node Run was pressed on.
-    target: NodeId,
+    /// The node Run was pressed on, or every end node for Run all.
+    targets: Vec<NodeId>,
     /// The document the run works on, to remember each node's content at run time.
     doc: GraphDoc,
 }
@@ -128,12 +141,20 @@ pub struct Inspector {
     live_states: usize,
     /// The canvas dots: one run's worth, the latest.
     marks: HashMap<NodeId, Mark>,
-    /// The last finished run and the node it was started from.
-    report: Option<(NodeId, Report)>,
+    /// The run shown: its report and the nodes it was started from.
+    report: Option<(Vec<NodeId>, Report)>,
     /// What every node produced the last time a run included it.
     results: HashMap<NodeId, NodeResult>,
     /// Node outputs kept across runs, so a downstream run reuses upstream agents.
     cache: Arc<Mutex<Cache>>,
+    /// Past runs of the current graph, newest first.
+    history: Vec<history::Run>,
+    /// The record whose outputs and dots are showing, when the run is one from the list.
+    shown_run: Option<String>,
+    /// The graph's name as saved, which its runs are filed under.
+    graph_name: String,
+    /// The selected node's own name.
+    node_name: Entity<InputState>,
     preset_name: Entity<InputState>,
     // agent
     provider: Entity<StrSelect>,
@@ -142,6 +163,7 @@ pub struct Inspector {
     model: Entity<InputState>,
     auth_env: Entity<InputState>,
     prompt: Entity<TextareaState>,
+    message: Entity<TextareaState>,
     prompt_name: Entity<InputState>,
     context_size: Entity<InputState>,
     temperature: Entity<InputState>,
@@ -281,6 +303,7 @@ impl Inspector {
             })
         };
 
+        let node_name = text("name, for {{name}} in agent prompts", window, cx);
         let preset_name = text("preset name", window, cx);
         let provider = enum_select(&Provider::ALL, Provider::label, window, cx);
         let endpoint = text(Provider::Ollama.default_endpoint(), window, cx);
@@ -288,6 +311,12 @@ impl Inspector {
         let model = text("model id", window, cx);
         let auth_env = text("ANTHROPIC_API_KEY", window, cx);
         let prompt = area("You are…", 6, window, cx);
+        let message = area(
+            "Empty sends the inputs. {{name}} puts an input here.",
+            3,
+            window,
+            cx,
+        );
         let prompt_name = text("prompt name", window, cx);
         let context_size = text("8192", window, cx);
         let temperature = text("0.7", window, cx);
@@ -362,7 +391,7 @@ impl Inspector {
                 },
             ));
         }
-        for state in [&prompt, &query] {
+        for state in [&prompt, &message, &query] {
             subscriptions.push(cx.subscribe_in(
                 state,
                 window,
@@ -373,6 +402,16 @@ impl Inspector {
                 },
             ));
         }
+        // The name is not part of the node's content: it goes to the graph directly.
+        subscriptions.push(cx.subscribe_in(
+            &node_name,
+            window,
+            |this, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.on_name_change(cx);
+                }
+            },
+        ));
         // Paths pick a matching runtime or format as they change.
         subscriptions.push(cx.subscribe_in(
             &script_path,
@@ -449,6 +488,10 @@ impl Inspector {
             report: None,
             results: HashMap::new(),
             cache: Arc::new(Mutex::new(Cache::persistent(exec::Dirs::from_cwd().cache))),
+            history: Vec::new(),
+            shown_run: None,
+            graph_name: String::new(),
+            node_name,
             preset_name,
             provider,
             endpoint,
@@ -456,6 +499,7 @@ impl Inspector {
             model,
             auth_env,
             prompt,
+            message,
             prompt_name,
             context_size,
             temperature,
@@ -491,6 +535,7 @@ impl Inspector {
             _subscriptions: subscriptions,
         };
         inspector.reload(window, cx);
+        inspector.set_graph_name("untitled", cx);
         inspector
     }
 
@@ -503,7 +548,25 @@ impl Inspector {
         self.results.clear();
         self.report = None;
         self.marks.clear();
+        self.shown_run = None;
         cx.notify();
+    }
+
+    /// The graph was loaded, saved or started afresh under `name`: its runs are filed
+    /// under that name, so list them.
+    pub fn set_graph_name(&mut self, name: &str, cx: &mut Context<Self>) {
+        let name = history::graph_name(name);
+        if name == self.graph_name {
+            return;
+        }
+        self.graph_name = name;
+        self.history = history::list(Path::new("."), &self.graph_name);
+        self.shown_run = None;
+        cx.notify();
+    }
+
+    pub fn running(&self) -> bool {
+        self.job.is_some()
     }
 
     fn push_marks(&self, cx: &mut Context<Self>) {
@@ -537,9 +600,14 @@ impl Inspector {
         self.loading = true;
         let selected = {
             let graph = self.graph.read(cx);
-            graph
-                .selected()
-                .map(|v| (v.id, v.preset.clone(), v.data.cloned()))
+            graph.selected().map(|v| {
+                (
+                    v.id,
+                    v.preset.clone(),
+                    v.name.map(str::to_string),
+                    v.data.cloned(),
+                )
+            })
         };
         match selected {
             None => {
@@ -548,8 +616,9 @@ impl Inspector {
                 self.issues.clear();
                 self.output_count = 0;
             }
-            Some((id, preset, data)) => {
+            Some((id, preset, name, data)) => {
                 self.node = Some(id);
+                set_text(&self.node_name, name.unwrap_or_default(), window, cx);
                 set_text(
                     &self.preset_name,
                     preset.as_ref().map(|p| p.to_string()).unwrap_or_default(),
@@ -589,6 +658,7 @@ impl Inspector {
                 set_text(&self.model, a.model.clone(), window, cx);
                 set_text(&self.auth_env, a.auth.env_var().to_string(), window, cx);
                 set_textarea(&self.prompt, a.prompt.clone(), window, cx);
+                set_textarea(&self.message, a.message.clone(), window, cx);
                 set_text(&self.context_size, a.context_size.to_string(), window, cx);
                 set_text(&self.temperature, a.temperature.to_string(), window, cx);
                 choose(&self.output, &OutputType::ALL, a.output, window, cx);
@@ -671,6 +741,7 @@ impl Inspector {
                         Auth::Env { var: env }
                     },
                     prompt: self.prompt.read(cx).value().to_string(),
+                    message: self.message.read(cx).value().to_string(),
                     context_size: parse_field(
                         &self.context_size,
                         prev.context_size,
@@ -792,6 +863,70 @@ impl Inspector {
     }
 
     // ----- field reactions -----
+
+    /// The name lives on the node itself, not in its content, so it is written to the
+    /// graph as typed; what is wrong with it shows under the form.
+    fn on_name_change(&mut self, cx: &mut Context<Self>) {
+        if self.loading {
+            return;
+        }
+        let Some(id) = self.node else { return };
+        let name = text_of(&self.node_name, cx);
+        self.graph
+            .update(cx, |graph, cx| graph.set_node_name(id, Some(name), cx));
+        cx.notify();
+    }
+
+    /// Problems that depend on the rest of the graph, found at render time so a wire
+    /// drawn or removed shows at once: the node's name, and an agent's placeholders
+    /// against what is wired into it.
+    fn wiring_issues(&self, id: NodeId, data: Option<&NodeData>, cx: &App) -> Vec<Issue> {
+        let graph = self.graph.read(cx);
+        let mut issues = Vec::new();
+        if let Some(name) = graph.node_name(id) {
+            if let Err(e) = validate::node_name(name) {
+                issues.push(Issue::new("name", e));
+            } else if let Some((other, _)) = graph
+                .named_nodes()
+                .iter()
+                .find(|(other, n)| *other != id && n == name)
+            {
+                issues.push(Issue::new(
+                    "name",
+                    format!("n{other} is also named {name}; a placeholder needs one of each"),
+                ));
+            }
+        }
+        if let Some(NodeData::Agent(agent)) = data {
+            let inputs = graph.inputs(id);
+            let mut handles: Vec<String> = Vec::new();
+            for input in &inputs {
+                handles.push(format!("n{input}"));
+                if let Some(name) = graph.node_name(*input)
+                    && validate::node_name(name).is_ok()
+                {
+                    handles.push(name.to_string());
+                }
+            }
+            for (field, template) in [("prompt", &agent.prompt), ("message", &agent.message)] {
+                for hole in validate::placeholders(template) {
+                    if handles.contains(&hole) {
+                        continue;
+                    }
+                    let where_ = if inputs.is_empty() {
+                        "nothing is wired into this node".to_string()
+                    } else {
+                        format!("the inputs are {}", handles.join(", "))
+                    };
+                    issues.push(Issue::new(
+                        field,
+                        format!("{{{{{hole}}}}} names no input; {where_}"),
+                    ));
+                }
+            }
+        }
+        issues
+    }
 
     /// Switching provider fills in its usual model and key variable when those are empty
     /// or still the previous provider's defaults.
@@ -1046,16 +1181,38 @@ impl Inspector {
     /// ignores cached outputs. A run can start while a cancelled one is still winding
     /// down; the old one's progress is then ignored.
     fn run_selected(&mut self, fresh: bool, cx: &mut Context<Self>) {
+        if let Some(id) = self.node {
+            self.start_run(vec![id], fresh, cx);
+        }
+    }
+
+    /// Run every end node of the graph, which runs the whole graph in one pass.
+    pub fn run_all(&mut self, fresh: bool, cx: &mut Context<Self>) {
+        let doc = self.graph.read(cx).snapshot(&self.graph_name);
+        let targets: Vec<NodeId> = exec::sinks(&doc)
+            .iter()
+            .filter_map(|id| node_id(id))
+            .collect();
+        if targets.is_empty() {
+            self.status("Nothing to run: no node has content".into(), true, cx);
+            return;
+        }
+        self.start_run(targets, fresh, cx);
+    }
+
+    /// Start `targets` on a background thread, in order, each after everything wired into
+    /// it, and poll its progress until the report and the run record arrive.
+    fn start_run(&mut self, targets: Vec<NodeId>, fresh: bool, cx: &mut Context<Self>) {
         if self
             .job
             .as_ref()
             .is_some_and(|j| !j.cancel.load(Ordering::Relaxed))
+            || targets.is_empty()
         {
             return;
         }
-        let Some(id) = self.node else { return };
-        let doc = self.graph.read(cx).snapshot("run");
-        let node_id = format!("n{id}");
+        let doc = self.graph.read(cx).snapshot(&self.graph_name);
+        let ids: Vec<String> = targets.iter().map(|t| format!("n{t}")).collect();
         let cancel = Arc::new(AtomicBool::new(false));
         let live = Arc::new(Mutex::new(Live::default()));
         let sink = live.clone();
@@ -1068,16 +1225,19 @@ impl Inspector {
         self.job = Some(Job {
             cancel,
             live: live.clone(),
-            target: id,
+            targets: targets.clone(),
             doc: doc.clone(),
         });
         self.live_log.clear();
         self.live_stream = None;
         self.live_states = 0;
         self.report = None;
+        // `shown_run` stays: the results on show are still that run's until the report
+        // arrives, and Previous compares against the run before it.
         // The dots now describe this run: every member hollow until it moves.
-        self.marks = Self::run_members(&doc, id)
-            .into_iter()
+        self.marks = targets
+            .iter()
+            .flat_map(|target| Self::run_members(&doc, *target))
             .map(|member| (member, Mark::Pending))
             .collect();
         self.push_marks(cx);
@@ -1086,15 +1246,20 @@ impl Inspector {
             let worker = live.clone();
             cx.background_spawn(async move {
                 let http = UreqHttp::new(exec::HTTP_TIMEOUT);
-                let report = exec::run_with(
-                    &doc,
-                    &node_id,
-                    exec::Dirs::from_cwd(),
-                    &http,
-                    &exec::process_env,
-                    &control,
-                );
-                lock(&worker).report = Some(report);
+                let dirs = exec::Dirs::from_cwd();
+                let mut report = match ids.as_slice() {
+                    [only] => exec::run_with(&doc, only, dirs, &http, &exec::process_env, &control),
+                    many => {
+                        exec::run_all_with(&doc, many, dirs, &http, &exec::process_env, &control)
+                    }
+                };
+                let run = history::record(&doc, &ids, &report, control.cache.as_deref());
+                if let Err(e) = history::save(Path::new("."), &run) {
+                    report
+                        .log
+                        .push(format!("⚠ the run record was not saved: {e}"));
+                }
+                lock(&worker).report = Some((report, run));
             })
             .detach();
             loop {
@@ -1149,25 +1314,47 @@ impl Inspector {
             self.push_marks(cx);
         }
         cx.notify();
-        let Some(report) = report else { return false };
+        let Some((report, run)) = report else {
+            return false;
+        };
         let Some(job) = self.job.take() else {
             return true;
         };
         self.live_log.clear();
         self.live_stream = None;
-        self.remember(&job, &report, cx);
+        let data_of = |id: &str| {
+            job.doc
+                .nodes
+                .iter()
+                .find(|n| n.id == id)
+                .and_then(|n| n.data.clone())
+        };
+        self.remember(&data_of, &report, cx);
+        let all = job.targets.len() > 1;
+        let what = if all { "Run all" } else { "Run" };
+        let cached = match report.reused.len() {
+            0 => String::new(),
+            1 => " (1 node from the cache)".to_string(),
+            n => format!(" ({n} nodes from the cache)"),
+        };
         let (text, error) = match &report.result {
+            Ok(output) if all => {
+                let ran = report.outputs.len().saturating_sub(report.reused.len());
+                (
+                    format!(
+                        "Run all finished in {:.1}s: {ran} node{} ran{cached}",
+                        report.elapsed.as_secs_f32(),
+                        if ran == 1 { "" } else { "s" }
+                    ),
+                    false,
+                )
+            }
             Ok(output) => {
                 let saved = output
                     .saved
                     .as_ref()
                     .map(|p| format!(" → {}", p.display()))
                     .unwrap_or_default();
-                let cached = match report.reused.len() {
-                    0 => String::new(),
-                    1 => " (1 node from the cache)".to_string(),
-                    n => format!(" ({n} nodes from the cache)"),
-                };
                 (
                     format!(
                         "Run finished in {:.1}s: {}{saved}{cached}",
@@ -1177,15 +1364,18 @@ impl Inspector {
                     false,
                 )
             }
-            Err(e) if e == exec::CANCELLED => ("Run cancelled".to_string(), false),
-            Err(e) => (format!("Run failed: {e}"), true),
+            Err(e) if e == exec::CANCELLED => (format!("{what} cancelled"), false),
+            Err(e) => (format!("{what} failed: {e}"), true),
         };
         if let Ok(output) = &report.result
             && output.saved.is_some()
         {
             self.output_count += 1;
         }
-        self.report = Some((job.target, report));
+        self.report = Some((job.targets, report));
+        self.shown_run = Some(run.id.clone());
+        self.history.insert(0, run);
+        self.history.truncate(history::MAX_RUNS);
         self.status(text, error, cx);
         cx.notify();
         true
@@ -1194,15 +1384,13 @@ impl Inspector {
     /// Keep every node's outcome from a run: the outputs that were made, and the error on
     /// the node that failed. Nodes the run never reached keep their earlier result. The
     /// canvas dots are settled from the report: a node that never got going loses its
-    /// hollow dot.
-    fn remember(&mut self, job: &Job, report: &Report, cx: &mut Context<Self>) {
-        let data_of = |id: &str| {
-            job.doc
-                .nodes
-                .iter()
-                .find(|n| n.id == id)
-                .and_then(|n| n.data.clone())
-        };
+    /// hollow dot. `data_of` is each node's content when it ran.
+    fn remember(
+        &mut self,
+        data_of: &dyn Fn(&str) -> Option<NodeData>,
+        report: &Report,
+        cx: &mut Context<Self>,
+    ) {
         for (id, output) in &report.outputs {
             if let Some(node) = node_id(id) {
                 self.results.insert(
@@ -1247,6 +1435,56 @@ impl Inspector {
             self.status("Cancelling…".into(), false, cx);
             cx.notify();
         }
+    }
+
+    /// Show a past run as if it had just finished: its outputs (from the cache, or the
+    /// previews its record kept), its dots and its log, without running anything.
+    fn open_run(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.job.is_some() {
+            return;
+        }
+        let Some(run) = self.history.iter().find(|r| r.id == id).cloned() else {
+            return;
+        };
+        let report = run.report(Some(&self.cache));
+        let targets: Vec<NodeId> = run.targets.iter().filter_map(|t| node_id(t)).collect();
+        self.results.clear();
+        self.marks.clear();
+        let data_of = |id: &str| run.nodes.get(id).and_then(|n| n.data.clone());
+        self.remember(&data_of, &report, cx);
+        self.report = Some((targets, report));
+        self.shown_run = Some(run.id.clone());
+        self.status(
+            format!("Showing the run from {} UTC; nothing was run", run.time()),
+            false,
+            cx,
+        );
+        cx.notify();
+    }
+
+    fn clear_runs(&mut self, cx: &mut Context<Self>) {
+        let n = history::clear(Path::new("."), &self.graph_name);
+        self.history.clear();
+        self.shown_run = None;
+        self.status(
+            format!(
+                "Deleted {n} run record{} of {}",
+                if n == 1 { "" } else { "s" },
+                self.graph_name
+            ),
+            false,
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// The latest past run, other than the one showing, that this node took part in.
+    fn previous_run(&self, node: NodeId) -> Option<(&history::Run, &history::NodeRun)> {
+        let key = format!("n{node}");
+        self.history
+            .iter()
+            .filter(|run| self.shown_run.as_deref() != Some(run.id.as_str()))
+            .find_map(|run| run.nodes.get(&key).map(|n| (run, n)))
     }
 
     fn clear_cache(&mut self, cx: &mut Context<Self>) {
@@ -1424,10 +1662,18 @@ impl Inspector {
                                 ),
                         )
                         .child(div().text_xs().text_color(muted).child(format!(
-                            "Saved prompts live in {}/ and load from the sidebar.",
+                            "Saved prompts live in {}/ and load from the sidebar. {{{{name}}}} stands for the output of the input named so.",
                             library::PROMPTS_DIR
                         ))),
                 ),
+            )
+            .child(
+                field()
+                    .label("Message")
+                    .description(
+                        "The user message. Empty sends the inputs joined with blank lines; otherwise {{name}} puts an input here and the inputs nothing names follow.",
+                    )
+                    .child(Textarea::new(&self.message).small()),
             )
             .child(
                 field()
@@ -1742,6 +1988,176 @@ impl Inspector {
     }
 
     /// One button per content type, with the writable database after the read-only one.
+    /// An agent's inputs: how each is addressed, where it ends up, and what it produced
+    /// the last time it ran.
+    fn render_inputs(
+        &self,
+        id: NodeId,
+        agent: &AgentConfig,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let theme = cx.theme();
+        let fg = theme.sidebar_foreground;
+        let muted = theme.muted_foreground;
+        let danger = theme.danger;
+        let graph = self.graph.read(cx);
+        let in_prompt = validate::placeholders(&agent.prompt);
+        let in_message = validate::placeholders(&agent.message);
+        let inputs = graph.inputs(id);
+        let rows: Vec<AnyElement> = inputs
+            .iter()
+            .map(|input| {
+                let key = format!("n{input}");
+                let name = graph
+                    .node_name(*input)
+                    .filter(|n| validate::node_name(n).is_ok())
+                    .map(str::to_string);
+                let refers = |holes: &[String]| {
+                    holes
+                        .iter()
+                        .any(|h| *h == key || name.as_deref() == Some(h.as_str()))
+                };
+                let placement = match (refers(&in_prompt), refers(&in_message)) {
+                    (true, true) => "in the prompt and the message",
+                    (true, false) => "in the prompt",
+                    (false, true) => "in the message",
+                    (false, false) => "appended to the message",
+                };
+                let (handle, detail) = match &name {
+                    Some(n) => (format!("{{{{{n}}}}}"), format!("{key} · {placement}")),
+                    None => (key.clone(), placement.to_string()),
+                };
+                let (last, color) = match self.results.get(input).map(|r| &r.result) {
+                    Some(Ok(output)) => (output.label.clone(), muted),
+                    Some(Err(_)) => ("failed last time".to_string(), danger),
+                    None => ("not run yet".to_string(), muted),
+                };
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(fg)
+                            .child(handle),
+                    )
+                    .child(div().text_xs().text_color(muted).child(detail))
+                    .child(div().ml_auto().text_xs().text_color(color).child(last))
+                    .into_any_element()
+            })
+            .collect();
+        let hint = |text: &'static str| div().text_xs().text_color(muted).child(text);
+        v_flex()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(fg)
+                    .child(format!("Inputs · {}", inputs.len())),
+            )
+            .children(rows)
+            .when(inputs.is_empty(), |d| {
+                d.child(hint(
+                    "Nothing is wired in. Drag from another node's ● onto this one.",
+                ))
+            })
+            .child(hint(
+                "Name an upstream node and write {{name}} in the prompt or message to put its output there; the rest follow in id order.",
+            ))
+    }
+
+    /// The graph's past runs, newest first, with Run all and Clear.
+    fn render_runs(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = cx.theme();
+        let fg = theme.sidebar_foreground;
+        let muted = theme.muted_foreground;
+        let accent = theme.sidebar_accent;
+        let accent_fg = theme.sidebar_accent_foreground;
+        let running = self.job.is_some();
+        let shown = self.shown_run.clone();
+        let rows: Vec<AnyElement> = self
+            .history
+            .iter()
+            .take(RUNS_SHOWN)
+            .enumerate()
+            .map(|(i, run)| {
+                let id = run.id.clone();
+                let active = shown.as_deref() == Some(run.id.as_str());
+                div()
+                    .id(("run", i))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_xs()
+                    .text_color(fg)
+                    .cursor_pointer()
+                    .when(active, |d| d.bg(accent).text_color(accent_fg))
+                    .hover(move |d| d.bg(accent))
+                    .child(run.headline())
+                    .on_click(
+                        cx.listener(move |this, _: &ClickEvent, _, cx| this.open_run(&id, cx)),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        let more = self.history.len().saturating_sub(RUNS_SHOWN);
+        let hint = |text: String| div().text_xs().text_color(muted).child(text);
+        v_flex()
+            .gap_1()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(fg)
+                            .child("Runs"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(self.history.len().to_string()),
+                    )
+                    .child(
+                        div().ml_auto().child(
+                            Button::new("run-all")
+                                .primary()
+                                .xsmall()
+                                .label(if running { "Running…" } else { "Run all" })
+                                .disabled(running)
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.run_all(false, cx)
+                                })),
+                        ),
+                    )
+                    .when(!self.history.is_empty() && !running, |d| {
+                        d.child(
+                            Button::new("clear-runs")
+                                .ghost()
+                                .xsmall()
+                                .label("Clear")
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.clear_runs(cx)
+                                })),
+                        )
+                    }),
+            )
+            .child(hint(format!(
+                "Run all (⌘↩) runs every end node. Click a run to see its log and outputs without running anything; times are UTC; records live in {}/{}/.",
+                history::DIR, self.graph_name
+            )))
+            .children(rows)
+            .when(more > 0, |d| d.child(hint(format!("… {more} more on disk"))))
+            .when(self.history.is_empty(), |d| {
+                d.child(hint("No runs of this graph yet.".into()))
+            })
+    }
+
     fn render_type_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let choices: Vec<(&'static str, NodeData)> = NodeType::ALL
             .into_iter()
@@ -1790,6 +2206,25 @@ impl Render for Inspector {
             (Some(_), None) => ("Blank node", None),
             (Some(_), Some(data)) => (data.label(), Some(data_color(data))),
         };
+        let corner = self.node.map(|id| match self.graph.read(cx).node_name(id) {
+            Some(name) => format!("{name} · n{id}"),
+            None => format!("n{id}"),
+        });
+        let wiring = self
+            .node
+            .map(|id| self.wiring_issues(id, data.as_ref(), cx))
+            .unwrap_or_default();
+        // The name is the node's, whatever its content, so it heads both forms.
+        let name_field = self.node.map(|_| {
+            v_form().small().child(
+                field()
+                    .label("Name")
+                    .description(
+                        "The canvas label. An agent wired after this node can write {{name}} for its output.",
+                    )
+                    .child(Input::new(&self.node_name).small()),
+            )
+        });
         let header = h_flex()
             .flex_shrink_0()
             .gap_2()
@@ -1860,17 +2295,18 @@ impl Render for Inspector {
                         )
                     })
             }))
-            .children(self.node.map(|id| {
-                div()
-                    .ml_auto()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(format!("n{id}"))
-            }));
+            .children(corner.map(|text| div().ml_auto().text_xs().text_color(muted).child(text)));
 
         let hint = |text: String| div().text_xs().text_color(muted).child(text);
+        let issue_line = |i: &Issue| {
+            div()
+                .text_xs()
+                .text_color(danger)
+                .child(format!("{}: {}", i.field, i.message))
+                .into_any_element()
+        };
 
-        let body: AnyElement = match (self.node, self.kind) {
+        let node_body: AnyElement = match (self.node, self.kind) {
             (None, _) => hint(
                 "Select a node to edit it. Double-click the canvas or press Add node to make one."
                     .into(),
@@ -1878,10 +2314,12 @@ impl Render for Inspector {
             .into_any_element(),
             (Some(_), None) => v_flex()
                 .gap_3()
+                .children(name_field)
+                .children(wiring.iter().map(issue_line))
                 .child(hint("This node has no content yet. Give it some:".into()))
                 .child(self.render_type_buttons(cx))
                 .into_any_element(),
-            (Some(_), Some(ty)) => {
+            (Some(id), Some(ty)) => {
                 let form: AnyElement = match ty {
                     NodeType::Agent => self.render_agent(cx).into_any_element(),
                     NodeType::Database => self.render_database(cx).into_any_element(),
@@ -1890,7 +2328,13 @@ impl Render for Inspector {
                     NodeType::Directory => self.render_directory(cx).into_any_element(),
                     NodeType::File => self.render_file(cx).into_any_element(),
                 };
-                let issues: Vec<AnyElement> = if self.issues.is_empty() {
+                let inputs_section = match &data {
+                    Some(NodeData::Agent(agent)) => {
+                        Some(self.render_inputs(id, agent, cx).into_any_element())
+                    }
+                    _ => None,
+                };
+                let issues: Vec<AnyElement> = if self.issues.is_empty() && wiring.is_empty() {
                     vec![
                         div()
                             .text_xs()
@@ -1901,13 +2345,8 @@ impl Render for Inspector {
                 } else {
                     self.issues
                         .iter()
-                        .map(|i| {
-                            div()
-                                .text_xs()
-                                .text_color(danger)
-                                .child(format!("{}: {}", i.field, i.message))
-                                .into_any_element()
-                        })
+                        .chain(wiring.iter())
+                        .map(issue_line)
                         .collect()
                 };
                 let saveable = matches!(ty, NodeType::Agent | NodeType::Database);
@@ -1985,7 +2424,7 @@ impl Render for Inspector {
                 let run_section = self
                     .report
                     .as_ref()
-                    .filter(|(target, _)| Some(*target) == self.node)
+                    .filter(|(targets, _)| targets.contains(&id))
                     .map(|(_, report)| {
                         let (headline, color) = match &report.result {
                             Ok(output) => (
@@ -2030,6 +2469,61 @@ impl Render for Inspector {
                     let binary = output
                         .filter(|o| !o.text)
                         .map(|o| hint(format!("{}: binary, no preview", o.label)));
+                    // The same node's output in the run before this one, to compare.
+                    let previous = self.previous_run(id).map(|(run, then)| {
+                        let now_key = output
+                            .zip(last.data.as_ref())
+                            .map(|(o, d)| format!("{:032x}", exec::content_key(d.node_type(), o)));
+                        let now_preview: Option<String> = output
+                            .and_then(|o| o.as_text())
+                            .map(|t| t.chars().take(PREVIEW_CHARS).collect());
+                        let same = match (&then.key, &now_key) {
+                            (Some(a), Some(b)) => a == b,
+                            _ => {
+                                then.error.is_none()
+                                    && then.label == output.map(|o| o.label.clone())
+                                    && now_preview.as_deref() == Some(then.preview.as_str())
+                            }
+                        };
+                        let reconfigured = then.data != last.data;
+                        let headline = format!(
+                            "Previous · {} UTC · {}",
+                            run.time(),
+                            then.label.clone().unwrap_or_else(|| "no output".into())
+                        );
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(muted)
+                                    .child(headline),
+                            )
+                            .when_some(then.error.clone(), |d, e| {
+                                d.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(danger)
+                                        .child(format!("✗ Failed then: {e}")),
+                                )
+                            })
+                            .when(then.error.is_none() && same, |d| {
+                                d.child(hint("Same output as now.".into()))
+                            })
+                            .when(
+                                then.error.is_none() && !same && !then.preview.is_empty(),
+                                |d| {
+                                    d.child(preview_box(then.preview.clone()))
+                                        .when(!then.complete, |d| {
+                                            d.child(hint("… truncated in this preview".into()))
+                                        })
+                                },
+                            )
+                            .when(reconfigured, |d| {
+                                d.child(hint("The node was configured differently then.".into()))
+                            })
+                    });
                     v_flex()
                         .gap_1()
                         .child(
@@ -2047,6 +2541,7 @@ impl Render for Inspector {
                         .children(saved)
                         .children(preview)
                         .children(binary)
+                        .children(previous)
                 });
                 let cached = lock(&self.cache).len();
                 let cache_row = (cached > 0).then(|| {
@@ -2070,7 +2565,9 @@ impl Render for Inspector {
                 });
                 v_flex()
                     .gap_3()
+                    .children(name_field)
                     .child(form)
+                    .children(inputs_section)
                     .child(div().h(px(1.0)).flex_shrink_0().bg(border))
                     .child(v_flex().gap_1().children(issues))
                     .children(live_section)
@@ -2098,6 +2595,11 @@ impl Render for Inspector {
                     .into_any_element()
             }
         };
+        let body = v_flex()
+            .gap_3()
+            .child(node_body)
+            .child(div().h(px(1.0)).flex_shrink_0().bg(border))
+            .child(self.render_runs(cx));
 
         v_flex()
             .size_full()

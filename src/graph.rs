@@ -72,6 +72,8 @@ pub struct NodeView<'a> {
     pub id: NodeId,
     /// Name of the saved kind or preset this node was made from, if any.
     pub preset: Option<SharedString>,
+    /// The node's own name, if it has one.
+    pub name: Option<&'a str>,
     pub data: Option<&'a NodeData>,
 }
 
@@ -82,6 +84,8 @@ struct Node {
     pos: Point<Pixels>,
     /// The kind or preset this node was made from, if any.
     style: Option<NodeStyle>,
+    /// The node's own name, shown as its label and used by `{{name}}` in agent prompts.
+    name: Option<String>,
     /// Typed content; `None` for a blank node.
     data: Option<NodeData>,
 }
@@ -236,6 +240,7 @@ impl Graph {
             id,
             pos,
             style,
+            name: None,
             data,
         });
         self.set_selection(Some(Selection::Node(id)), cx);
@@ -512,12 +517,47 @@ impl Graph {
         Some(NodeView {
             id,
             preset: node.style.as_ref().map(|s| s.name.clone()),
+            name: node.name.as_deref(),
             data: node.data.as_ref(),
         })
     }
 
     pub fn node_data(&self, id: NodeId) -> Option<&NodeData> {
         self.node(id)?.data.as_ref()
+    }
+
+    pub fn node_name(&self, id: NodeId) -> Option<&str> {
+        self.node(id)?.name.as_deref()
+    }
+
+    /// Name or unname a node. The name is stored as typed; the inspector reports what is
+    /// wrong with it and the executor ignores a name that does not validate.
+    pub fn set_node_name(&mut self, id: NodeId, name: Option<String>, cx: &mut Context<Self>) {
+        if let Some(node) = self.node_mut(id) {
+            node.name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+            cx.notify();
+        }
+    }
+
+    /// The nodes wired into `id`, in id order: the order the executor sees them in.
+    pub fn inputs(&self, id: NodeId) -> Vec<NodeId> {
+        let mut from: Vec<NodeId> = self
+            .edges
+            .iter()
+            .filter(|e| e.to == id)
+            .map(|e| e.from)
+            .collect();
+        from.sort_unstable();
+        from.dedup();
+        from
+    }
+
+    /// Every named node, so the inspector can flag a name used twice.
+    pub fn named_nodes(&self) -> Vec<(NodeId, String)> {
+        self.nodes
+            .iter()
+            .filter_map(|n| Some((n.id, n.name.clone()?)))
+            .collect()
     }
 
     /// Replace a node's content. `None` makes it blank again.
@@ -546,9 +586,10 @@ impl Graph {
         cx.notify();
     }
 
-    /// The node's style for display. Typed content wins: it sets the color (its type's, or
-    /// red for a database that may write) and, when the node has no preset name, the
-    /// label. Otherwise the live kind color wins over the one captured at load time.
+    /// The node's style for display. The node's own name is the label when it has one,
+    /// else the preset or kind name, else the content type. Typed content sets the color
+    /// (its type's, or red for a database that may write). Otherwise the live kind color
+    /// wins over the one captured at load time; a named blank node without a kind is grey.
     fn resolved_style(&self, node: &Node) -> Option<NodeStyle> {
         resolve_style(node, &self.kinds)
     }
@@ -837,24 +878,28 @@ impl Render for Graph {
 
 /// See [`Graph::resolved_style`].
 fn resolve_style(node: &Node, kinds: &HashMap<String, Hsla>) -> Option<NodeStyle> {
+    let own: Option<SharedString> = node.name.clone().map(SharedString::from);
+    let preset = node.style.as_ref().map(|s| s.name.clone());
     if let Some(data) = &node.data {
         return Some(NodeStyle {
-            name: node
-                .style
-                .as_ref()
-                .map(|s| s.name.clone())
-                .unwrap_or_else(|| data.label().into()),
+            name: own.or(preset).unwrap_or_else(|| data.label().into()),
             color: data_color(data),
         });
     }
-    let style = node.style.as_ref()?;
-    Some(NodeStyle {
-        name: style.name.clone(),
-        color: kinds
-            .get(style.name.as_ref())
-            .copied()
-            .unwrap_or(style.color),
-    })
+    match (own, node.style.as_ref()) {
+        (name, Some(style)) => Some(NodeStyle {
+            name: name.unwrap_or_else(|| style.name.clone()),
+            color: kinds
+                .get(style.name.as_ref())
+                .copied()
+                .unwrap_or(style.color),
+        }),
+        (Some(name), None) => Some(NodeStyle {
+            name,
+            color: FALLBACK_KIND_COLOR,
+        }),
+        (None, None) => None,
+    }
 }
 
 /// The editor state as a document ready for disk: nodes and edges sorted by id so the
@@ -885,6 +930,7 @@ fn snapshot_doc(
                 x: n.pos.x.as_f32(),
                 y: n.pos.y.as_f32(),
                 kind: n.style.as_ref().map(|s| s.name.to_string()),
+                name: n.name.clone(),
                 color: resolve_style(n, kinds).map(|s| hex_of(s.color)),
                 data: n.data.clone(),
             })
@@ -935,6 +981,12 @@ fn restore_plan(doc: &GraphDoc, kinds: &HashMap<String, Hsla>) -> Restored {
                 id,
                 pos: point(px(n.x), px(n.y)),
                 style: style_from_doc(n, kinds),
+                name: n
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string),
                 data: n.data.clone(),
             }
         })
@@ -1109,7 +1161,8 @@ mod tests {
     // standard one, so the module names what it needs.
     use super::{
         Edge, FALLBACK_KIND_COLOR, Node, NodeId, NodeStyle, hex_of, hsla_of, node_key, parse_key,
-        restore_plan, segment_distance, snapshot_doc, style_from_doc, wire_distance, wrap,
+        resolve_style, restore_plan, segment_distance, snapshot_doc, style_from_doc, wire_distance,
+        wrap,
     };
     use crate::doc::{self, EdgeDoc, GraphDoc, NodeDoc, View};
     use crate::node_data::{
@@ -1124,6 +1177,7 @@ mod tests {
             x: 10.0,
             y: 20.0,
             kind: kind.map(String::from),
+            name: None,
             color: color.map(String::from),
             data: None,
         }
@@ -1311,6 +1365,46 @@ mod tests {
     }
 
     #[test]
+    fn labels_prefer_the_name_then_the_preset_then_the_type() {
+        let kinds = kinds(&[("Note", "#112233")]);
+        let label = |node: &Node| resolve_style(node, &kinds).map(|s| s.name.to_string());
+        let color = |node: &Node| resolve_style(node, &kinds).unwrap().color;
+        let mut node = Node {
+            id: 0,
+            pos: point(px(0.0), px(0.0)),
+            style: None,
+            name: None,
+            data: None,
+        };
+        assert_eq!(label(&node), None);
+        // A named blank node shows its name in the fallback grey.
+        node.name = Some("schema".into());
+        assert_eq!(label(&node), Some("schema".into()));
+        assert_eq!(color(&node), FALLBACK_KIND_COLOR);
+        // With a kind, the name still wins the label and the live kind color the fill.
+        node.style = Some(NodeStyle {
+            name: "Note".into(),
+            color: hsla_of("#999999").unwrap(),
+        });
+        assert_eq!(label(&node), Some("schema".into()));
+        assert_eq!(color(&node), hsla_of("#112233").unwrap());
+        node.name = None;
+        assert_eq!(label(&node), Some("Note".into()));
+        // Content keeps the preset label and colors by type; the type label is the last
+        // resort; a name beats both.
+        node.data = Some(NodeData::Data(DataConfig {
+            path: "a.csv".into(),
+            format: DataFormat::Csv,
+        }));
+        assert_eq!(label(&node), Some("Note".into()));
+        assert_eq!(color(&node), hsla_of(NodeType::Data.color()).unwrap());
+        node.style = None;
+        assert_eq!(label(&node), Some("Data".into()));
+        node.name = Some("rows".into());
+        assert_eq!(label(&node), Some("rows".into()));
+    }
+
+    #[test]
     fn snapshots_are_sorted_and_colored_by_content_and_round_trip() {
         let kinds = kinds(&[("Note", "#112233")]);
         let style = |name: &str, hex: &str| {
@@ -1324,18 +1418,21 @@ mod tests {
                 id: 3,
                 pos: point(px(1.0), px(2.0)),
                 style: None,
+                name: Some("sink".into()),
                 data: Some(NodeData::Database(DatabaseConfig::writable())),
             },
             Node {
                 id: 1,
                 pos: point(px(0.0), px(0.0)),
                 style: style("Note", "#999999"),
+                name: None,
                 data: None,
             },
             Node {
                 id: 2,
                 pos: point(px(5.0), px(5.0)),
                 style: style("Gone", "#abcdef"),
+                name: None,
                 data: Some(NodeData::Data(DataConfig {
                     path: "a.csv".into(),
                     format: DataFormat::Csv,
@@ -1359,6 +1456,8 @@ mod tests {
         assert_eq!(doc.nodes[1].color.as_deref(), Some(NodeType::Data.color()));
         assert_eq!(doc.nodes[2].kind, None);
         assert_eq!(doc.nodes[2].color.as_deref(), Some(WRITE_COLOR));
+        assert_eq!(doc.nodes[2].name.as_deref(), Some("sink"));
+        assert_eq!(doc.nodes[0].name, None);
         let edges: Vec<(&str, &str)> = doc
             .edges
             .iter()
@@ -1372,6 +1471,7 @@ mod tests {
         assert_eq!(restored.edges.len(), 3);
         assert_eq!(restored.next_id, 4);
         assert_eq!(restored.nodes[2].data, nodes[0].data);
+        assert_eq!(restored.nodes[2].name.as_deref(), Some("sink"));
         let again = snapshot_doc(
             "g",
             &restored.nodes,
