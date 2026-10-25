@@ -65,6 +65,7 @@ use crate::node_data::{
 use crate::providers::{self, Http};
 use crate::storage;
 use crate::validate;
+use crate::{review, workflow};
 
 pub const HTTP_TIMEOUT: Duration = Duration::from_secs(300);
 pub const DB_TIMEOUT: Duration = Duration::from_secs(300);
@@ -155,6 +156,8 @@ impl Output {
 
 #[derive(Debug)]
 pub struct Report {
+    /// Resolved run-form values, including defaults, for replay and history.
+    pub inputs: workflow::Values,
     pub log: Vec<String>,
     pub result: Result<Output, String>,
     pub elapsed: Duration,
@@ -453,6 +456,8 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// cancelled and reports nothing.
 #[derive(Clone, Default)]
 pub struct Control {
+    pub inputs: workflow::Values,
+    pub review: Option<review::Handler>,
     /// Outputs of earlier runs. `None` runs every node.
     pub cache: Option<Arc<Mutex<Cache>>>,
     /// Run every node even when the cache has its output; the cache is still updated.
@@ -548,7 +553,28 @@ pub fn run_all_with(
     control: &Control,
 ) -> Report {
     let start = Instant::now();
+    let resolved = if control.cancelled() {
+        Err(CANCELLED.into())
+    } else {
+        workflow::fields(doc, targets)
+            .and_then(|fields| workflow::resolve(&fields, &control.inputs, &dirs.data))
+    };
+    let inputs = match resolved {
+        Ok(inputs) => inputs,
+        Err(error) => {
+            return Report {
+                inputs: workflow::Values::new(),
+                log: Vec::new(),
+                result: Err(error),
+                elapsed: start.elapsed(),
+                reused: Vec::new(),
+                outputs: HashMap::new(),
+                failed: None,
+            };
+        }
+    };
     let mut runner = Runner {
+        inputs,
         graph: GraphIndex::new(doc),
         dirs,
         http,
@@ -591,6 +617,7 @@ pub fn run_all_with(
         runner.log(format!("run all: {finished} of {} finished", targets.len()));
     }
     Report {
+        inputs: runner.inputs,
         log: runner.log,
         result: result.map(Arc::unwrap_or_clone),
         elapsed: start.elapsed(),
@@ -605,6 +632,7 @@ pub fn run_all_with(
 }
 
 struct Runner<'a> {
+    inputs: workflow::Values,
     graph: GraphIndex<'a>,
     dirs: Dirs,
     http: &'a dyn Http,
@@ -878,6 +906,7 @@ impl Runner<'_> {
                 Some(cache_key(&config_json, &source, &upstream_keys))
             }
             NodeData::Data(_)
+            | NodeData::Input(_)
             | NodeData::Database(_)
             | NodeData::Directory(_)
             | NodeData::File(_) => None,
@@ -900,6 +929,25 @@ impl Runner<'_> {
         self.state(id, NodeState::Running);
         let outputs: Vec<Arc<Output>> = inputs.into_iter().map(|(_, done)| done.output).collect();
         let output = match data {
+            NodeData::Input(config) => {
+                let field = node.name.as_deref().unwrap_or_default().trim();
+                let value = self
+                    .inputs
+                    .get(field)
+                    .ok_or_else(|| format!("{id}: missing run input {field}"))?;
+                Ok(
+                    if config.kind == workflow::InputType::File && !value.is_empty() {
+                        let path = validate::resolve_inside(&self.dirs.data, value)?;
+                        Output::new(
+                            read_bounded(&path, MAX_FILE_BYTES)?,
+                            true,
+                            &format!("Input {field}: {value}"),
+                        )
+                    } else {
+                        Output::new(value.as_bytes().to_vec(), true, &format!("Input {field}"))
+                    },
+                )
+            }
             NodeData::Data(config) => self.run_data(config),
             NodeData::Script(config) => {
                 self.run_script(config, &join_text(id, &upstream, &outputs)?)
@@ -925,12 +973,13 @@ impl Runner<'_> {
             }
             NodeData::Directory(config) => self.run_directory(config),
             NodeData::File(config) if config.bundle => {
-                self.run_bundle(config, &join_text(id, &upstream, &outputs)?)
+                self.run_bundle(id, config, &join_text(id, &upstream, &outputs)?)
             }
             NodeData::File(config) => match outputs.as_slice() {
                 // A single binary input (an image from an agent) is written as it is.
-                [only] if !only.text => self.run_file(config, only.bytes.clone(), false),
+                [only] if !only.text => self.run_file(id, config, only.bytes.clone(), false),
                 _ => self.run_file(
+                    id,
                     config,
                     join_text(id, &upstream, &outputs)?.into_bytes(),
                     true,
@@ -941,8 +990,25 @@ impl Runner<'_> {
             lock(cache).store(id, key, output.clone());
         }
         self.state(id, NodeState::Done);
+        let key = if let NodeData::Input(_) = data {
+            let name = node.name.as_deref().unwrap_or_default().trim();
+            let value = self
+                .inputs
+                .get(name)
+                .map(String::as_str)
+                .unwrap_or_default();
+            key_of(&[
+                b"run-input-v1",
+                &config_json,
+                name.as_bytes(),
+                value.as_bytes(),
+                &output.bytes,
+            ])
+        } else {
+            content_key(data.node_type(), &output)
+        };
         Ok(Done {
-            key: content_key(data.node_type(), &output),
+            key,
             output: Arc::new(output),
         })
     }
@@ -953,6 +1019,7 @@ impl Runner<'_> {
     /// directories on the way. The path is checked again here and resolved after symlinks.
     fn run_file(
         &mut self,
+        id: &str,
         config: &FileConfig,
         bytes: Vec<u8>,
         textual: bool,
@@ -977,6 +1044,7 @@ impl Runner<'_> {
                 config.path
             ));
         }
+        self.review_writes(id, config, &[(&config.path, &path, &bytes)])?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("create {}: {e}", parent.display()))?;
@@ -1002,7 +1070,7 @@ impl Runner<'_> {
     /// in it can change or add several files at once. Every path is checked and resolved
     /// before anything is written; in Create mode one existing file stops the whole
     /// write. The output lists what was written.
-    fn run_bundle(&mut self, config: &FileConfig, text: &str) -> Result<Output, String> {
+    fn run_bundle(&mut self, id: &str, config: &FileConfig, text: &str) -> Result<Output, String> {
         let base = validate::directory_path(&config.path)?;
         let sections = split_sections(text);
         if sections.is_empty() {
@@ -1057,6 +1125,11 @@ impl Runner<'_> {
             }
             plan.push((shown, real, bytes, exists));
         }
+        let files: Vec<_> = plan
+            .iter()
+            .map(|(shown, real, bytes, _)| (shown.as_str(), real.as_path(), bytes.as_slice()))
+            .collect();
+        self.review_writes(id, config, &files)?;
         let mut summary = format!(
             "Wrote {} file{} under {}/\n",
             plan.len(),
@@ -1093,6 +1166,35 @@ impl Runner<'_> {
     }
 
     // ----- directories -----
+
+    fn review_writes(
+        &mut self,
+        id: &str,
+        config: &FileConfig,
+        files: &[(&str, &Path, &[u8])],
+    ) -> Result<(), String> {
+        self.check_cancel()?;
+        if !config.review {
+            return Ok(());
+        }
+        let handler = self.control.review.clone().ok_or(
+            "this write-file node requires review; run it in the app to approve the changes",
+        )?;
+        let batch = review::Batch::prepare(&self.dirs.root, id, files, config.mode)?;
+        self.log(format!(
+            "{id}: waiting for review of {} file(s)",
+            files.len()
+        ));
+        let decision = handler(batch.request.clone())?;
+        self.check_cancel()?;
+        if decision == review::Decision::Reject {
+            return Err(review::REJECTED.into());
+        }
+        batch.verify(&self.dirs.root)?;
+        self.check_cancel()?;
+        self.log(format!("{id}: approved {} file(s)", files.len()));
+        Ok(())
+    }
 
     /// Read a directory as text: the files that pass the filters, then their contents up
     /// to the budget. Hidden entries and symlinks are never read.
@@ -2605,6 +2707,7 @@ mod tests {
             fresh: false,
             cancel: Arc::new(AtomicBool::new(false)),
             progress: Some(Arc::new(move |p| sink.lock().unwrap().push(p))),
+            ..Control::default()
         };
         (control, seen)
     }
@@ -4453,6 +4556,396 @@ mod tests {
     }
 
     #[test]
+    fn reviewed_note_example_runs_offline_with_per_run_overrides() {
+        let root = scratch("reviewed-example");
+        let doc: GraphDoc =
+            serde_json::from_str(include_str!("../examples/reviewed-note.json")).unwrap();
+        let original = serde_json::to_string(&doc).unwrap();
+        let http = FakeHttp::new(200, "{}");
+        let mut control = Control {
+            inputs: workflow::Values::from([("note".into(), "# Changed for this run\n".into())]),
+            review: Some(Arc::new(|_| Ok(review::Decision::Reject))),
+            ..Control::default()
+        };
+        assert_eq!(
+            run_all_with(
+                &doc,
+                &sinks(&doc),
+                Dirs::under(&root),
+                &http,
+                &no_env,
+                &control
+            )
+            .result
+            .unwrap_err(),
+            review::REJECTED
+        );
+        assert!(!root.join("generated").exists());
+        control.review = Some(Arc::new(|request| {
+            assert_eq!(request.files[0].path, "generated/note.md");
+            assert!(request.files[0].diff.contains("+# Changed for this run"));
+            Ok(review::Decision::Apply)
+        }));
+        let report = run_all_with(
+            &doc,
+            &sinks(&doc),
+            Dirs::under(&root),
+            &http,
+            &no_env,
+            &control,
+        );
+        report.result.unwrap();
+        assert_eq!(report.inputs["note"], "# Changed for this run\n");
+        assert_eq!(
+            fs::read_to_string(root.join("generated/note.md")).unwrap(),
+            "# Changed for this run\n"
+        );
+        assert_eq!(serde_json::to_string(&doc).unwrap(), original);
+        assert!(http.seen.lock().unwrap().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn run_inputs_flow_through_templates_and_invalidate_cached_agents() {
+        let root = scratch("run-inputs");
+        let mut question = node(
+            "n0",
+            Some(NodeData::Input(workflow::InputConfig {
+                default: "Default question".into(),
+                ..workflow::InputConfig::default()
+            })),
+        );
+        question.name = Some("question".into());
+        let mut count = node(
+            "n1",
+            Some(NodeData::Input(workflow::InputConfig {
+                kind: workflow::InputType::Number,
+                default: "2".into(),
+                required: true,
+            })),
+        );
+        count.name = Some("count".into());
+        let doc = graph(
+            vec![
+                question,
+                count,
+                node(
+                    "n2",
+                    Some(NodeData::Agent(AgentConfig {
+                        prompt: "Question: {{question}}".into(),
+                        message: "Count: {{count}}".into(),
+                        ..fake_agent()
+                    })),
+                ),
+            ],
+            &[("n0", "n2"), ("n1", "n2")],
+        );
+        let original = serde_json::to_string(&doc).unwrap();
+        let http = FakeHttp::new(200, r#"{"choices":[{"message":{"content":"answer"}}]}"#);
+        let (mut control, _) = recording_control();
+        let first = run_with(&doc, "n2", Dirs::under(&root), &http, &with_key, &control);
+        first.result.as_ref().unwrap();
+        assert_eq!(first.inputs["question"], "Default question");
+        assert_eq!(first.inputs["count"], "2");
+        assert_eq!(
+            http.seen.lock().unwrap()[0].body["messages"][0]["content"],
+            "Question: Default question"
+        );
+        let repeated = run_with(&doc, "n2", Dirs::under(&root), &http, &with_key, &control);
+        repeated.result.unwrap();
+        assert_eq!(repeated.reused, ["n2"]);
+        control.inputs.insert(
+            "question".into(),
+            "{{literal}} is not another template".into(),
+        );
+        let changed = run_with(&doc, "n2", Dirs::under(&root), &http, &with_key, &control);
+        changed.result.as_ref().unwrap();
+        assert!(changed.reused.is_empty());
+        assert_eq!(http.seen.lock().unwrap().len(), 2);
+        assert_eq!(
+            http.seen.lock().unwrap()[1].body["messages"][0]["content"],
+            "Question: {{literal}} is not another template"
+        );
+        let record = crate::history::record(&doc, &["n2".into()], &changed, None);
+        assert_eq!(record.inputs, changed.inputs);
+        assert_eq!(
+            serde_json::to_string(&doc).unwrap(),
+            original,
+            "run values never mutate the graph"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_input_values_and_file_contents_both_enter_the_cache_key() {
+        let root = scratch("file-inputs");
+        for name in ["a.txt", "b.txt"] {
+            fs::write(root.join("data").join(name), "same bytes").unwrap();
+        }
+        let mut input = node(
+            "n0",
+            Some(NodeData::Input(workflow::InputConfig {
+                kind: workflow::InputType::File,
+                default: "a.txt".into(),
+                required: true,
+            })),
+        );
+        input.name = Some("attachment".into());
+        let doc = graph(
+            vec![input, node("n1", Some(NodeData::Agent(fake_agent())))],
+            &[("n0", "n1")],
+        );
+        let http = FakeHttp::new(200, r#"{"choices":[{"message":{"content":"answer"}}]}"#);
+        let (mut control, _) = recording_control();
+        run_with(&doc, "n1", Dirs::under(&root), &http, &with_key, &control)
+            .result
+            .unwrap();
+        control.inputs.insert("attachment".into(), "b.txt".into());
+        run_with(&doc, "n1", Dirs::under(&root), &http, &with_key, &control)
+            .result
+            .unwrap();
+        assert_eq!(
+            http.seen.lock().unwrap().len(),
+            2,
+            "a different selection is a different run input"
+        );
+        fs::write(root.join("data/b.txt"), "changed bytes").unwrap();
+        run_with(&doc, "n1", Dirs::under(&root), &http, &with_key, &control)
+            .result
+            .unwrap();
+        assert_eq!(http.seen.lock().unwrap().len(), 3);
+        control
+            .inputs
+            .insert("attachment".into(), "../outside.txt".into());
+        assert!(
+            run_with(&doc, "n1", Dirs::under(&root), &http, &with_key, &control)
+                .result
+                .is_err()
+        );
+        assert_eq!(http.seen.lock().unwrap().len(), 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_or_invalid_run_values_fail_before_any_side_effect() {
+        let root = scratch("input-preflight");
+        fs::write(root.join("data/source.txt"), "payload").unwrap();
+        let mut input = node(
+            "n2",
+            Some(NodeData::Input(workflow::InputConfig {
+                kind: workflow::InputType::Number,
+                ..workflow::InputConfig::default()
+            })),
+        );
+        input.name = Some("amount".into());
+        let doc = graph(
+            vec![
+                node("n0", data("source.txt", DataFormat::Text)),
+                node(
+                    "n1",
+                    Some(NodeData::File(FileConfig {
+                        path: "out.txt".into(),
+                        ..FileConfig::default()
+                    })),
+                ),
+                input,
+                node("n3", Some(NodeData::Agent(fake_agent()))),
+            ],
+            &[("n0", "n1"), ("n1", "n3"), ("n2", "n3")],
+        );
+        let http = FakeHttp::new(200, "{}");
+        for supplied in [
+            workflow::Values::new(),
+            workflow::Values::from([("amount".into(), "NaN".into())]),
+        ] {
+            let report = run_with(
+                &doc,
+                "n3",
+                Dirs::under(&root),
+                &http,
+                &with_key,
+                &Control {
+                    inputs: supplied,
+                    ..Control::default()
+                },
+            );
+            assert!(report.result.unwrap_err().contains("amount"));
+            assert!(report.outputs.is_empty());
+            assert!(!root.join("out.txt").exists());
+        }
+        assert!(http.seen.lock().unwrap().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reviewed_writes_pause_downstream_execution_until_the_batch_is_approved() {
+        let root = scratch("review-apply");
+        fs::write(
+            root.join("data/answer.txt"),
+            "=== a.txt ===\nfirst\n=== b.txt ===\nsecond\n",
+        )
+        .unwrap();
+        let doc = graph(
+            vec![
+                node("n0", data("answer.txt", DataFormat::Text)),
+                node(
+                    "n1",
+                    Some(NodeData::File(FileConfig {
+                        path: "out".into(),
+                        bundle: true,
+                        review: true,
+                        ..FileConfig::default()
+                    })),
+                ),
+                node("n2", Some(NodeData::Agent(fake_agent()))),
+            ],
+            &[("n0", "n1"), ("n1", "n2")],
+        );
+        let http = Arc::new(FakeHttp::new(
+            200,
+            r#"{"choices":[{"message":{"content":"done"}}]}"#,
+        ));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (mut control, _) = recording_control();
+        let cancel = control.cancel.clone();
+        control.review = Some(Arc::new(move |request| {
+            review::wait(request, &cancel, |pending| tx.send(pending).unwrap())
+        }));
+        let worker_root = root.clone();
+        let worker_http = http.clone();
+        let worker = thread::spawn(move || {
+            run_with(
+                &doc,
+                "n2",
+                Dirs::under(&worker_root),
+                &*worker_http,
+                &with_key,
+                &control,
+            )
+        });
+        let pending = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(pending.request.node, "n1");
+        assert_eq!(pending.request.files.len(), 2);
+        assert!(pending.request.files[0].diff.contains("+first"));
+        assert!(!root.join("out").exists());
+        assert!(http.seen.lock().unwrap().is_empty());
+        assert!(pending.decide(review::Decision::Apply));
+        let report = worker.join().unwrap();
+        assert_eq!(report.result.unwrap().as_text(), Some("done"));
+        assert_eq!(
+            fs::read_to_string(root.join("out/a.txt")).unwrap(),
+            "first\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("out/b.txt")).unwrap(),
+            "second\n"
+        );
+        assert_eq!(http.seen.lock().unwrap().len(), 1);
+        assert!(report.log.iter().any(|line| line.contains("approved 2")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejecting_or_cancelling_review_never_writes_or_runs_downstream() {
+        let root = scratch("review-reject");
+        fs::write(root.join("data/answer.txt"), "new").unwrap();
+        fs::write(root.join("out.txt"), "old").unwrap();
+        let doc = graph(
+            vec![
+                node("n0", data("answer.txt", DataFormat::Text)),
+                node(
+                    "n1",
+                    Some(NodeData::File(FileConfig {
+                        path: "out.txt".into(),
+                        mode: WriteMode::Overwrite,
+                        review: true,
+                        ..FileConfig::default()
+                    })),
+                ),
+                node("n2", Some(NodeData::Agent(fake_agent()))),
+            ],
+            &[("n0", "n1"), ("n1", "n2")],
+        );
+        let http = FakeHttp::new(200, "{}");
+        let no_reviewer = run(&doc, "n2", Dirs::under(&root), &http, &with_key);
+        assert!(no_reviewer.result.unwrap_err().contains("requires review"));
+        for cancel in [false, true] {
+            let mut control = Control::default();
+            let flag = control.cancel.clone();
+            control.review = Some(Arc::new(move |request| {
+                assert!(request.files[0].diff.contains("-old"));
+                if cancel {
+                    flag.store(true, Ordering::Relaxed);
+                    Ok(review::Decision::Apply)
+                } else {
+                    Ok(review::Decision::Reject)
+                }
+            }));
+            let report = run_with(&doc, "n2", Dirs::under(&root), &http, &with_key, &control);
+            assert_eq!(
+                report.result.unwrap_err(),
+                if cancel { CANCELLED } else { review::REJECTED }
+            );
+            assert!(!report.outputs.contains_key("n1"));
+            assert!(!report.outputs.contains_key("n2"));
+            assert_eq!(fs::read_to_string(root.join("out.txt")).unwrap(), "old");
+        }
+        assert!(http.seen.lock().unwrap().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_stale_file_stops_an_approved_batch_before_its_first_write() {
+        let root = scratch("review-stale");
+        fs::create_dir(root.join("out")).unwrap();
+        fs::write(root.join("out/b.txt"), "original").unwrap();
+        fs::write(
+            root.join("data/answer.txt"),
+            "=== a.txt ===\nnew file\n=== b.txt ===\nreplacement\n",
+        )
+        .unwrap();
+        let doc = graph(
+            vec![
+                node("n0", data("answer.txt", DataFormat::Text)),
+                node(
+                    "n1",
+                    Some(NodeData::File(FileConfig {
+                        path: "out".into(),
+                        mode: WriteMode::Overwrite,
+                        bundle: true,
+                        review: true,
+                        ..FileConfig::default()
+                    })),
+                ),
+            ],
+            &[("n0", "n1")],
+        );
+        let edited = root.join("out/b.txt");
+        let control = Control {
+            review: Some(Arc::new(move |_| {
+                fs::write(&edited, "edited during review").unwrap();
+                Ok(review::Decision::Apply)
+            })),
+            ..Control::default()
+        };
+        let report = run_with(
+            &doc,
+            "n1",
+            Dirs::under(&root),
+            &FakeHttp::new(200, "{}"),
+            &no_env,
+            &control,
+        );
+        assert!(report.result.unwrap_err().contains("changed since review"));
+        assert!(!root.join("out/a.txt").exists());
+        assert_eq!(
+            fs::read_to_string(root.join("out/b.txt")).unwrap(),
+            "edited during review"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn run_all_covers_every_sink_once_and_outlives_a_failure() {
         let root = scratch("run-all");
         fs::write(root.join("data/a.txt"), "v1").unwrap();
@@ -4884,6 +5377,7 @@ mod tests {
                 mode,
                 unfence: true,
                 bundle: true,
+                review: false,
             }))
         };
         let doc = graph(
@@ -5053,6 +5547,7 @@ mod tests {
                     stop.store(true, Ordering::Relaxed);
                 }
             })),
+            ..Control::default()
         };
         let report = run_with(&doc, "n0", Dirs::under(&root), &http, &with_key, &control);
         assert_eq!(report.result.unwrap_err(), CANCELLED);
@@ -5096,6 +5591,7 @@ mod tests {
                 mode,
                 unfence,
                 bundle: false,
+                review: false,
             }))
         };
         let doc = graph(
@@ -5215,6 +5711,7 @@ mod tests {
                 mode: WriteMode::Overwrite,
                 unfence: false,
                 bundle: false,
+                review: false,
             }))
         };
         let doc = graph(
@@ -5299,6 +5796,7 @@ mod tests {
                                     mode,
                                     bundle,
                                     unfence: false,
+                                    review: false,
                                 })),
                             ),
                         ],
@@ -5338,6 +5836,7 @@ mod tests {
                         mode: WriteMode::Create,
                         bundle: true,
                         unfence: false,
+                        review: false,
                     })),
                 ),
             ],
@@ -5437,6 +5936,7 @@ mod tests {
                 mode: WriteMode::Overwrite,
                 unfence: true,
                 bundle: true,
+                review: false,
             }))
         };
         let doc = graph(
@@ -5621,6 +6121,7 @@ mod tests {
                 mode: WriteMode::Overwrite,
                 unfence: true,
                 bundle: false,
+                review: false,
             })),
         ));
         doc.edges.push(EdgeDoc {

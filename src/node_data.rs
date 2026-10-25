@@ -18,10 +18,11 @@ pub const WRITE_COLOR: &str = "#ef4444";
 /// Picker label for a database node created with its read-only flag off.
 pub const WRITABLE_DATABASE_LABEL: &str = "Database (write)";
 
-/// The six kinds of content a node can carry.
+/// The kinds of content a node can carry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NodeType {
+    Input,
     Agent,
     Database,
     Script,
@@ -32,7 +33,8 @@ pub enum NodeType {
 }
 
 impl NodeType {
-    pub const ALL: [NodeType; 6] = [
+    pub const ALL: [NodeType; 7] = [
+        Self::Input,
         Self::Agent,
         Self::Database,
         Self::Script,
@@ -43,6 +45,7 @@ impl NodeType {
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::Input => "Run input",
             Self::Agent => "Agent",
             Self::Database => "Database",
             Self::Script => "Script",
@@ -56,6 +59,7 @@ impl NodeType {
     /// writable database: red means the node changes something outside `agents/`.
     pub fn color(self) -> &'static str {
         match self {
+            Self::Input => "#06b6d4",
             Self::Agent => "#8b5cf6",
             Self::Database => "#0ea5e9",
             Self::Script => "#f59e0b",
@@ -74,6 +78,7 @@ impl NodeType {
     /// A fresh, default configuration of this type.
     pub fn default_data(self) -> NodeData {
         match self {
+            Self::Input => NodeData::Input(crate::workflow::InputConfig::default()),
             Self::Agent => NodeData::Agent(AgentConfig::default()),
             Self::Database => NodeData::Database(DatabaseConfig::default()),
             Self::Script => NodeData::Script(ScriptConfig::default()),
@@ -88,6 +93,7 @@ impl NodeType {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum NodeData {
+    Input(crate::workflow::InputConfig),
     Agent(AgentConfig),
     Database(DatabaseConfig),
     Script(ScriptConfig),
@@ -99,6 +105,7 @@ pub enum NodeData {
 impl NodeData {
     pub fn node_type(&self) -> NodeType {
         match self {
+            Self::Input(_) => NodeType::Input,
             Self::Agent(_) => NodeType::Agent,
             Self::Database(_) => NodeType::Database,
             Self::Script(_) => NodeType::Script,
@@ -128,6 +135,7 @@ impl NodeData {
     /// One short line for the canvas: the most identifying setting of the config.
     pub fn summary(&self) -> String {
         match self {
+            Self::Input(input) => input.summary(),
             Self::Agent(a) => a.summary(),
             Self::Database(d) => d.summary(),
             Self::Script(s) => s.summary(),
@@ -140,6 +148,7 @@ impl NodeData {
     /// Everything wrong with the config. Empty means it is safe to save and (later) run.
     pub fn validate(&self) -> Vec<Issue> {
         match self {
+            Self::Input(input) => input.validate(),
             Self::Agent(a) => a.validate(),
             Self::Database(d) => d.validate(),
             Self::Script(s) => s.validate(),
@@ -1018,6 +1027,9 @@ pub struct FileConfig {
     pub unfence: bool,
     /// Write one file per `=== path ===` section under `path`.
     pub bundle: bool,
+    /// Pause this node for review before creating directories or writing any file.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub review: bool,
 }
 
 impl Default for FileConfig {
@@ -1027,6 +1039,7 @@ impl Default for FileConfig {
             mode: WriteMode::Create,
             unfence: true,
             bundle: false,
+            review: false,
         }
     }
 }

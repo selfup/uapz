@@ -2,7 +2,8 @@
 
 A small native node-graph editor built with [gpui-kit](https://gpui-kit.com). Nodes are
 boxes you drag around and wire together; each one can carry typed content: an **agent**,
-a **database**, a **script**, a **data** file, a **directory** or a **file to write**.
+a **database**, a **script**, a **data** file, a **directory**, a **file to write**, or a
+named **Run input** supplied each time the graph runs.
 Graphs save as a Markdown file with a Mermaid diagram plus a JSON sidecar, and reusable
 agents, prompts and databases save into their own directories so they show up in the
 sidebar.
@@ -58,7 +59,7 @@ an inspector on the right. Drag the divider beside either side panel to resize i
 - Click a node or a wire to select it. Backspace or Delete removes it. Deleting a node
   removes its wires.
 - Double-click empty space, press cmd-n, or click **Add node** to add a node of whatever
-  the toolbar dropdown has selected: **Blank**, one of the six types, **Database
+  the toolbar dropdown has selected: **Blank**, one of the seven types, **Database
   (write)**, or a saved kind.
 - Escape cancels a drag and clears the selection.
 - A typed node shows its label (its name if it has one, else its type or the preset it
@@ -81,7 +82,7 @@ an inspector on the right. Drag the divider beside either side panel to resize i
   agent wired after it write `{{name}}` for its output. Names are letters, digits, `_`
   and `-`, start with a letter, and must be unique to be useful; the panel says when one
   is not.
-- A blank node offers buttons to give it content: the six types plus **Database (write)**,
+- A blank node offers buttons to give it content: the seven types plus **Database (write)**,
   a database node that starts with its read-only switch off. A typed node can change type
   or go back to blank at the bottom of the panel.
 - Problems are listed under the form as they happen (`model: model is empty`, `query:
@@ -111,6 +112,12 @@ an inspector on the right. Drag the divider beside either side panel to resize i
   its outputs, dots and log without running anything; the status line says so. **Run all**
   (also cmd-enter and the toolbar button) runs every end node of the graph in one pass.
   See *Running nodes*.
+- **Run input** nodes turn a saved graph into a reusable tool. Run and Run all first ask
+  for the named inputs their targets need. Change the values in the Run form and press
+  **Start run**; the graph's saved configuration and defaults stay unchanged.
+- A write-file node with **Review changes before writing** enabled pauses with a diff
+  for every proposed file. **Apply** approves the entire batch and continues downstream;
+  **Reject batch** leaves that batch untouched; **Cancel run** stops the whole run.
 
 **Sidebar**
 
@@ -129,6 +136,49 @@ Every section header collapses on click. Sections, top to bottom:
   **↻** re-reads the directories.
 
 ## Node types
+
+**Run input**
+
+| Field | Notes |
+| --- | --- |
+| Name | Required, unique among the run's inputs; also the name an agent wired after it uses in `{{name}}` |
+| Input type | Text, Number, Boolean, JSON, or File from `data/` |
+| Default value | Used initially when the Run form has no previous value for this name; may be empty even for a required field |
+| A value is required | On by default. Clearing a required value is an error; clearing an optional value sends empty text |
+
+Run inputs are source nodes, so they have no incoming wires. Text preserves its spacing;
+numbers must be finite JSON numbers; booleans are `true` or `false`; JSON is validated and
+compacted. File inputs offer a selector over `data/` plus a relative-path field, and send
+the selected file's contents (up to 64 MB), as text when valid UTF-8 and binary otherwise.
+File paths cannot leave `data/`, including through symlinks.
+
+For example, add a Text input named `question` and a File input named `source`, wire both
+to an agent, and use `{{question}}` and `{{source}}` in its prompt or message. Wire the
+agent to a write-file node and enable review there. **Run all** now asks for the question
+and document, generates an answer, and pauses for file review before applying it.
+
+Only inputs reachable from the requested targets appear in the form. All their values
+are validated before any node executes. A run accepts up to 64 fields, 256 KB per value,
+and 1 MB of values combined. Actual file contents have their separate 64 MB limit.
+
+The latest run's values prefill the next form, including after reopening the graph.
+Opening an older entry in **Runs** uses that entry's values for the next form. Values,
+including effective defaults, are stored in the run record and shown below the run list;
+credentials should continue to use the existing environment-variable fields. Input
+values and file contents both participate in downstream cache keys, so changing either
+recomputes affected agents and scripts. Saving a graph stores input definitions and
+defaults, never the Run form's overrides.
+
+To try both features without a model or API key, copy the included example into the
+graph library before starting the app:
+
+```sh
+mkdir -p graphs
+cp examples/reviewed-note.json examples/reviewed-note.md graphs/
+```
+
+Open **reviewed-note** and press **Run all**. Edit `note`, start the run, then inspect
+and apply or reject the proposed change to `generated/note.md`.
 
 **Agent**
 
@@ -201,6 +251,7 @@ them on disk. The node is red because it changes files outside the app's own fol
 | If the file exists | **Create only** (the default) refuses to touch an existing file; **Overwrite** replaces it; **Append** adds to it |
 | Split sections | Off: the whole text becomes the one file. On: the field names a directory (`.` for the working directory) and the text is split on `=== path ===` headers, one file per section under it. See below |
 | Strip a code fence | On by default: a surrounding ```` ``` ```` fence is removed and the text ends with a newline, which is what a model's answer needs to become a source file. Off writes the bytes as they came |
+| Review changes before writing | Off by default for compatibility. On pauses the run with a per-file diff before this node creates directories or writes anything |
 
 A single binary input (an image from an agent) is written byte for byte. The node's output
 is what it wrote, so a script can run on the file next.
@@ -228,6 +279,24 @@ aliases to the same file and file/directory conflicts are errors, and one answer
 at most 500 files. Create only also refuses a file created by another writer after the
 initial check. The output lists what was written.
 
+**Review and apply.** A reviewed write shows the final bytes after code-fence removal and,
+for Append, the resulting file with its original contents retained. Use **Previous file**
+and **Next file** to inspect a batch, and the page controls for long diffs. Binary changes
+show their byte counts and are explicitly identified as having no text diff.
+
+Applying rechecks every destination against its captured contents and resolved path.
+If a file was edited, deleted, created or redirected through a symlink during review,
+the entire batch is refused before its first write; rerun to see the updated diff.
+Rejection stops this node and its dependents; independent Run all targets can continue.
+Cancellation, closing the inspector, or replacing the graph also stops a pending review.
+Earlier completed nodes and their saved agent outputs remain available.
+
+Review captures at most 64 MB of original files and produces at most 1 MB of diff text.
+Larger diffs are refused with a request to split the batch; changed lines are never
+silently omitted. These are preflight checks, not a filesystem transaction: an I/O
+failure during application can leave earlier files in the batch written. Reviewed nodes
+require an interactive reviewer; an executor call without one fails instead of writing.
+
 ## Running nodes
 
 Press **Run** in the inspector. The executor checks the target's complete dependency graph
@@ -240,6 +309,7 @@ with independent targets after a failure:
 
 | Node | What runs | Takes from the wire | Produces |
 | --- | --- | --- | --- |
+| Run input | Validates the supplied value or default; a File input reads its selected file | nothing | typed text, JSON, or file bytes |
 | Data | Reads the file (up to 64 MB) | nothing | the file; text for CSV, TSV, JSON, Text and Markdown, binary otherwise |
 | Script | `uv run --quiet <file>`, `sh`/`bash`/`zsh <file>` or `node <file>` with the arguments, in `scripts/` | stdin | stdout as text; non-zero exit or the timeout is an error |
 | Database | `sqlite3 -json`, `duckdb -json`, `psql --csv` or `mysql --batch` with the query on stdin | the SQL to run, only when the node's own query is empty; data comes from the input file | rows as JSON (file engines) or CSV/TSV (server engines) |
@@ -267,7 +337,7 @@ component. It runs these targets in id order in one pass: a node two of them sha
 once, a failed node is not tried again for the next target, and a failed target does not
 stop the others. Cancellation stops the pass even after an earlier failure. Every
 finished run is written to
-`runs/<graph>/<timestamp>.json` with its log, outcome, targets, and for every node its
+`runs/<graph>/<timestamp>.json` with its log, outcome, targets, resolved run inputs, and for every node its
 state, its content at the time, the label and a 4000-character preview of its output, and
 the content key under which `cache/` holds the full bytes (outputs over 8 MB keep only the
 preview). Two hundred records are kept per graph; unsaved graphs file under `untitled`.
@@ -512,6 +582,9 @@ ids and `-->` edges (node shapes and `|labels|` are tolerated) and laid out left
 | `src/sidebar.rs` | Workspace: sidebar sections, toolbar, layout |
 | `src/inspector.rs` | The node content editor on the right, with Run |
 | `src/exec.rs` | The executor: upstream ordering, files, child processes, database tools, agent runs |
+| `src/workflow.rs` | Run input definitions, reachable fields, typed values and validation |
+| `src/review.rs` | File snapshots, bounded diffs, review decisions and stale-file checks |
+| `src/history.rs` | Run records, input values, output previews and history replay |
 | `src/providers.rs` | Provider request builders and reply parsers; the HTTP client, plain and streamed |
 | `.github/workflows/ci.yml` | Format, clippy and tests on every push |
 | `src/graph.rs` | The editor view: nodes, wires, dragging, selection |

@@ -35,6 +35,9 @@ pub const PREVIEW_CHARS: usize = 4000;
 /// One run of a graph.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Run {
+    /// Values supplied to Run input nodes, including their effective defaults.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub inputs: crate::workflow::Values,
     /// When the run finished, as a UTC timestamp (`YYYYMMDDTHHMMSSmmmZ`); also the file
     /// stem.
     pub id: String,
@@ -208,6 +211,7 @@ pub fn record(
         nodes.insert(id.clone(), failed);
     }
     Run {
+        inputs: report.inputs.clone(),
         id: library::timestamp(),
         graph: graph_name(&doc.name),
         targets: targets.to_vec(),
@@ -291,6 +295,7 @@ impl Run {
             Outcome::Cancelled => Err(exec::CANCELLED.to_string()),
         };
         Report {
+            inputs: self.inputs.clone(),
             log: self.log.clone(),
             result,
             elapsed: Duration::from_millis(self.elapsed_ms),
@@ -436,12 +441,33 @@ mod tests {
         }
         Report {
             log: vec!["n0: data".into(), "n1: data".into()],
+            inputs: crate::workflow::Values::new(),
             result,
             elapsed: Duration::from_millis(1500),
             reused: vec!["n0".into()],
             outputs,
             failed: failed.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn run_values_survive_persistence_and_older_records_still_load() {
+        let root = scratch("inputs");
+        let mut report = report(Ok(output("result")), None);
+        report.inputs = crate::workflow::Values::from([
+            ("question".into(), "How many?".into()),
+            ("count".into(), "3".into()),
+        ]);
+        let run = record(&doc(), &["n1".into()], &report, None);
+        save(&root, &run).unwrap();
+        let loaded = list(&root, &run.graph).pop().unwrap();
+        assert_eq!(loaded.inputs, report.inputs);
+        assert_eq!(loaded.report(None).inputs, report.inputs);
+        let mut legacy = serde_json::to_value(&run).unwrap();
+        legacy.as_object_mut().unwrap().remove("inputs");
+        let legacy: Run = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.inputs.is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "name": "reviewed-note",
+  "view": { "pan_x": 0.0, "pan_y": 0.0 },
+  "nodes": [
+    {
+      "id": "n0",
+      "x": 80.0,
+      "y": 100.0,
+      "name": "note",
+      "data": {
+        "type": "input",
+        "kind": "text",
+        "default": "# My note\n\nEdit this text in the Run form.\n",
+        "required": true
+      }
+    },
+    {
+      "id": "n1",
+      "x": 360.0,
+      "y": 100.0,
+      "name": "save-note",
+      "data": {
+        "type": "file",
+        "path": "generated/note.md",
+        "mode": "overwrite",
+        "unfence": false,
+        "bundle": false,
+        "review": true
+      }
+    }
+  ],
+  "edges": [{ "from": "n0", "to": "n1" }]
+}

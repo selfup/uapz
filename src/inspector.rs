@@ -52,6 +52,10 @@ use crate::node_data::{
 };
 use crate::providers::{self, UreqHttp};
 use crate::validate::{self, Issue};
+use crate::{
+    review,
+    workflow::{self, InputConfig, InputType},
+};
 
 /// Initial inspector width; the divider next to it resizes it.
 pub const INSPECTOR_W: f32 = 320.0;
@@ -65,6 +69,7 @@ const RUNS_SHOWN: usize = 12;
 /// What the executor's thread writes and the panel reads while a run is going.
 #[derive(Default)]
 struct Live {
+    review: Option<review::Pending>,
     log: Vec<String>,
     /// The node whose text is streaming in, and the text so far.
     stream: Option<(String, String)>,
@@ -121,7 +126,28 @@ impl EventEmitter<InspectorEvent> for Inspector {}
 
 type StrSelect = SelectState<Vec<SharedString>>;
 
+struct RunField {
+    field: workflow::Field,
+    value: Entity<TextareaState>,
+    choices: Option<Entity<StrSelect>>,
+}
+
+struct RunForm {
+    doc: GraphDoc,
+    targets: Vec<NodeId>,
+    fresh: bool,
+    fields: Vec<RunField>,
+    error: Option<String>,
+    _subscriptions: Vec<Subscription>,
+}
+
 pub struct Inspector {
+    scroll: ScrollHandle,
+    run_form: Option<RunForm>,
+    run_values: workflow::Values,
+    pending_review: Option<review::Pending>,
+    review_file: usize,
+    review_page: usize,
     graph: Entity<Graph>,
     /// The node being edited, mirrored from the graph's selection.
     node: Option<NodeId>,
@@ -156,6 +182,10 @@ pub struct Inspector {
     /// The selected node's own name.
     node_name: Entity<InputState>,
     preset_name: Entity<InputState>,
+    // run input definition
+    input_kind: Entity<StrSelect>,
+    input_default: Entity<TextareaState>,
+    input_required: bool,
     // agent
     provider: Entity<StrSelect>,
     endpoint: Entity<InputState>,
@@ -202,6 +232,7 @@ pub struct Inspector {
     file_mode: Entity<StrSelect>,
     file_unfence: bool,
     file_bundle: bool,
+    file_review: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -305,6 +336,8 @@ impl Inspector {
 
         let node_name = text("name, for {{name}} in agent prompts", window, cx);
         let preset_name = text("preset name", window, cx);
+        let input_kind = enum_select(&InputType::ALL, InputType::label, window, cx);
+        let input_default = area("Optional default for the Run form", 3, window, cx);
         let provider = enum_select(&Provider::ALL, Provider::label, window, cx);
         let endpoint = text(Provider::Ollama.default_endpoint(), window, cx);
         let model_type = enum_select(&ModelType::ALL, ModelType::label, window, cx);
@@ -391,7 +424,7 @@ impl Inspector {
                 },
             ));
         }
-        for state in [&prompt, &message, &query] {
+        for state in [&prompt, &message, &query, &input_default] {
             subscriptions.push(cx.subscribe_in(
                 state,
                 window,
@@ -432,7 +465,7 @@ impl Inspector {
             },
         ));
         // Dropdowns.
-        for state in [&output, &engine, &runtime, &format, &file_mode] {
+        for state in [&output, &engine, &runtime, &format, &file_mode, &input_kind] {
             subscriptions.push(cx.subscribe_in(
                 state,
                 window,
@@ -474,6 +507,12 @@ impl Inspector {
         ));
 
         let mut inspector = Self {
+            scroll: ScrollHandle::new(),
+            run_form: None,
+            run_values: workflow::Values::new(),
+            pending_review: None,
+            review_file: 0,
+            review_page: 0,
             graph,
             node: None,
             kind: None,
@@ -493,6 +532,9 @@ impl Inspector {
             graph_name: String::new(),
             node_name,
             preset_name,
+            input_kind,
+            input_default,
+            input_required: true,
             provider,
             endpoint,
             model_type,
@@ -532,6 +574,7 @@ impl Inspector {
             file_mode,
             file_unfence: true,
             file_bundle: false,
+            file_review: false,
             _subscriptions: subscriptions,
         };
         inspector.reload(window, cx);
@@ -545,6 +588,14 @@ impl Inspector {
 
     /// A different graph is loaded: node ids mean other nodes now.
     fn forget_results(&mut self, cx: &mut Context<Self>) {
+        if let Some(job) = self.job.take() {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+        self.run_form = None;
+        self.run_values.clear();
+        self.pending_review = None;
+        self.live_log.clear();
+        self.live_stream = None;
         self.results.clear();
         self.report = None;
         self.marks.clear();
@@ -561,12 +612,17 @@ impl Inspector {
         }
         self.graph_name = name;
         self.history = history::list(Path::new("."), &self.graph_name);
+        self.run_values = self
+            .history
+            .first()
+            .map(|run| run.inputs.clone())
+            .unwrap_or_default();
         self.shown_run = None;
         cx.notify();
     }
 
     pub fn running(&self) -> bool {
-        self.job.is_some()
+        self.job.is_some() || self.run_form.is_some()
     }
 
     fn push_marks(&self, cx: &mut Context<Self>) {
@@ -648,6 +704,11 @@ impl Inspector {
 
     fn fill(&mut self, data: &NodeData, window: &mut Window, cx: &mut Context<Self>) {
         match data {
+            NodeData::Input(input) => {
+                choose(&self.input_kind, &InputType::ALL, input.kind, window, cx);
+                set_textarea(&self.input_default, input.default.clone(), window, cx);
+                self.input_required = input.required;
+            }
             NodeData::Agent(a) => {
                 choose(&self.provider, &Provider::ALL, a.provider, window, cx);
                 set_text(&self.endpoint, a.endpoint.clone(), window, cx);
@@ -696,6 +757,7 @@ impl Inspector {
                 choose(&self.file_mode, &WriteMode::ALL, f.mode, window, cx);
                 self.file_unfence = f.unfence;
                 self.file_bundle = f.bundle;
+                self.file_review = f.review;
             }
         }
     }
@@ -722,6 +784,12 @@ impl Inspector {
     fn collect(&self, kind: NodeType, prev: Option<NodeData>, cx: &App) -> (NodeData, Vec<Issue>) {
         let mut issues = Vec::new();
         let data = match kind {
+            NodeType::Input => NodeData::Input(InputConfig {
+                kind: chosen(&self.input_kind, &InputType::ALL, InputType::label, cx)
+                    .unwrap_or_default(),
+                default: self.input_default.read(cx).value().to_string(),
+                required: self.input_required,
+            }),
             NodeType::Agent => {
                 let prev = match prev {
                     Some(NodeData::Agent(a)) => a,
@@ -856,6 +924,7 @@ impl Inspector {
                         .unwrap_or(prev.mode),
                     unfence: self.file_unfence,
                     bundle: self.file_bundle,
+                    review: self.file_review,
                 })
             }
         };
@@ -883,6 +952,20 @@ impl Inspector {
     fn wiring_issues(&self, id: NodeId, data: Option<&NodeData>, cx: &App) -> Vec<Issue> {
         let graph = self.graph.read(cx);
         let mut issues = Vec::new();
+        if matches!(data, Some(NodeData::Input(_))) {
+            if graph.node_name(id).is_none() {
+                issues.push(Issue::new(
+                    "name",
+                    "Name this Run input so it can appear in the Run form",
+                ));
+            }
+            if !graph.inputs(id).is_empty() {
+                issues.push(Issue::new(
+                    "inputs",
+                    "A Run input is a source; remove its incoming wires",
+                ));
+            }
+        }
         if let Some(name) = graph.node_name(id) {
             if let Err(e) = validate::node_name(name) {
                 issues.push(Issue::new("name", e));
@@ -1077,7 +1160,8 @@ impl Inspector {
         let result = match &data {
             NodeData::Agent(a) => library::save_agent(&name, a),
             NodeData::Database(d) => library::save_database(&name, d),
-            NodeData::Script(_)
+            NodeData::Input(_)
+            | NodeData::Script(_)
             | NodeData::Data(_)
             | NodeData::Directory(_)
             | NodeData::File(_) => {
@@ -1170,7 +1254,11 @@ impl Inspector {
                 set_text(&self.data_path, path.to_string(), window, cx);
                 self.on_data_path_change(window, cx);
             }
-            NodeType::Agent | NodeType::Database | NodeType::Directory | NodeType::File => {
+            NodeType::Input
+            | NodeType::Agent
+            | NodeType::Database
+            | NodeType::Directory
+            | NodeType::File => {
                 return false;
             }
         }
@@ -1180,14 +1268,14 @@ impl Inspector {
     /// Run the selected node and everything wired into it, off the UI thread. `fresh`
     /// ignores cached outputs. A run can start while a cancelled one is still winding
     /// down; the old one's progress is then ignored.
-    fn run_selected(&mut self, fresh: bool, cx: &mut Context<Self>) {
+    fn run_selected(&mut self, fresh: bool, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(id) = self.node {
-            self.start_run(vec![id], fresh, cx);
+            self.start_run(vec![id], fresh, window, cx);
         }
     }
 
     /// Run every end node of the graph, which runs the whole graph in one pass.
-    pub fn run_all(&mut self, fresh: bool, cx: &mut Context<Self>) {
+    pub fn run_all(&mut self, fresh: bool, window: &mut Window, cx: &mut Context<Self>) {
         let doc = self.graph.read(cx).snapshot(&self.graph_name);
         let targets: Vec<NodeId> = exec::sinks(&doc)
             .iter()
@@ -1197,12 +1285,153 @@ impl Inspector {
             self.status("Nothing to run: no node has content".into(), true, cx);
             return;
         }
-        self.start_run(targets, fresh, cx);
+        self.start_run(targets, fresh, window, cx);
+    }
+
+    fn start_run(
+        &mut self,
+        targets: Vec<NodeId>,
+        fresh: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.running() {
+            return;
+        }
+        let doc = self.graph.read(cx).snapshot(&self.graph_name);
+        let ids: Vec<_> = targets.iter().map(|id| format!("n{id}")).collect();
+        let fields = match workflow::fields(&doc, &ids) {
+            Ok(fields) => fields,
+            Err(error) => {
+                self.status(error, true, cx);
+                return;
+            }
+        };
+        if fields.is_empty() {
+            self.launch_run(doc, targets, fresh, workflow::Values::new(), cx);
+            return;
+        }
+        let mut editors = Vec::new();
+        let mut subscriptions = Vec::new();
+        for field in fields {
+            let initial = self
+                .run_values
+                .get(&field.name)
+                .unwrap_or(&field.config.default)
+                .clone();
+            let rows = if matches!(field.config.kind, InputType::Text | InputType::Json) {
+                3
+            } else {
+                1
+            };
+            let value = cx.new(|cx| TextareaState::new(window, cx).rows(rows));
+            set_textarea(&value, initial.clone(), window, cx);
+            let choices = match field.config.kind {
+                InputType::File | InputType::Boolean => {
+                    let mut options = vec![String::new()];
+                    if field.config.kind == InputType::File {
+                        options.extend(library::list_data());
+                    } else {
+                        options.extend(["true".into(), "false".into()]);
+                    }
+                    if !options.contains(&initial) {
+                        options.push(initial.clone());
+                    }
+                    let selected = options
+                        .iter()
+                        .position(|s| s == &initial)
+                        .map(IndexPath::new);
+                    let items: Vec<SharedString> = options
+                        .iter()
+                        .map(|s| {
+                            if s.is_empty() {
+                                "—".into()
+                            } else {
+                                s.clone().into()
+                            }
+                        })
+                        .collect();
+                    let select = cx.new(|cx| SelectState::new(items, selected, window, cx));
+                    let editor = value.clone();
+                    subscriptions.push(cx.subscribe_in(
+                        &select,
+                        window,
+                        move |this, state, _: &SelectEvent<Vec<SharedString>>, window, cx| {
+                            if let Some(text) = state
+                                .read(cx)
+                                .selected_index(cx)
+                                .and_then(|index| options.get(index.row).cloned())
+                            {
+                                set_textarea(&editor, text, window, cx);
+                                if let Some(form) = &mut this.run_form {
+                                    form.error = None;
+                                }
+                                cx.notify();
+                            }
+                        },
+                    ));
+                    Some(select)
+                }
+                _ => None,
+            };
+            editors.push(RunField {
+                field,
+                value,
+                choices,
+            });
+        }
+        self.run_form = Some(RunForm {
+            doc,
+            targets,
+            fresh,
+            fields: editors,
+            error: None,
+            _subscriptions: subscriptions,
+        });
+        self.scroll.set_offset(point(px(0.0), px(0.0)));
+        self.status(
+            "Fill in the run inputs, then press Start run".into(),
+            false,
+            cx,
+        );
+        cx.notify();
+    }
+
+    fn submit_run_form(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = &self.run_form else {
+            return;
+        };
+        let supplied = form
+            .fields
+            .iter()
+            .map(|f| (f.field.name.clone(), f.value.read(cx).value().to_string()))
+            .collect();
+        let fields: Vec<_> = form.fields.iter().map(|f| f.field.clone()).collect();
+        match workflow::resolve(&fields, &supplied, &exec::Dirs::from_cwd().data) {
+            Ok(inputs) => {
+                let form = self.run_form.take().expect("the run form is open");
+                self.run_values = inputs.clone();
+                self.launch_run(form.doc, form.targets, form.fresh, inputs, cx);
+            }
+            Err(error) => {
+                if let Some(form) = &mut self.run_form {
+                    form.error = Some(error);
+                }
+                cx.notify();
+            }
+        }
     }
 
     /// Start `targets` on a background thread, in order, each after everything wired into
     /// it, and poll its progress until the report and the run record arrive.
-    fn start_run(&mut self, targets: Vec<NodeId>, fresh: bool, cx: &mut Context<Self>) {
+    fn launch_run(
+        &mut self,
+        doc: GraphDoc,
+        targets: Vec<NodeId>,
+        fresh: bool,
+        inputs: workflow::Values,
+        cx: &mut Context<Self>,
+    ) {
         if self
             .job
             .as_ref()
@@ -1211,12 +1440,21 @@ impl Inspector {
         {
             return;
         }
-        let doc = self.graph.read(cx).snapshot(&self.graph_name);
         let ids: Vec<String> = targets.iter().map(|t| format!("n{t}")).collect();
         let cancel = Arc::new(AtomicBool::new(false));
         let live = Arc::new(Mutex::new(Live::default()));
         let sink = live.clone();
+        let review_sink = live.clone();
+        let review_cancel = cancel.clone();
         let control = Control {
+            inputs,
+            review: Some(Arc::new(move |request| {
+                let result = review::wait(request, &review_cancel, |pending| {
+                    lock(&review_sink).review = Some(pending)
+                });
+                lock(&review_sink).review = None;
+                result
+            })),
             cache: Some(self.cache.clone()),
             fresh,
             cancel: cancel.clone(),
@@ -1230,6 +1468,7 @@ impl Inspector {
         });
         self.live_log.clear();
         self.live_stream = None;
+        self.pending_review = None;
         self.live_states = 0;
         self.report = None;
         // `shown_run` stays: the results on show are still that run's until the report
@@ -1287,6 +1526,19 @@ impl Inspector {
         }
         let (report, moved) = {
             let mut live = lock(live);
+            let changed_review = match (&self.pending_review, &live.review) {
+                (Some(a), Some(b)) => !Arc::ptr_eq(&a.request, &b.request),
+                (None, None) => false,
+                _ => true,
+            };
+            if changed_review {
+                self.review_file = 0;
+                self.review_page = 0;
+                if live.review.is_some() {
+                    self.scroll.set_offset(point(px(0.0), px(0.0)));
+                }
+            }
+            self.pending_review = live.review.clone();
             if live.log.len() > self.live_log.len() {
                 self.live_log
                     .extend(live.log[self.live_log.len()..].iter().cloned());
@@ -1322,6 +1574,7 @@ impl Inspector {
         };
         self.live_log.clear();
         self.live_stream = None;
+        self.pending_review = None;
         let data_of = |id: &str| {
             job.doc
                 .nodes
@@ -1440,13 +1693,14 @@ impl Inspector {
     /// Show a past run as if it had just finished: its outputs (from the cache, or the
     /// previews its record kept), its dots and its log, without running anything.
     fn open_run(&mut self, id: &str, cx: &mut Context<Self>) {
-        if self.job.is_some() {
+        if self.running() {
             return;
         }
         let Some(run) = self.history.iter().find(|r| r.id == id).cloned() else {
             return;
         };
         let report = run.report(Some(&self.cache));
+        self.run_values = run.inputs.clone();
         let targets: Vec<NodeId> = run.targets.iter().filter_map(|t| node_id(t)).collect();
         self.results.clear();
         self.marks.clear();
@@ -1972,6 +2226,16 @@ impl Inspector {
                             ))
                         })
                         .child(
+                            Switch::new("file-review")
+                                .small()
+                                .checked(self.file_review)
+                                .label("Review changes before writing")
+                                .on_change(cx.listener(|this, on: &bool, _, cx| {
+                                    this.file_review = *on;
+                                    this.sync(cx);
+                                })),
+                        )
+                        .child(
                             Switch::new("file-unfence")
                                 .small()
                                 .checked(unfence)
@@ -1981,10 +2245,113 @@ impl Inspector {
                                 })),
                         )
                         .child(div().text_xs().text_color(danger).child(
-                            "Writes whatever arrives on the wire, so read an agent's answer in the preview before pointing this at a file that matters.",
+                            "Review pauses this node with a diff for every file. Apply the batch to continue, or reject it to leave the files untouched.",
                         )),
                 ),
             )
+    }
+
+    fn render_input_config(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        v_form().small()
+            .child(field().label("Input type").child(Select::new(&self.input_kind).small().w_full()))
+            .child(field().label("Default value").description("Used when this input has no value from an earlier run. File paths are relative to data/.")
+                .child(Textarea::new(&self.input_default).small()))
+            .child(field().label("Run form").description("Give this node a Name above, then wire it to the nodes that use its value. File inputs send the selected file's contents.")
+                .child(Switch::new("input-required").small().checked(self.input_required).label("A value is required")
+                    .on_change(cx.listener(|this, on: &bool, _, cx| { this.input_required = *on; this.sync(cx); }))))
+    }
+
+    fn render_run_form(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let form = self.run_form.as_ref()?;
+        let muted = cx.theme().muted_foreground;
+        let danger = cx.theme().danger;
+        Some(v_flex().gap_2().p_2().border_1().border_color(cx.theme().border).rounded_md()
+            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Run inputs"))
+            .child(div().text_xs().text_color(muted).child("Values are saved with this run. The saved graph and its defaults stay unchanged."))
+            .children(form.fields.iter().map(|editor| {
+                field().label(editor.field.name.clone())
+                    .description(format!("{} · {} · {}", editor.field.config.kind.label(), if editor.field.config.required { "required" } else { "optional" }, editor.field.node))
+                    .child(v_flex().gap_1()
+                        .children(editor.choices.as_ref().map(|s| Select::new(s).small().w_full()))
+                        .when(editor.field.config.kind != InputType::Boolean, |d| d.child(Textarea::new(&editor.value).small())))
+            }))
+            .children(form.error.as_ref().map(|e| div().text_xs().text_color(danger).child(e.clone())))
+            .child(h_flex().gap_2()
+                .child(Button::new("submit-run-inputs").primary().small().label(if form.fresh { "Start fresh run" } else { "Start run" })
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.submit_run_form(cx))))
+                .child(Button::new("dismiss-run-inputs").outline().small().label("Cancel")
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| { this.run_form = None; cx.notify(); }))))
+            .into_any_element())
+    }
+
+    fn respond_review(
+        &mut self,
+        request: &Arc<review::Request>,
+        decision: review::Decision,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(job) = &self.job else {
+            return;
+        };
+        if job.cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut live = lock(&job.live);
+        if live
+            .review
+            .as_ref()
+            .is_some_and(|p| Arc::ptr_eq(&p.request, request))
+            && let Some(pending) = live.review.take()
+        {
+            pending.decide(decision);
+        }
+        self.pending_review = None;
+        cx.notify();
+    }
+
+    fn render_review(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        const PAGE_LINES: usize = 100;
+        let pending = self.pending_review.as_ref()?;
+        let request = &pending.request;
+        let file = request.files.get(self.review_file)?;
+        let pages = file.diff.lines().count().div_ceil(PAGE_LINES).max(1);
+        let apply = request.clone();
+        let reject = request.clone();
+        let muted = cx.theme().muted_foreground;
+        let success = cx.theme().success;
+        let danger = cx.theme().danger;
+        let cancelling = self
+            .job
+            .as_ref()
+            .is_none_or(|j| j.cancel.load(Ordering::Relaxed));
+        Some(v_flex().gap_2().p_2().border_1().border_color(cx.theme().border).rounded_md()
+            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(format!("Review changes · {}", request.node)))
+            .child(div().text_xs().text_color(muted).child("This node is paused. Apply approves the complete batch; changed destinations require a new review."))
+            .child(h_flex().gap_1()
+                .child(Button::new("review-prev-file").xsmall().label("Previous file").disabled(self.review_file == 0)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| { this.review_file = this.review_file.saturating_sub(1); this.review_page = 0; cx.notify(); })))
+                .child(Button::new("review-next-file").xsmall().label("Next file").disabled(self.review_file + 1 >= request.files.len())
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| { if let Some(p) = &this.pending_review { this.review_file = (this.review_file + 1).min(p.request.files.len().saturating_sub(1)); } this.review_page = 0; cx.notify(); }))))
+            .child(div().text_sm().child(format!("{}/{} · {}", self.review_file + 1, request.files.len(), file.path)))
+            .child(div().text_xs().text_color(muted).child(format!("{} → {} bytes", file.before_bytes.map(|n| n.to_string()).unwrap_or_else(|| "new file".into()), file.after_bytes)))
+            .child(div().id("review-diff").max_h(px(360.0)).overflow_y_scroll().overflow_x_scroll().p_2().bg(cx.theme().background)
+                .child(v_flex().font_family("Menlo").text_xs().children(file.diff.lines().skip(self.review_page * PAGE_LINES).take(PAGE_LINES).map(|line| {
+                    div().whitespace_nowrap().text_color(if line.starts_with('+') { success } else if line.starts_with('-') { danger } else { muted }).child(line.to_string())
+                }))))
+            .child(h_flex().gap_1()
+                .child(Button::new("review-prev-page").xsmall().label("Previous page").disabled(self.review_page == 0)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| { this.review_page = this.review_page.saturating_sub(1); cx.notify(); })))
+                .child(div().text_xs().child(format!("{} / {pages}", self.review_page + 1)))
+                .child(Button::new("review-next-page").xsmall().label("Next page").disabled(self.review_page + 1 >= pages)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| { this.review_page = (this.review_page + 1).min(pages - 1); cx.notify(); }))))
+            .child(h_flex().gap_1()
+                .child(Button::new("review-apply").primary().small().label(format!("Apply {} file(s)", request.files.len())).disabled(cancelling)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.respond_review(&apply, review::Decision::Apply, cx))))
+                .child(Button::new("review-reject").outline().small().label("Reject batch").disabled(cancelling)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.respond_review(&reject, review::Decision::Reject, cx))))
+                .child(Button::new("review-cancel").ghost().small().label("Cancel run").disabled(cancelling)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cancel_run(cx)))))
+            .into_any_element())
     }
 
     /// One button per content type, with the writable database after the read-only one.
@@ -2075,7 +2442,7 @@ impl Inspector {
         let muted = theme.muted_foreground;
         let accent = theme.sidebar_accent;
         let accent_fg = theme.sidebar_accent_foreground;
-        let running = self.job.is_some();
+        let running = self.running();
         let shown = self.shown_run.clone();
         let rows: Vec<AnyElement> = self
             .history
@@ -2130,8 +2497,8 @@ impl Inspector {
                                 .xsmall()
                                 .label(if running { "Running…" } else { "Run all" })
                                 .disabled(running)
-                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                    this.run_all(false, cx)
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.run_all(false, window, cx)
                                 })),
                         ),
                     )
@@ -2152,6 +2519,13 @@ impl Inspector {
                 history::DIR, self.graph_name
             )))
             .children(rows)
+            .children(self.report.as_ref().filter(|(_, report)| !report.inputs.is_empty()).map(|(_, report)| {
+                v_flex().gap_1().child(hint("Run inputs · these values will prefill the next Run form".into()))
+                    .children(report.inputs.iter().map(|(name, value)| {
+                        let shown: String = value.chars().take(240).collect();
+                        hint(format!("{name}: {shown}{}", if shown.len() < value.len() { "…" } else { "" }))
+                    }))
+            }))
             .when(more > 0, |d| d.child(hint(format!("… {more} more on disk"))))
             .when(self.history.is_empty(), |d| {
                 d.child(hint("No runs of this graph yet.".into()))
@@ -2184,6 +2558,14 @@ impl Inspector {
                         this.set_content(data.clone(), window, cx)
                     }))
             }))
+    }
+}
+
+impl Drop for Inspector {
+    fn drop(&mut self) {
+        if let Some(job) = &self.job {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -2261,10 +2643,10 @@ impl Render for Inspector {
                             .primary()
                             .xsmall()
                             .label(if running { "Running…" } else { "Run" })
-                            .disabled(running)
+                            .disabled(running || self.run_form.is_some())
                             .loading(running)
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.run_selected(false, cx)
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.run_selected(false, window, cx)
                             })),
                     )
                     .when(!running, |d| {
@@ -2273,8 +2655,8 @@ impl Render for Inspector {
                                 .outline()
                                 .xsmall()
                                 .label("Run fresh")
-                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                    this.run_selected(true, cx)
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.run_selected(true, window, cx)
                                 })),
                         )
                     })
@@ -2321,6 +2703,7 @@ impl Render for Inspector {
                 .into_any_element(),
             (Some(id), Some(ty)) => {
                 let form: AnyElement = match ty {
+                    NodeType::Input => self.render_input_config(cx).into_any_element(),
                     NodeType::Agent => self.render_agent(cx).into_any_element(),
                     NodeType::Database => self.render_database(cx).into_any_element(),
                     NodeType::Script => self.render_script(cx).into_any_element(),
@@ -2597,6 +2980,8 @@ impl Render for Inspector {
         };
         let body = v_flex()
             .gap_3()
+            .children(self.render_run_form(cx))
+            .children(self.render_review(cx))
             .child(node_body)
             .child(div().h(px(1.0)).flex_shrink_0().bg(border))
             .child(self.render_runs(cx));
@@ -2611,6 +2996,7 @@ impl Render for Inspector {
             .child(
                 div()
                     .id("inspector-body")
+                    .track_scroll(&self.scroll)
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()

@@ -274,9 +274,9 @@ impl Workspace {
         self.save_now(cx);
     }
 
-    fn on_run_all(&mut self, _: &RunAll, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_run_all(&mut self, _: &RunAll, window: &mut Window, cx: &mut Context<Self>) {
         self.inspector
-            .update(cx, |inspector, cx| inspector.run_all(false, cx));
+            .update(cx, |inspector, cx| inspector.run_all(false, window, cx));
     }
 
     fn on_new(&mut self, _: &NewGraph, window: &mut Window, cx: &mut Context<Self>) {
@@ -328,9 +328,11 @@ impl Workspace {
         let Some(kind) = self.kinds.get(index).cloned() else {
             return;
         };
-        let item = 1 + NodeType::ALL.len() + index;
+        let item = select_items(&self.kinds)
+            .iter()
+            .position(|label| label.as_ref() == kind.name);
         self.kind_select.update(cx, |select, cx| {
-            select.set_selected_index(Some(IndexPath::new(item)), window, cx)
+            select.set_selected_index(item.map(IndexPath::new), window, cx)
         });
         self.graph.update(cx, |graph, cx| {
             graph.set_current(Current::Kind(kind.name.clone()), cx)
@@ -890,9 +892,9 @@ impl Render for Workspace {
                     .small()
                     .label(if running { "Running…" } else { "Run all" })
                     .disabled(running || node_count == 0)
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                         this.inspector
-                            .update(cx, |inspector, cx| inspector.run_all(false, cx))
+                            .update(cx, |inspector, cx| inspector.run_all(false, window, cx))
                     })),
             )
             .child(
@@ -1031,6 +1033,7 @@ mod tests {
             items,
             [
                 "Blank",
+                "Run input",
                 "Agent",
                 "Database",
                 "Database (write)",
@@ -1042,6 +1045,7 @@ mod tests {
             ]
         );
         assert_eq!(current_of("Blank"), Current::Blank);
+        assert_eq!(current_of("Run input"), Current::Type(NodeType::Input));
         assert_eq!(current_of("Database"), Current::Type(NodeType::Database));
         assert_eq!(current_of("Database (write)"), Current::WritableDatabase);
         assert_eq!(current_of("Directory"), Current::Type(NodeType::Directory));
