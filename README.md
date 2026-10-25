@@ -273,12 +273,16 @@ Google's `streamGenerateContent`), the body is read as it arrives, and every pie
 reaches the inspector while the model is still typing. JSON output is validated and
 pretty-printed once the stream ends, so the preview shows the raw text and the result is
 the finished document. A server that ignores the request and answers in one piece still
-works. Embeddings and images are not streams.
+works. Multiline SSE events and final records without a newline are handled; malformed
+stream JSON, invalid UTF-8 and trailing error events fail the run instead of saving a
+partial answer. Reading stops when a reply exceeds 64 MB. Embeddings and images are not
+streams.
 
 **Cancel.** The run checks a cancel flag before every node, between the pieces of a
 streamed reply, and inside the wait for a child process, which is killed with its process
 group. A provider call that does not stream (embeddings, images) finishes or times out
-first. A cancelled run saves nothing and reports `Cancelled`.
+first. A reply received after cancellation is not saved or cached, and the run reports
+`Cancelled`. Outputs completed before cancellation and the run's history remain.
 
 **Cache.** Every agent's and script's output is kept across runs, keyed on the node's
 configuration, its inputs' outputs and (for scripts) the script file itself, so running a
@@ -294,7 +298,11 @@ The cache lives in `cache/` as `<key>.json` (label, type, saved path, time) plus
 node asking the same question of the same inputs gets the same answer without a call. Keys
 are content hashes (two FNV-1a passes, 128 bits), stable across builds. The directory is
 pruned oldest-first past 1 GB, a broken entry is a miss, and a disk that refuses the write
-costs persistence, not the run. Add `cache/` to `.gitignore`, as this repository does.
+costs persistence, not the run. Cache metadata is limited to 64 KB and payloads to 64 MB;
+the stored length and checksum must match before bytes are reused. Entries made before
+these integrity fields were added are treated as misses and refilled on the next run;
+old history records can still show their saved previews. Add `cache/` to `.gitignore`, as
+this repository does.
 
 Agents send the prompt as the system message and the wire text as the user message; with
 nothing on the wire the prompt is the user message. Prompt plus input must fit the context
@@ -383,6 +391,16 @@ Configs are checked while editing and again by the executor before running.
 - **Saving is strict, drafting is not.** The graph file keeps whatever you typed, flagged
   in the inspector. The library refuses to save an invalid agent or database, and the
   canvas shows the first problem.
+- **Saved state is bounded.** Graphs, kinds, presets and run records are limited to 16 MB
+  per file; prompts keep their 256 KB limit. Reads reject symlink files and non-regular
+  files, and the byte limit is enforced during reading as well as against metadata.
+  Cache and history operations refuse symlinked storage directories. Replacement saves
+  use exclusive temporary files and rename; new run records and agent outputs use
+  exclusive creation so simultaneous saves cannot overwrite each other.
+- **Provider endpoints are checked on every request path.** Helpers such as Write SQL
+  validate endpoints and model ids too. HTTP redirects are refused for both streamed and
+  whole replies, so prompts and provider-specific key headers stay at the configured
+  endpoint. Configure the final API endpoint directly if a server returns a redirect.
 - **The executor trusts nothing it didn't check itself.** Every config is validated again
   before it runs. Every file is opened through `resolve_inside`, after symlinks. Secrets are
   read from the environment at the last moment and go only into the request header or the
@@ -493,6 +511,7 @@ ids and `-->` edges (node shapes and `|labels|` are tolerated) and laid out left
 | `src/validate.rs` | Sanitizers and validators: names, paths, env vars, identifiers, SQL |
 | `src/library.rs` | The per-type directories: agents and outputs, prompts, databases, file listings |
 | `src/doc.rs` | Graph file formats, Mermaid writer and parser, kind library |
+| `src/storage.rs` | Bounded reads, managed directories, atomic replacements and exclusive new files |
 
 Dependencies are `gpui-kit` (GPUI plus the component library), `serde` and `serde_json`,
 `ureq` for HTTP, `url` for connection and endpoint URLs, and `base64` for image replies.

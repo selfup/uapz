@@ -19,6 +19,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::node_data::{AgentConfig, DatabaseConfig, OutputType, Runtime};
+use crate::storage;
 use crate::validate;
 
 pub const AGENTS_DIR: &str = "agents";
@@ -84,7 +85,7 @@ pub fn list_agents() -> Vec<Preset<AgentConfig>> {
     };
     let mut agents: Vec<Preset<AgentConfig>> = entries
         .flatten()
-        .filter(|e| e.path().is_dir())
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
         .filter_map(|e| {
             let name = e.file_name().to_str()?.to_string();
             let config = read_json(&e.path().join(AGENT_FILE)).ok()?;
@@ -122,15 +123,7 @@ fn write_output_in(
     stamp: String,
 ) -> Result<PathBuf, String> {
     fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    let mut path = dir.join(format!("{stamp}.{}", output.extension()));
-    // Two outputs in the same millisecond get a suffix instead of clobbering each other.
-    let mut n = 1;
-    while path.exists() {
-        path = dir.join(format!("{stamp}-{n}.{}", output.extension()));
-        n += 1;
-    }
-    fs::write(&path, bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
-    Ok(path)
+    storage::write_unique(dir, &stamp, output.extension(), bytes)
 }
 
 /// How many outputs an agent has saved.
@@ -150,13 +143,13 @@ pub fn save_prompt(name: &str, text: &str) -> Result<PathBuf, String> {
     validate::text("prompt", text, validate::MAX_PROMPT_LEN)?;
     fs::create_dir_all(PROMPTS_DIR).map_err(|e| format!("create {PROMPTS_DIR}/: {e}"))?;
     let path = prompt_path(name);
-    fs::write(&path, text).map_err(|e| format!("write {}: {e}", path.display()))?;
+    storage::write_atomic(&path, text.as_bytes())?;
     Ok(path)
 }
 
 pub fn load_prompt(name: &str) -> Result<String, String> {
     let path = prompt_path(name);
-    fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))
+    storage::read_text(&path, validate::MAX_PROMPT_LEN as u64)
 }
 
 pub fn delete_prompt(name: &str) -> Result<(), String> {
@@ -287,15 +280,16 @@ fn reject_issues(issues: Vec<validate::Issue>) -> Result<(), String> {
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(value).map_err(|e| e.to_string())? + "\n";
+    storage::check_size(text.len(), storage::MAX_DOCUMENT_BYTES)?;
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("create {}/: {e}", dir.display()))?;
     }
-    let text = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
-    fs::write(path, text + "\n").map_err(|e| format!("write {}: {e}", path.display()))
+    storage::write_atomic(path, text.as_bytes())
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
-    let text = fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let text = storage::read_text(path, storage::MAX_DOCUMENT_BYTES)?;
     serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))
 }
 

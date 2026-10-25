@@ -94,6 +94,9 @@ impl UreqHttp {
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(timeout))
             .http_status_as_error(false)
+            // Only the configured endpoint is trusted with the prompt and API key.
+            // Redirect policy for Authorization does not cover provider-specific keys.
+            .max_redirects(0)
             .build();
         Self {
             agent: ureq::Agent::new_with_config(config),
@@ -111,6 +114,7 @@ impl Http for UreqHttp {
             .send_json(&request.body)
             .map_err(|e| format!("request to {} failed: {e}", request.url))?;
         let status = response.status().as_u16();
+        reject_redirect(status)?;
         let body = response
             .body_mut()
             .with_config()
@@ -133,6 +137,7 @@ impl Http for UreqHttp {
             .send_json(&request.body)
             .map_err(|e| format!("request to {} failed: {e}", request.url))?;
         let status = response.status().as_u16();
+        reject_redirect(status)?;
         let mut reader = response
             .body_mut()
             .with_config()
@@ -156,6 +161,16 @@ impl Http for UreqHttp {
             }
         }
         Ok(status)
+    }
+}
+
+fn reject_redirect(status: u16) -> Result<(), String> {
+    if (300..400).contains(&status) {
+        Err(format!(
+            "provider returned HTTP {status}; redirects are refused to protect API keys and input. Configure the final endpoint directly"
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -206,8 +221,8 @@ pub fn generate_streaming(
         // growing at the cap; the stream itself keeps parsing the pieces it receives.
         let room = (MAX_REPLY_BYTES as usize).saturating_sub(body.len());
         if chunk.len() > room {
-            body.extend_from_slice(&chunk[..room]);
             body_overflowed = true;
+            return false;
         } else {
             body.extend_from_slice(chunk);
         }
@@ -219,6 +234,9 @@ pub fn generate_streaming(
             "the reply from {} is larger than {} bytes",
             request.url, MAX_REPLY_BYTES
         ));
+    }
+    if status < 400 && !stream.stopped && stream.error.is_none() {
+        stream.finish();
     }
     if stream.stopped {
         return Err(STOPPED.into());
@@ -271,6 +289,12 @@ struct Stream<'a> {
     provider: &'static str,
     /// Bytes after the last complete line.
     pending: Vec<u8>,
+    /// SSE data fields for the current event, joined with newlines.
+    event_data: String,
+    seen_sse: bool,
+    seen_record: bool,
+    /// A provider ignored the stream request and sent one (possibly pretty) JSON body.
+    whole_reply: bool,
     text: String,
     /// The model named by the first event that names one.
     model: Option<String>,
@@ -285,6 +309,10 @@ impl<'a> Stream<'a> {
             api: config.provider.api(),
             provider: config.provider.label(),
             pending: Vec::new(),
+            event_data: String::new(),
+            seen_sse: false,
+            seen_record: false,
+            whole_reply: false,
             text: String::new(),
             model: None,
             error: None,
@@ -296,35 +324,87 @@ impl<'a> Stream<'a> {
     /// Take more bytes; false means stop reading (the callback said so, or an error event
     /// arrived).
     fn feed(&mut self, chunk: &[u8]) -> bool {
-        self.pending.extend_from_slice(chunk);
-        while let Some(end) = self.pending.iter().position(|b| *b == b'\n') {
-            let line: Vec<u8> = self.pending.drain(..=end).collect();
-            let line = String::from_utf8_lossy(&line);
-            if !self.line(line.trim_end_matches(['\r', '\n'])) {
+        // Scan each incoming byte once. Repeatedly searching an ever-growing pending
+        // line makes a response without newlines quadratic in its length.
+        for part in chunk.split_inclusive(|b| *b == b'\n') {
+            self.pending.extend_from_slice(part);
+            if part.ends_with(b"\n") && !self.pending_line() {
                 return false;
             }
         }
         true
     }
 
-    /// One line: an SSE `data:` payload or a bare JSON object (Ollama). Everything else
-    /// (`event:`, `id:`, comments, blank lines) is skipped.
-    fn line(&mut self, line: &str) -> bool {
-        let payload = match line.strip_prefix("data:") {
-            Some(rest) => rest.trim(),
-            None if line.starts_with('{') => line,
-            None => return true,
+    fn pending_line(&mut self) -> bool {
+        let bytes = std::mem::take(&mut self.pending);
+        let Ok(line) = std::str::from_utf8(&bytes) else {
+            self.error = Some(format!("{} stream contains invalid UTF-8", self.provider));
+            return false;
         };
+        self.line(line.trim_end_matches(['\r', '\n']))
+    }
+
+    /// EOF may terminate the last NDJSON record or SSE data line. Process it before
+    /// deciding whether this is a successful response; it may carry a late error.
+    fn finish(&mut self) {
+        if !self.pending.is_empty() && !self.pending_line() {
+            return;
+        }
+        self.dispatch_sse();
+    }
+
+    /// SSE dispatches on a blank line and joins multiple data fields. Native Ollama
+    /// replies use one JSON object per line; whole replies are parsed by the fallback.
+    fn line(&mut self, line: &str) -> bool {
+        if let Some(data) = line.strip_prefix("data:") {
+            self.seen_sse = true;
+            self.event_data
+                .push_str(data.strip_prefix(' ').unwrap_or(data));
+            self.event_data.push('\n');
+            return true;
+        }
+        if line.is_empty() {
+            return self.dispatch_sse();
+        }
+        if self.seen_sse || self.api != Api::Ollama || self.whole_reply {
+            return true;
+        }
+        match serde_json::from_str::<Value>(line) {
+            Ok(value) => self.value(&value),
+            Err(_) if !self.seen_record => {
+                self.whole_reply = true;
+                true
+            }
+            Err(_) => self.malformed(),
+        }
+    }
+
+    fn dispatch_sse(&mut self) -> bool {
+        if self.event_data.is_empty() {
+            return true;
+        }
+        let data = std::mem::take(&mut self.event_data);
+        let payload = data.trim();
         if payload == "[DONE]" {
             return true;
         }
         let Ok(value) = serde_json::from_str::<Value>(payload) else {
-            return true;
+            return self.malformed();
         };
+        self.value(&value)
+    }
+
+    fn malformed(&mut self) -> bool {
+        self.error = Some(format!("{} returned malformed stream JSON", self.provider));
+        false
+    }
+
+    fn value(&mut self, value: &Value) -> bool {
+        self.seen_record = true;
         if self.model.is_none() {
-            self.model = reply_model(self.api, &value);
+            self.model = reply_model(self.api, value);
         }
-        match self.event(&value) {
+        match self.event(value) {
             Err(e) => {
                 self.error = Some(e);
                 false
@@ -449,10 +529,11 @@ pub fn build_request(
     key: Option<&str>,
     input: &str,
 ) -> Result<Request, String> {
-    let base = config.endpoint_url().trim_end_matches('/').to_string();
-    if base.is_empty() {
-        return Err("the agent has no endpoint".into());
-    }
+    // Helpers such as write_sql call this without running a graph node's validation.
+    // Check every URL input at the common boundary before adding secrets or URL paths.
+    let endpoint = crate::validate::endpoint_url(config.endpoint_url())?;
+    let base = endpoint.as_str().trim_end_matches('/').to_string();
+    crate::validate::model_id(&config.model)?;
     let model = config.model.trim();
     let wants_json = config.output == OutputType::Json;
     let mut headers: Vec<(String, String)> = Vec::new();
@@ -1136,7 +1217,16 @@ pub(crate) mod tests {
         status: u16,
         body: &'static str,
     ) -> (String, std::thread::JoinHandle<String>) {
+        one_shot_response(status, body, "")
+    }
+
+    fn one_shot_response(
+        status: u16,
+        body: &'static str,
+        extra_headers: &str,
+    ) -> (String, std::thread::JoinHandle<String>) {
         use std::io::{BufRead, BufReader, Read, Write};
+        let extra_headers = extra_headers.to_string();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
@@ -1157,6 +1247,9 @@ pub(crate) mod tests {
                 }
             };
             stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
             let mut reader = BufReader::new(stream);
             let mut head = String::new();
             let mut length = 0usize;
@@ -1174,13 +1267,50 @@ pub(crate) mod tests {
             let mut payload = vec![0u8; length];
             reader.read_exact(&mut payload).unwrap();
             let reply = format!(
-                "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status} X\r\n{extra_headers}content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len()
             );
             reader.get_mut().write_all(reply.as_bytes()).unwrap();
             format!("{head}{}", String::from_utf8_lossy(&payload))
         });
         (url, handle)
+    }
+
+    #[test]
+    fn provider_redirects_never_receive_keys_or_prompts() {
+        for status in [301, 302, 303, 307, 308] {
+            for streamed in [false, true] {
+                let destination = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                destination.set_nonblocking(true).unwrap();
+                let location = format!(
+                    "Location: http://{}/stolen\r\n",
+                    destination.local_addr().unwrap()
+                );
+                let (url, server) = one_shot_response(status, "", &location);
+                let request = Request {
+                    url,
+                    headers: vec![
+                        ("x-api-key".into(), "test-secret".into()),
+                        ("x-goog-api-key".into(), "test-secret".into()),
+                    ],
+                    body: json!({"prompt": "private input"}),
+                };
+                let http = UreqHttp::new(Duration::from_millis(500));
+                let err = if streamed {
+                    http.post_json_streaming(&request, &mut |_, _| true)
+                        .unwrap_err()
+                } else {
+                    http.post_json(&request).unwrap_err()
+                };
+                server.join().unwrap();
+                assert!(err.contains("redirects are refused"), "{err}");
+                assert!(!err.contains("test-secret") && !err.contains("/stolen"));
+                assert!(
+                    matches!(destination.accept(), Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock),
+                    "a provider request followed HTTP {status}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1417,6 +1547,138 @@ pub(crate) mod tests {
         assert!(pieces.is_empty());
         assert!(request.body.get("stream").is_none());
         assert_eq!(result.unwrap(), b"[0.5,0.25]");
+    }
+
+    #[test]
+    fn streamed_errors_and_corruption_never_become_partial_successes() {
+        let config = agent(Provider::OpenAi, ModelType::Generative, OutputType::Text);
+        let prefix = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
+        for tail in [
+            "data: {\"error\":{\"message\":\"late failure\"}}",
+            "data: {not json}\n\n",
+            "data: {\"choices\":",
+        ] {
+            let (result, pieces, _) = stream_with(&config, 200, &format!("{prefix}{tail}"));
+            assert_eq!(pieces, ["partial"]);
+            assert!(result.is_err(), "silently accepted {tail:?}");
+        }
+    }
+
+    #[test]
+    fn ndjson_keeps_the_last_record_without_a_newline() {
+        let config = agent(Provider::Ollama, ModelType::Generative, OutputType::Text);
+        let body = "{\"message\":{\"content\":\"first\"},\"done\":false}\n{\"message\":{\"content\":\"last\"},\"done\":true}";
+        let (result, pieces, _) = stream_with(&config, 200, body);
+        assert_eq!(result.unwrap(), b"firstlast");
+        assert_eq!(pieces, ["first", "last"]);
+    }
+
+    #[test]
+    fn sse_multiline_events_and_split_utf8_survive_chunk_boundaries() {
+        struct Chunked(Vec<u8>);
+        impl Http for Chunked {
+            fn post_json(&self, _: &Request) -> Result<Reply, String> {
+                unreachable!()
+            }
+            fn post_json_streaming(
+                &self,
+                _: &Request,
+                sink: &mut dyn FnMut(u16, &[u8]) -> bool,
+            ) -> Result<u16, String> {
+                for byte in self.0.chunks(1) {
+                    if !sink(200, byte) {
+                        break;
+                    }
+                }
+                Ok(200)
+            }
+        }
+        let config = agent(Provider::OpenAi, ModelType::Generative, OutputType::Text);
+        let body = "event: message\r\ndata: {\"choices\":\r\ndata: [{\"delta\":{\"content\":\"café\"}}]}\r\n\r\ndata: [DONE]\n\n";
+        let mut pieces = Vec::new();
+        let out = generate_streaming(
+            &Chunked(body.as_bytes().to_vec()),
+            &config,
+            Some("k"),
+            "hi",
+            &mut |text| {
+                pieces.push(text.to_string());
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(out.bytes, "café".as_bytes());
+        assert_eq!(pieces, ["café"]);
+        let bytes = b"data: {\"choices\":[{\"delta\":{\"content\":\"\xff\"}}]}\n\n".to_vec();
+        let err = generate_streaming(&Chunked(bytes), &config, Some("k"), "hi", &mut |_| true)
+            .unwrap_err();
+        assert!(err.contains("UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn streaming_stops_reading_at_the_body_cap_even_on_http_errors() {
+        struct Endless {
+            status: u16,
+            delivered: Mutex<usize>,
+        }
+        impl Http for Endless {
+            fn post_json(&self, _: &Request) -> Result<Reply, String> {
+                unreachable!()
+            }
+            fn post_json_streaming(
+                &self,
+                _: &Request,
+                sink: &mut dyn FnMut(u16, &[u8]) -> bool,
+            ) -> Result<u16, String> {
+                let mut chunk = vec![b'x'; 64 * 1024];
+                chunk[0] = b':';
+                *chunk.last_mut().unwrap() = b'\n';
+                for _ in 0..MAX_REPLY_BYTES as usize / chunk.len() + 10 {
+                    *self.delivered.lock().unwrap() += 1;
+                    if !sink(self.status, &chunk) {
+                        break;
+                    }
+                }
+                Ok(self.status)
+            }
+        }
+        let config = agent(Provider::OpenAi, ModelType::Generative, OutputType::Text);
+        for status in [200, 500] {
+            let http = Endless {
+                status,
+                delivered: Mutex::new(0),
+            };
+            let err =
+                generate_streaming(&http, &config, Some("k"), "hi", &mut |_| true).unwrap_err();
+            assert!(err.contains("larger than"), "{err}");
+            assert_eq!(
+                *http.delivered.lock().unwrap(),
+                MAX_REPLY_BYTES as usize / (64 * 1024) + 1
+            );
+        }
+    }
+
+    #[test]
+    fn request_helpers_validate_endpoints_and_model_paths_before_http() {
+        let base = agent(Provider::Google, ModelType::Generative, OutputType::Text);
+        for (endpoint, model) in [
+            ("http://example.com", "m"),
+            ("https://user:secret@example.com", "m"),
+            ("https://example.com?secret=key", "m"),
+            ("https://example.com", "m/../../other"),
+        ] {
+            let config = AgentConfig {
+                endpoint: endpoint.into(),
+                model: model.into(),
+                ..base.clone()
+            };
+            let http = FakeHttp::new(
+                200,
+                r#"{"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}"#,
+            );
+            assert!(generate(&http, &config, Some("key"), "hi").is_err());
+            assert!(http.seen.lock().unwrap().is_empty());
+        }
     }
 
     #[test]

@@ -9,6 +9,7 @@ mod library;
 mod node_data;
 mod providers;
 mod sidebar;
+mod storage;
 mod validate;
 
 use gpui_kit::*;

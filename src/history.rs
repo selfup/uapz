@@ -22,6 +22,7 @@ use crate::doc::GraphDoc;
 use crate::exec::{self, Cache, Key, Output, Report};
 use crate::library;
 use crate::node_data::NodeData;
+use crate::storage;
 use crate::validate;
 
 /// Directory, relative to the working directory, that holds run records.
@@ -305,23 +306,24 @@ impl Run {
     }
 }
 
-fn graph_dir(root: &Path, graph: &str) -> PathBuf {
-    root.join(DIR).join(validate::file_stem(graph))
+fn graph_dir(root: &Path, graph: &str, create: bool) -> Result<PathBuf, String> {
+    storage::directory(
+        root,
+        &Path::new(DIR).join(validate::file_stem(graph)),
+        create,
+    )
 }
 
 /// Write the record as `runs/<graph>/<id>.json` and drop the oldest records past
 /// [`MAX_RUNS`]. Two runs ending in the same millisecond get a suffix, not a clobber.
 pub fn save(root: &Path, run: &Run) -> Result<PathBuf, String> {
-    let dir = graph_dir(root, &run.graph);
-    fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    let mut path = dir.join(format!("{}.json", run.id));
-    let mut n = 1;
-    while path.exists() {
-        path = dir.join(format!("{}-{n}.json", run.id));
-        n += 1;
+    if run.id.is_empty() || validate::file_stem(&run.id) != run.id {
+        return Err("run id must be a safe file stem".into());
     }
-    let json = serde_json::to_string_pretty(run).map_err(|e| e.to_string())?;
-    fs::write(&path, json + "\n").map_err(|e| format!("write {}: {e}", path.display()))?;
+    let json = serde_json::to_string_pretty(run).map_err(|e| e.to_string())? + "\n";
+    storage::check_size(json.len(), storage::MAX_DOCUMENT_BYTES)?;
+    let dir = graph_dir(root, &run.graph, true)?;
+    let path = storage::write_unique(&dir, &run.id, "json", json.as_bytes())?;
     let mut files = record_files(&dir);
     if files.len() > MAX_RUNS {
         files.sort();
@@ -339,31 +341,39 @@ fn record_files(dir: &Path) -> Vec<PathBuf> {
     };
     entries
         .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
         .map(|e| e.path())
-        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "json"))
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
         .collect()
 }
 
 /// A graph's runs, newest first, at most [`MAX_RUNS`]. Files that don't parse are skipped.
 pub fn list(root: &Path, graph: &str) -> Vec<Run> {
-    let mut files = record_files(&graph_dir(root, graph));
+    let Ok(dir) = graph_dir(root, graph, false) else {
+        return Vec::new();
+    };
+    let mut files = record_files(&dir);
     files.sort();
     files.reverse();
     files
         .iter()
-        .filter_map(|path| serde_json::from_str::<Run>(&fs::read_to_string(path).ok()?).ok())
+        .filter_map(|path| {
+            serde_json::from_slice::<Run>(&storage::read(path, storage::MAX_DOCUMENT_BYTES).ok()?)
+                .ok()
+        })
         .take(MAX_RUNS)
         .collect()
 }
 
 /// Delete a graph's run records. Returns how many went.
 pub fn clear(root: &Path, graph: &str) -> usize {
-    let files = record_files(&graph_dir(root, graph));
-    let count = files.len();
-    for file in files {
-        let _ = fs::remove_file(file);
-    }
-    count
+    let Ok(dir) = graph_dir(root, graph, false) else {
+        return 0;
+    };
+    record_files(&dir)
+        .iter()
+        .filter(|path| fs::remove_file(path).is_ok())
+        .count()
 }
 
 #[cfg(test)]
@@ -461,7 +471,7 @@ mod tests {
         assert!(ok.headline().contains("1 reused"), "{}", ok.headline());
 
         let path = save(&root, &ok).unwrap();
-        assert!(path.starts_with(root.join(DIR).join("My Graph")));
+        assert!(path.starts_with(root.canonicalize().unwrap().join(DIR).join("My Graph")));
         let listed = list(&root, "My Graph");
         assert_eq!(listed, vec![ok.clone()]);
         assert!(list(&root, "other").is_empty());
@@ -564,5 +574,46 @@ mod tests {
             node.output(None).is_none(),
             "no label, no preview, no output"
         );
+    }
+
+    #[test]
+    fn history_refuses_path_ids_and_oversized_records() {
+        let root = scratch("bounded");
+        let mut run = record(&doc(), &[], &report(Ok(output("v")), None), None);
+        run.id = "../../outside".into();
+        assert!(save(&root, &run).unwrap_err().contains("safe file stem"));
+        run.id = "oversized".into();
+        run.log
+            .push("x".repeat(storage::MAX_DOCUMENT_BYTES as usize));
+        assert!(save(&root, &run).unwrap_err().contains("limit"));
+        let dir = graph_dir(&root, &run.graph, true).unwrap();
+        fs::write(
+            dir.join("oversized.json"),
+            serde_json::to_vec(&run).unwrap(),
+        )
+        .unwrap();
+        assert!(list(&root, &run.graph).is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_never_follows_symlinked_graph_directories_or_records() {
+        let root = scratch("links");
+        let run = record(&doc(), &[], &report(Ok(output("v")), None), None);
+        let dir = graph_dir(&root, &run.graph, true).unwrap();
+        let outside = root.join("outside.json");
+        fs::write(&outside, serde_json::to_vec(&run).unwrap()).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("linked.json")).unwrap();
+        assert!(list(&root, &run.graph).is_empty());
+        assert_eq!(clear(&root, &run.graph), 0);
+        std::os::unix::fs::symlink(&root, root.join(DIR).join("linked-graph")).unwrap();
+        assert!(list(&root, "linked-graph").is_empty());
+        assert_eq!(clear(&root, "linked-graph"), 0);
+        let mut linked = run;
+        linked.graph = "linked-graph".into();
+        assert!(save(&root, &linked).is_err());
+        assert!(outside.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 }
