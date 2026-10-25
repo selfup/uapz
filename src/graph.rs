@@ -13,7 +13,7 @@
 use gpui_kit::component::{ActiveTheme, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::doc::{self, EdgeDoc, GraphDoc, NodeDoc, NodeKind, View};
 use crate::node_data::{DatabaseConfig, NodeData, NodeType};
@@ -21,8 +21,8 @@ use crate::node_data::{DatabaseConfig, NodeData, NodeType};
 gpui_kit::actions!(graph, [AddNode, DeleteSelection, ClearAll, Cancel]);
 
 pub const KEY_CONTEXT: &str = "Graph";
-const NODE_W: f32 = 150.0;
-const NODE_H: f32 = 72.0;
+const NODE_W: f32 = 224.0;
+const NODE_H: f32 = 104.0;
 const PORT_R: f32 = 6.0;
 const GRID: f32 = 24.0;
 /// How close (in px) the cursor must be to a wire to pick it.
@@ -34,6 +34,10 @@ pub type NodeId = usize;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GraphEvent {
     SelectionChanged,
+    /// A document edit that should be saved.
+    Changed,
+    /// Open the saved child graph represented by a Workflow card.
+    OpenWorkflow(NodeId),
     /// The whole graph was replaced or cleared; anything remembered per node id is stale.
     Replaced,
 }
@@ -88,6 +92,10 @@ struct Node {
     name: Option<String>,
     /// Typed content; `None` for a blank node.
     data: Option<NodeData>,
+    /// Saved child graph outputs, sorted by their stable public name.
+    named_ports: Vec<String>,
+    /// Stale wire endpoints stay visible, but cannot start new connections.
+    missing_ports: HashSet<String>,
 }
 
 /// What a node shows for its kind. `color` is the value captured when the node was
@@ -108,45 +116,117 @@ const FALLBACK_KIND_COLOR: Hsla = Hsla {
 };
 
 impl Node {
+    fn named_mode(&self) -> bool {
+        matches!(&self.data, Some(NodeData::Workflow(config)) if config.output.is_empty())
+    }
+    fn height(&self) -> f32 {
+        if self.named_mode() {
+            NODE_H + self.named_ports.len() as f32 * 24.0
+        } else {
+            NODE_H
+        }
+    }
     fn bounds(&self) -> Bounds<Pixels> {
-        Bounds::new(self.pos, size(px(NODE_W), px(NODE_H)))
+        Bounds::new(self.pos, size(px(NODE_W), px(self.height())))
     }
-
-    /// Center of the input port on the left edge.
     fn input(&self) -> Point<Pixels> {
-        point(self.pos.x, self.pos.y + px(NODE_H / 2.0))
+        point(self.pos.x, self.pos.y + px(52.0))
+    }
+    fn output_y(&self, output: Option<&str>) -> f32 {
+        // Older wires may use the default handle. The executor resolves that to
+        // the sole published output, so anchor it to the same visible port.
+        let output = output.or_else(|| {
+            if !self.named_mode() {
+                return None;
+            }
+            let mut available = self
+                .named_ports
+                .iter()
+                .filter(|name| !self.missing_ports.contains(*name));
+            let first = available.next()?;
+            available.next().is_none().then_some(first.as_str())
+        });
+        output
+            .and_then(|name| self.named_ports.iter().position(|p| p == name))
+            .map_or(52.0, |i| NODE_H + i as f32 * 24.0 + 12.0)
+    }
+    fn output(&self, output: Option<&str>) -> Point<Pixels> {
+        point(
+            self.pos.x + px(NODE_W),
+            self.pos.y + px(self.output_y(output)),
+        )
     }
 
-    /// Center of the output port on the right edge.
-    fn output(&self) -> Point<Pixels> {
-        point(self.pos.x + px(NODE_W), self.pos.y + px(NODE_H / 2.0))
+    fn has_output(&self, output: Option<&str>) -> bool {
+        if self.named_mode() {
+            output.is_some_and(|name| {
+                self.named_ports.iter().any(|port| port == name)
+                    && !self.missing_ports.contains(name)
+            })
+        } else {
+            output.is_none()
+        }
+    }
+
+    fn set_output_ports(&mut self, names: &[String], edges: &[Edge]) {
+        self.named_ports.clear();
+        self.missing_ports.clear();
+        if !self.named_mode() {
+            return;
+        }
+        self.named_ports = names
+            .iter()
+            .filter(|name| crate::validate::output_name(name).is_ok())
+            .cloned()
+            .collect();
+        for edge in edges {
+            if edge.from == self.id
+                && let Some(name) = &edge.output
+                && !self.named_ports.contains(name)
+            {
+                self.named_ports.push(name.clone());
+                self.missing_ports.insert(name.clone());
+            }
+        }
+        self.named_ports.sort();
+        self.named_ports.dedup();
     }
 }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Edge {
     from: NodeId,
     to: NodeId,
+    output: Option<String>,
 }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+impl Edge {
+    fn handle(&self) -> String {
+        match &self.output {
+            Some(output) => format!("{}.{}", node_key(self.from), output),
+            None => node_key(self.from),
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Selection {
     Node(NodeId),
     Edge(Edge),
 }
-
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum Drag {
-    /// Moving a node; `grab` is the cursor offset from the node's origin.
-    Node { id: NodeId, grab: Point<Pixels> },
-    /// Pulling a new wire out of `from`'s output port. `target` is the node under the cursor.
+    Node {
+        id: NodeId,
+        grab: Point<Pixels>,
+        origin: Point<Pixels>,
+    },
     Wire {
         from: NodeId,
+        output: Option<String>,
         cursor: Point<Pixels>,
         target: Option<NodeId>,
     },
-    /// Panning the graph; `last` is the previous cursor position in window space.
-    Pan { last: Point<Pixels> },
+    Pan {
+        last: Point<Pixels>,
+    },
 }
 
 /// Theme colors sampled once per frame so paint closures can own them.
@@ -181,12 +261,16 @@ pub struct Graph {
     marks: HashMap<NodeId, Mark>,
     current: Current,
     next_id: NodeId,
+    outputs: BTreeMap<String, String>,
+    /// Recorded child interfaces override disk lookups only in explicit previews.
+    workflow_snapshots: Option<BTreeMap<NodeId, Vec<String>>>,
+    read_only: bool,
     pub(crate) focus_handle: FocusHandle,
 }
 
 impl Graph {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let mut graph = Self {
+        Self {
             nodes: Vec::new(),
             edges: Vec::new(),
             selection: None,
@@ -197,13 +281,11 @@ impl Graph {
             marks: HashMap::new(),
             current: Current::Blank,
             next_id: 0,
+            outputs: BTreeMap::new(),
+            workflow_snapshots: None,
+            read_only: false,
             focus_handle: cx.focus_handle(),
-        };
-        graph.insert_node(point(px(160.0), px(220.0)), None, None, cx);
-        graph.insert_node(point(px(460.0), px(330.0)), None, None, cx);
-        graph.insert_node(point(px(760.0), px(200.0)), None, None, cx);
-        graph.selection = None;
-        graph
+        }
     }
 
     /// Window coordinates to graph coordinates.
@@ -242,7 +324,11 @@ impl Graph {
             style,
             name: None,
             data,
+            named_ports: Vec::new(),
+            missing_ports: HashSet::new(),
         });
+        self.refresh_workflow_ports(cx);
+        cx.emit(GraphEvent::Changed);
         self.set_selection(Some(Selection::Node(id)), cx);
         id
     }
@@ -258,21 +344,37 @@ impl Graph {
     }
 
     fn edge_at(&self, p: Point<Pixels>) -> Option<Edge> {
-        self.edges.iter().copied().find(|e| {
-            let (Some(a), Some(b)) = (self.node(e.from), self.node(e.to)) else {
-                return false;
-            };
-            wire_distance(a.output(), b.input(), p) <= WIRE_HIT
-        })
+        self.edges
+            .iter()
+            .find(|e| {
+                let (Some(a), Some(b)) = (self.node(e.from), self.node(e.to)) else {
+                    return false;
+                };
+                wire_distance(a.output(e.output.as_deref()), b.input(), p) <= WIRE_HIT
+            })
+            .cloned()
     }
 
-    fn connect(&mut self, from: NodeId, to: NodeId, cx: &mut Context<Self>) {
-        if from == to {
+    fn connect(
+        &mut self,
+        from: NodeId,
+        to: NodeId,
+        output: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.read_only
+            || from == to
+            || self.node(to).is_none()
+            || !self
+                .node(from)
+                .is_some_and(|node| node.has_output(output.as_deref()))
+        {
             return;
         }
-        let edge = Edge { from, to };
+        let edge = Edge { from, to, output };
         if !self.edges.contains(&edge) {
-            self.edges.push(edge);
+            self.edges.push(edge.clone());
+            cx.emit(GraphEvent::Changed);
         }
         self.set_selection(Some(Selection::Edge(edge)), cx);
     }
@@ -287,7 +389,7 @@ impl Graph {
     ) {
         self.focus_handle.focus(window, cx);
         let p = self.to_graph(ev.position);
-        if ev.click_count == 2 {
+        if ev.click_count == 2 && !self.read_only {
             let (style, data) = self.current_parts();
             self.insert_node(
                 p - point(px(NODE_W / 2.0), px(NODE_H / 2.0)),
@@ -315,19 +417,33 @@ impl Graph {
         self.focus_handle.focus(window, cx);
         let Some(node) = self.node(id) else { return };
         let grab = self.to_graph(ev.position) - node.pos;
+        let origin = node.pos;
+        let workflow = matches!(node.data, Some(NodeData::Workflow(_)));
+        self.set_selection(Some(Selection::Node(id)), cx);
+        if ev.click_count == 2 && workflow {
+            self.drag = None;
+            cx.emit(GraphEvent::OpenWorkflow(id));
+            cx.notify();
+            return;
+        }
+        if self.read_only {
+            cx.notify();
+            return;
+        }
         // Raise the node so it renders above its siblings while dragging.
         if let Some(i) = self.nodes.iter().position(|n| n.id == id) {
             let node = self.nodes.remove(i);
             self.nodes.push(node);
         }
         self.set_selection(Some(Selection::Node(id)), cx);
-        self.drag = Some(Drag::Node { id, grab });
+        self.drag = Some(Drag::Node { id, grab, origin });
         cx.notify();
     }
 
     fn on_port_mouse_down(
         &mut self,
         id: NodeId,
+        output: Option<String>,
         ev: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -335,8 +451,17 @@ impl Graph {
         cx.stop_propagation();
         self.focus_handle.focus(window, cx);
         self.set_selection(Some(Selection::Node(id)), cx);
+        if self.read_only
+            || !self
+                .node(id)
+                .is_some_and(|node| node.has_output(output.as_deref()))
+        {
+            cx.notify();
+            return;
+        }
         self.drag = Some(Drag::Wire {
             from: id,
+            output,
             cursor: self.to_graph(ev.position),
             target: None,
         });
@@ -344,27 +469,39 @@ impl Graph {
     }
 
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(drag) = self.drag else { return };
+        let Some(drag) = self.drag.clone() else {
+            return;
+        };
         if ev.pressed_button != Some(MouseButton::Left) {
             // We missed the mouse-up (e.g. it happened over another window); stop dragging.
+            if let Drag::Node { id, origin, .. } = drag
+                && !self.read_only
+                && self.node(id).is_some_and(|node| node.pos != origin)
+            {
+                cx.emit(GraphEvent::Changed);
+            }
             self.drag = None;
             cx.notify();
             return;
         }
         let p = self.to_graph(ev.position);
         match drag {
-            Drag::Node { id, grab } => {
+            Drag::Node { id, grab, .. } if !self.read_only => {
                 if let Some(node) = self.node_mut(id) {
                     node.pos = p - grab;
                 }
             }
-            Drag::Wire { from, .. } => {
+            Drag::Wire { from, output, .. } if !self.read_only => {
                 let target = self.node_at(p, Some(from));
                 self.drag = Some(Drag::Wire {
                     from,
+                    output,
                     cursor: p,
                     target,
                 });
+            }
+            Drag::Node { .. } | Drag::Wire { .. } => {
+                self.drag = None;
             }
             Drag::Pan { last } => {
                 self.pan += ev.position - last;
@@ -376,11 +513,20 @@ impl Graph {
 
     fn on_mouse_up(&mut self, ev: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         let Some(drag) = self.drag.take() else { return };
-        if let Drag::Wire { from, .. } = drag {
+        if let Drag::Wire {
+            from, ref output, ..
+        } = drag
+        {
             let p = self.to_graph(ev.position);
             if let Some(to) = self.node_at(p, Some(from)) {
-                self.connect(from, to, cx);
+                self.connect(from, to, output.clone(), cx);
             }
+        }
+        if let Drag::Node { id, origin, .. } = drag
+            && !self.read_only
+            && self.node(id).is_some_and(|node| node.pos != origin)
+        {
+            cx.emit(GraphEvent::Changed);
         }
         cx.notify();
     }
@@ -399,15 +545,21 @@ impl Graph {
     }
 
     fn delete_selection(&mut self, _: &DeleteSelection, _: &mut Window, cx: &mut Context<Self>) {
-        match self.selection {
+        if self.read_only {
+            return;
+        }
+        match self.selection.clone() {
             Some(Selection::Node(id)) => {
                 self.nodes.retain(|n| n.id != id);
                 self.edges.retain(|e| e.from != id && e.to != id);
+                self.outputs
+                    .retain(|_, target| publication_node(target) != Some(id));
             }
             Some(Selection::Edge(edge)) => self.edges.retain(|e| *e != edge),
             None => return,
         }
         self.set_selection(None, cx);
+        cx.emit(GraphEvent::Changed);
         cx.notify();
     }
 
@@ -416,6 +568,12 @@ impl Graph {
     }
 
     fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(Drag::Node { id, origin, .. }) = self.drag
+            && !self.read_only
+            && self.node(id).is_some_and(|node| node.pos != origin)
+        {
+            cx.emit(GraphEvent::Changed);
+        }
         self.drag = None;
         self.set_selection(None, cx);
         cx.notify();
@@ -463,6 +621,9 @@ impl Graph {
 
     /// Add a node of the current kind or type near the visible center.
     pub fn add_current(&mut self, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         let (style, data) = self.current_parts();
         let pos = self.spawn_pos();
         self.insert_node(pos, style, data, cx);
@@ -471,6 +632,9 @@ impl Graph {
 
     /// Add a blank node of a custom kind near the visible center.
     pub fn add_kind_node(&mut self, kind: &NodeKind, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         let style = NodeStyle {
             name: kind.name.clone().into(),
             color: hsla_of(&kind.color).unwrap_or(FALLBACK_KIND_COLOR),
@@ -482,6 +646,9 @@ impl Graph {
 
     /// Add a node carrying `data`, labeled by its type.
     pub fn add_data(&mut self, data: NodeData, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         let pos = self.spawn_pos();
         self.insert_node(pos, None, Some(data), cx);
         cx.notify();
@@ -489,6 +656,9 @@ impl Graph {
 
     /// Add a node made from a saved preset: its content plus the preset's name as label.
     pub fn add_preset(&mut self, name: &str, data: NodeData, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         let style = NodeStyle {
             name: name.to_string().into(),
             color: data_color(&data),
@@ -506,16 +676,175 @@ impl Graph {
         self.edges.len()
     }
 
+    /// Select a node without changing the document, including in a child preview.
+    pub fn select_node(&mut self, id: NodeId, cx: &mut Context<Self>) {
+        if self.node(id).is_some() {
+            self.set_selection(Some(Selection::Node(id)), cx);
+            cx.notify();
+        }
+    }
+
+    pub fn set_read_only(&mut self, read_only: bool, cx: &mut Context<Self>) {
+        self.read_only = read_only;
+        self.drag = None;
+        cx.notify();
+    }
+
+    /// Center the saved layout in the available canvas.
+    pub fn frame_all(&mut self, cx: &mut Context<Self>) {
+        if let Some(first) = self.nodes.first() {
+            let mut left = first.pos.x;
+            let mut top = first.pos.y;
+            let mut right = first.bounds().right();
+            let mut bottom = first.bounds().bottom();
+            for node in &self.nodes {
+                left = left.min(node.pos.x);
+                top = top.min(node.pos.y);
+                right = right.max(node.bounds().right());
+                bottom = bottom.max(node.bounds().bottom());
+            }
+            self.pan = point(
+                self.canvas.size.width / 2.0 - (left + right) / 2.0,
+                self.canvas.size.height / 2.0 - (top + bottom) / 2.0,
+            );
+            cx.notify();
+        }
+    }
+
+    pub fn published_names(&self, id: NodeId) -> Vec<String> {
+        self.outputs
+            .iter()
+            .filter(|(_, target)| publication_node(target) == Some(id))
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// Available saved child output ports, excluding stale wire endpoints.
+    pub fn output_ports(&self, id: NodeId) -> Vec<String> {
+        self.node(id)
+            .filter(|node| node.named_mode())
+            .map(|node| {
+                node.named_ports
+                    .iter()
+                    .filter(|name| !node.missing_ports.contains(*name))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn published_port_names(&self, id: NodeId, port: Option<&str>) -> Vec<String> {
+        let target = publication_target(id, port);
+        self.outputs
+            .iter()
+            .filter(|(_, value)| **value == target)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// Replace this node's public names atomically, leaving other exports untouched.
+    pub fn publish_outputs(
+        &mut self,
+        id: NodeId,
+        names: &[String],
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        self.publish_output_port(id, None, names, cx)
+    }
+
+    /// Publish one child output as a parent output without an intermediate node.
+    pub fn publish_output_port(
+        &mut self,
+        id: NodeId,
+        port: Option<&str>,
+        names: &[String],
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if self.read_only {
+            return Err("This child graph is read-only".into());
+        }
+        let node = self.node(id).ok_or("Choose a node to publish")?;
+        // Empty names may remove a stale publication even after its port vanished.
+        if !names.is_empty() && !node.has_output(port) {
+            return Err("Choose an available output port to publish".into());
+        }
+        let outputs = published_outputs(&self.outputs, &publication_target(id, port), names)?;
+        if outputs != self.outputs {
+            self.outputs = outputs;
+            cx.emit(GraphEvent::Changed);
+            cx.notify();
+        }
+        Ok(())
+    }
+
+    /// The executor's actual ordered input handles, including distinct child ports.
+    pub fn input_handles(&self, id: NodeId) -> Vec<String> {
+        input_handles(&self.edges, id)
+    }
+
+    pub fn input_label(&self, handle: &str) -> String {
+        let (key, output) = handle
+            .split_once('.')
+            .map_or((handle, None), |(key, output)| (key, Some(output)));
+        let label = parse_key(key)
+            .and_then(|id| self.node(id))
+            .and_then(|node| self.resolved_style(node))
+            .map_or_else(|| key.to_string(), |style| style.name.to_string());
+        output.map_or(label.clone(), |name| format!("{label}.{name}"))
+    }
+
+    /// The template alias the executor accepts, independent of display labels.
+    pub fn input_alias(&self, handle: &str) -> Option<String> {
+        input_alias(&self.nodes, handle)
+    }
+
+    /// Refresh saved child interfaces without rewriting existing wires. A removed port
+    /// remains visible on its wire so execution can report the stale configuration.
+    pub fn refresh_workflow_ports(&mut self, cx: &mut Context<Self>) {
+        let mut saved = HashMap::new();
+        for node in &mut self.nodes {
+            let names = if let Some(snapshots) = &self.workflow_snapshots {
+                snapshots.get(&node.id).cloned().unwrap_or_default()
+            } else if let Some(NodeData::Workflow(config)) = &node.data
+                && config.output.is_empty()
+            {
+                saved
+                    .entry(config.graph.clone())
+                    .or_insert_with(|| {
+                        doc::load(&config.graph)
+                            .map(|doc| doc.outputs.into_keys().collect::<Vec<_>>())
+                            .unwrap_or_default()
+                    })
+                    .clone()
+            } else {
+                Vec::new()
+            };
+            node.set_output_ports(&names, &self.edges);
+        }
+        cx.notify();
+    }
+
+    /// Show interfaces from the immutable child graphs captured for this run.
+    /// Missing snapshots stay unavailable rather than resolving today's saved files.
+    pub fn set_workflow_snapshots(
+        &mut self,
+        snapshots: &BTreeMap<String, GraphDoc>,
+        cx: &mut Context<Self>,
+    ) {
+        self.workflow_snapshots = Some(snapshot_ports(snapshots));
+        self.refresh_workflow_ports(cx);
+    }
+
     // ----- node content -----
 
     /// The selected node, if the selection is a node.
     pub fn selected(&self) -> Option<NodeView<'_>> {
-        let Some(Selection::Node(id)) = self.selection else {
+        let Some(Selection::Node(id)) = self.selection.as_ref() else {
             return None;
         };
-        let node = self.node(id)?;
+        let node = self.node(*id)?;
         Some(NodeView {
-            id,
+            id: *id,
             preset: node.style.as_ref().map(|s| s.name.clone()),
             name: node.name.as_deref(),
             data: node.data.as_ref(),
@@ -533,9 +862,16 @@ impl Graph {
     /// Name or unname a node. The name is stored as typed; the inspector reports what is
     /// wrong with it and the executor ignores a name that does not validate.
     pub fn set_node_name(&mut self, id: NodeId, name: Option<String>, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         if let Some(node) = self.node_mut(id) {
-            node.name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
-            cx.notify();
+            let name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+            if node.name != name {
+                node.name = name;
+                cx.emit(GraphEvent::Changed);
+                cx.notify();
+            }
         }
     }
 
@@ -562,17 +898,30 @@ impl Graph {
 
     /// Replace a node's content. `None` makes it blank again.
     pub fn set_node_data(&mut self, id: NodeId, data: Option<NodeData>, cx: &mut Context<Self>) {
-        if let Some(node) = self.node_mut(id) {
+        if self.read_only {
+            return;
+        }
+        if let Some(node) = self.node_mut(id)
+            && node.data != data
+        {
             node.data = data;
+            self.refresh_workflow_ports(cx);
+            cx.emit(GraphEvent::Changed);
             cx.notify();
         }
     }
 
     /// Set or clear the kind/preset name shown on a node.
     pub fn set_node_label(&mut self, id: NodeId, label: Option<String>, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         let Some(node) = self.node_mut(id) else {
             return;
         };
+        if node.style.as_ref().map(|style| style.name.as_ref()) == label.as_deref() {
+            return;
+        }
         node.style = label.map(|name| {
             let color = match &node.data {
                 Some(data) => data_color(data),
@@ -583,6 +932,7 @@ impl Graph {
                 color,
             }
         });
+        cx.emit(GraphEvent::Changed);
         cx.notify();
     }
 
@@ -599,7 +949,14 @@ impl Graph {
     /// The editor state as a document ready to be written to disk. Nodes and edges are
     /// sorted by id so the files don't churn when a node is dragged to the front.
     pub fn snapshot(&self, name: &str) -> GraphDoc {
-        snapshot_doc(name, &self.nodes, &self.edges, self.pan, &self.kinds)
+        snapshot_doc(
+            name,
+            &self.nodes,
+            &self.edges,
+            self.pan,
+            &self.kinds,
+            &self.outputs,
+        )
     }
 
     /// Replace the editor state with a document; see [`restore_plan`] for the rules.
@@ -608,6 +965,9 @@ impl Graph {
         self.nodes = restored.nodes;
         self.edges = restored.edges;
         self.next_id = restored.next_id;
+        self.outputs = restored.outputs;
+        self.workflow_snapshots = None;
+        self.refresh_workflow_ports(cx);
         self.pan = point(px(doc.view.pan_x), px(doc.view.pan_y));
         self.selection = None;
         self.drag = None;
@@ -618,6 +978,13 @@ impl Graph {
     }
 
     pub fn clear(&mut self, cx: &mut Context<Self>) {
+        if self.read_only
+            || (self.nodes.is_empty() && self.edges.is_empty() && self.outputs.is_empty())
+        {
+            return;
+        }
+        self.outputs.clear();
+        self.workflow_snapshots = None;
         self.nodes.clear();
         self.edges.clear();
         self.selection = None;
@@ -626,6 +993,7 @@ impl Graph {
         self.marks.clear();
         cx.emit(GraphEvent::Replaced);
         cx.emit(GraphEvent::SelectionChanged);
+        cx.emit(GraphEvent::Changed);
         cx.notify();
     }
 
@@ -636,8 +1004,8 @@ impl Graph {
         let view = cx.entity().downgrade();
         let nodes = self.nodes.clone();
         let edges = self.edges.clone();
-        let selection = self.selection;
-        let drag = self.drag;
+        let selection = self.selection.clone();
+        let drag = self.drag.clone();
         let pan = self.pan;
 
         canvas(
@@ -654,30 +1022,37 @@ impl Graph {
                     let (Some(a), Some(b)) = (find(edge.from), find(edge.to)) else {
                         continue;
                     };
-                    let selected = selection == Some(Selection::Edge(*edge));
+                    let selected = selection == Some(Selection::Edge(edge.clone()));
                     let (color, width) = if selected {
                         (c.accent, px(3.0))
                     } else {
                         (c.wire, px(2.0))
                     };
-                    if let Some(path) =
-                        wire_path(a.output() + origin, b.input() + origin, width, false)
-                    {
+                    if let Some(path) = wire_path(
+                        a.output(edge.output.as_deref()) + origin,
+                        b.input() + origin,
+                        width,
+                        false,
+                    ) {
                         window.paint_path(path, color);
                     }
                 }
 
                 if let Some(Drag::Wire {
                     from,
+                    output,
                     cursor,
                     target,
                 }) = drag
                     && let Some(a) = find(from)
                 {
                     let end = target.and_then(find).map(Node::input).unwrap_or(cursor);
-                    if let Some(path) =
-                        wire_path(a.output() + origin, end + origin, px(2.0), target.is_none())
-                    {
+                    if let Some(path) = wire_path(
+                        a.output(output.as_deref()) + origin,
+                        end + origin,
+                        px(2.0),
+                        target.is_none(),
+                    ) {
                         window.paint_path(path, c.accent);
                     }
                 }
@@ -697,14 +1072,13 @@ impl Graph {
         let id = node.id;
         let selected = self.selection == Some(Selection::Node(id));
         let is_target = matches!(self.drag, Some(Drag::Wire { target: Some(t), .. }) if t == id);
-        let is_source = matches!(self.drag, Some(Drag::Wire { from, .. }) if from == id);
         let dragging = matches!(self.drag, Some(Drag::Node { id: d, .. }) if d == id);
         let top_left = node.pos + self.pan;
 
-        let port = |active: bool| {
+        let port = |active: bool, y: f32| {
             div()
                 .absolute()
-                .top(px(NODE_H / 2.0 - PORT_R))
+                .top(px(y - PORT_R))
                 .w(px(PORT_R * 2.0))
                 .h(px(PORT_R * 2.0))
                 .rounded_full()
@@ -717,17 +1091,23 @@ impl Graph {
         // element's border after its children, so a border on the node would be drawn
         // over the ports. As the first sibling, the body stays beneath them.
         let style = self.resolved_style(node);
-        let summary = node.data.as_ref().map(|d| d.summary());
-        let fill = style.as_ref().map_or(c.node, |s| s.color);
-        let edge = style.as_ref().map_or(c.node_border, |s| darken(s.color));
-        let label_color =
-            style.as_ref().map_or(
-                c.text,
-                |s| if is_light(s.color) { black() } else { white() },
-            );
-        let summary_color = Hsla {
-            a: 0.75,
-            ..label_color
+        let summary = node
+            .data
+            .as_ref()
+            .map(|data| data.summary())
+            .unwrap_or_else(|| "Add configuration in the inspector".into());
+        let accent = style.as_ref().map_or(c.node_border, |s| s.color);
+        let label = style
+            .as_ref()
+            .map_or_else(|| "Untitled node".into(), |s| s.name.clone());
+        let type_label = node.data.as_ref().map_or("Note", NodeData::label);
+        let (status, status_color) = match self.marks.get(&id) {
+            Some(Mark::Pending) => ("Waiting", c.reused),
+            Some(Mark::Running) => ("Running", c.accent),
+            Some(Mark::Ran) => ("Complete", c.ran),
+            Some(Mark::Reused) => ("Cached", c.reused),
+            Some(Mark::Failed) => ("Failed", c.failed),
+            None => ("", c.reused),
         };
         let body = div()
             .absolute()
@@ -737,62 +1117,121 @@ impl Graph {
             .border_color(if selected || is_target {
                 c.accent
             } else {
-                edge
+                c.node_border
             })
-            .bg(fill)
+            .bg(c.node)
             .when(selected || dragging, |d| d.shadow_md())
-            .flex()
-            .items_center()
-            .justify_center()
-            .px_2()
-            .when_some(style, |d, s| {
-                d.child(
-                    v_flex()
-                        .min_w_0()
-                        .items_center()
-                        .child(
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top(px(12.0))
+                    .bottom(px(12.0))
+                    .w(px(3.0))
+                    .rounded_full()
+                    .bg(accent),
+            )
+            .child(
+                v_flex()
+                    .absolute()
+                    .top(px(12.0))
+                    .left(px(16.0))
+                    .right(px(14.0))
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .items_center()
+                            .child(div().text_xs().text_color(accent).child(type_label))
+                            .when(!status.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(div().size(px(5.0)).rounded_full().bg(status_color))
+                                        .child(
+                                            div().text_xs().text_color(status_color).child(status),
+                                        ),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(c.text)
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_xs()
+                            .text_color(c.reused)
+                            .child(summary),
+                    )
+                    .when(matches!(node.data, Some(NodeData::Workflow(_))), |d| {
+                        d.child(
                             div()
-                                .max_w_full()
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .text_sm()
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(label_color)
-                                .child(s.name),
+                                .text_xs()
+                                .text_color(c.reused)
+                                .child("Double-click to explore →"),
                         )
-                        .children(summary.map(|text| {
+                    }),
+            );
+
+        let outputs: Vec<Option<String>> = if node.named_mode() {
+            node.named_ports.iter().cloned().map(Some).collect()
+        } else {
+            vec![None]
+        };
+        let output_elements = outputs
+            .into_iter()
+            .map(|output| {
+                let y = node.output_y(output.as_deref());
+                let missing = output.as_ref().is_some_and(|name| node.missing_ports.contains(name));
+                let name = output.as_ref().map(|name| if missing { format!("{name} · missing") } else { name.clone() });
+                let active = matches!(&self.drag, Some(Drag::Wire { from, output: dragging, .. }) if *from == id && *dragging == output);
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .top(px(y - 12.0))
+                    .h(px(24.0))
+                    .when_some(name, |d, name| {
+                        d.child(
                             div()
-                                .max_w_full()
+                                .absolute()
+                                .right(px(14.0))
+                                .top(px(3.0))
+                                .max_w(px(NODE_W - 28.0))
                                 .overflow_hidden()
                                 .whitespace_nowrap()
                                 .text_ellipsis()
                                 .text_xs()
-                                .text_color(summary_color)
-                                .child(text)
-                        })),
-                )
-            });
-
-        // The latest run's state, as a dot in the top-right corner: hollow while waiting,
-        // the accent while running, then green ran, grey reused or red failed.
-        let mark = self.marks.get(&id).map(|mark| {
-            let dot = div()
-                .absolute()
-                .top(px(5.0))
-                .right(px(5.0))
-                .w(px(9.0))
-                .h(px(9.0))
-                .rounded_full()
-                .border_1();
-            match mark {
-                Mark::Pending => dot.border_color(c.reused).bg(c.port_ring),
-                Mark::Running => dot.border_color(c.port_ring).bg(c.accent),
-                Mark::Ran => dot.border_color(c.port_ring).bg(c.ran),
-                Mark::Reused => dot.border_color(c.port_ring).bg(c.reused),
-                Mark::Failed => dot.border_color(c.port_ring).bg(c.failed),
-            }
-        });
+                                .text_color(if missing { c.failed } else { c.reused })
+                                .child(name),
+                        )
+                    })
+                    .child(
+                        port(active, 12.0)
+                            .right(px(-PORT_R))
+                            .when(!missing && !self.read_only, |d| d.cursor_crosshair())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |graph, ev: &MouseDownEvent, window, cx| {
+                                    graph.on_port_mouse_down(id, output.clone(), ev, window, cx)
+                                }),
+                            ),
+                    )
+            })
+            .collect::<Vec<_>>();
 
         div()
             .id(("node", id))
@@ -800,9 +1239,9 @@ impl Graph {
             .left(top_left.x)
             .top(top_left.y)
             .w(px(NODE_W))
-            .h(px(NODE_H))
+            .h(px(node.height()))
             .when(dragging, |d| d.cursor_grabbing())
-            .when(!dragging, |d| d.cursor_grab())
+            .when(!dragging && !self.read_only, |d| d.cursor_grab())
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |graph, ev: &MouseDownEvent, window, cx| {
@@ -810,21 +1249,10 @@ impl Graph {
                 }),
             )
             .child(body)
-            .children(mark)
             // Input port: a drop target, so it only needs to look right.
-            .child(port(is_target).left(px(-PORT_R)))
+            .child(port(is_target, 52.0).left(px(-PORT_R)))
             // Output port: where wires start.
-            .child(
-                port(is_source)
-                    .right(px(-PORT_R))
-                    .cursor_crosshair()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |graph, ev: &MouseDownEvent, window, cx| {
-                            graph.on_port_mouse_down(id, ev, window, cx)
-                        }),
-                    ),
-            )
+            .children(output_elements)
     }
 }
 
@@ -840,7 +1268,7 @@ impl Render for Graph {
             port: theme.muted_foreground,
             port_ring: theme.background,
             wire: theme.muted_foreground,
-            text: theme.muted_foreground,
+            text: theme.foreground,
             ran: theme.success,
             reused: theme.muted_foreground,
             failed: theme.danger,
@@ -870,11 +1298,108 @@ impl Render for Graph {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .child(self.render_canvas(c, cx))
+            .when(self.nodes.is_empty(), |d| {
+                d.child(
+                    v_flex()
+                        .absolute()
+                        .top(px(80.0))
+                        .left(px(56.0))
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_lg()
+                                .text_color(c.text)
+                                .child("Build your workflow"),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(c.reused)
+                                .child("Choose a node from the library to begin."),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(c.reused)
+                                .child("Connect outputs to inputs. Select a node to configure it."),
+                        ),
+                )
+            })
             .children(nodes)
     }
 }
 
 // ----- documents -----
+
+fn published_outputs(
+    current: &BTreeMap<String, String>,
+    target: &str,
+    names: &[String],
+) -> Result<BTreeMap<String, String>, String> {
+    let mut outputs = current.clone();
+    outputs.retain(|_, value| value != target);
+    for name in names {
+        crate::validate::output_name(name)?;
+        if outputs.insert(name.clone(), target.to_string()).is_some() {
+            return Err(format!("Output name `{name}` is already published"));
+        }
+    }
+    if outputs.len() > crate::workflow::MAX_FIELDS {
+        return Err("At most 64 published outputs are allowed".into());
+    }
+    Ok(outputs)
+}
+
+fn publication_target(id: NodeId, port: Option<&str>) -> String {
+    port.map_or_else(|| node_key(id), |port| format!("{}.{port}", node_key(id)))
+}
+
+fn publication_node(target: &str) -> Option<NodeId> {
+    parse_key(target.split_once('.').map_or(target, |(node, _)| node))
+}
+
+fn snapshot_ports(snapshots: &BTreeMap<String, GraphDoc>) -> BTreeMap<NodeId, Vec<String>> {
+    snapshots
+        .iter()
+        .filter_map(|(node, graph)| {
+            Some((
+                parse_key(node)?,
+                graph
+                    .outputs
+                    .keys()
+                    .filter(|name| crate::validate::output_name(name).is_ok())
+                    .cloned()
+                    .collect(),
+            ))
+        })
+        .collect()
+}
+
+fn input_handles(edges: &[Edge], id: NodeId) -> Vec<String> {
+    let mut handles: Vec<String> = edges
+        .iter()
+        .filter(|edge| edge.to == id)
+        .map(Edge::handle)
+        .collect();
+    handles.sort();
+    handles.dedup();
+    handles
+}
+
+fn input_alias(nodes: &[Node], handle: &str) -> Option<String> {
+    let (base, port) = handle
+        .split_once('.')
+        .map_or((handle, None), |(base, port)| (base, Some(port)));
+    let id = parse_key(base)?;
+    let name = nodes
+        .iter()
+        .find(|node| node.id == id)?
+        .name
+        .as_deref()?
+        .trim();
+    crate::validate::node_name(name).ok()?;
+    Some(port.map_or_else(|| name.to_string(), |port| format!("{name}.{port}")))
+}
 
 /// See [`Graph::resolved_style`].
 fn resolve_style(node: &Node, kinds: &HashMap<String, Hsla>) -> Option<NodeStyle> {
@@ -911,12 +1436,14 @@ fn snapshot_doc(
     edges: &[Edge],
     pan: Point<Pixels>,
     kinds: &HashMap<String, Hsla>,
+    outputs: &BTreeMap<String, String>,
 ) -> GraphDoc {
     let mut nodes: Vec<&Node> = nodes.iter().collect();
     nodes.sort_by_key(|n| n.id);
     let mut edges = edges.to_vec();
-    edges.sort_by_key(|e| (e.from, e.to));
+    edges.sort_by_key(|e| (e.from, e.to, e.output.clone()));
     GraphDoc {
+        outputs: outputs.clone(),
         version: doc::VERSION,
         name: name.to_string(),
         view: View {
@@ -940,6 +1467,7 @@ fn snapshot_doc(
             .map(|e| EdgeDoc {
                 from: node_key(e.from),
                 to: node_key(e.to),
+                output: e.output.clone(),
             })
             .collect(),
     }
@@ -950,6 +1478,7 @@ struct Restored {
     nodes: Vec<Node>,
     edges: Vec<Edge>,
     next_id: NodeId,
+    outputs: BTreeMap<String, String>,
 }
 
 /// Ids of the form `n<number>` are kept, the first time each appears, so the JSON stays
@@ -992,6 +1521,8 @@ fn restore_plan(doc: &GraphDoc, kinds: &HashMap<String, Hsla>) -> Restored {
                     .filter(|name| !name.is_empty())
                     .map(str::to_string),
                 data: n.data.clone(),
+                named_ports: Vec::new(),
+                missing_ports: HashSet::new(),
             }
         })
         .collect();
@@ -1001,12 +1532,29 @@ fn restore_plan(doc: &GraphDoc, kinds: &HashMap<String, Hsla>) -> Restored {
         let (Some(&from), Some(&to)) = (ids.get(e.from.as_str()), ids.get(e.to.as_str())) else {
             continue;
         };
-        let edge = Edge { from, to };
+        let edge = Edge {
+            from,
+            to,
+            output: e.output.clone(),
+        };
         if from != to && !edges.contains(&edge) {
             edges.push(edge);
         }
     }
     Restored {
+        outputs: doc
+            .outputs
+            .iter()
+            .map(|(name, target)| {
+                let (key, port) = target
+                    .split_once('.')
+                    .map_or((target.as_str(), None), |(key, port)| (key, Some(port)));
+                let target = ids
+                    .get(key)
+                    .map_or_else(|| target.clone(), |id| publication_target(*id, port));
+                (name.clone(), target)
+            })
+            .collect(),
         nodes,
         edges,
         next_id: next,
@@ -1155,34 +1703,22 @@ fn hex_of(color: Hsla) -> String {
     doc::rgb_to_hex(rgb.r, rgb.g, rgb.b)
 }
 
-fn is_light(color: Hsla) -> bool {
-    let rgb = Rgba::from(color);
-    doc::is_light(rgb.r, rgb.g, rgb.b)
-}
-
-/// A border tone for a colored node body.
-fn darken(color: Hsla) -> Hsla {
-    Hsla {
-        l: color.l * 0.75,
-        ..color
-    }
-}
-
 #[cfg(test)]
 mod tests {
     // `use super::*` would also import gpui's `test` attribute macro, which shadows the
     // standard one, so the module names what it needs.
     use super::{
-        Edge, FALLBACK_KIND_COLOR, Node, NodeId, NodeStyle, hex_of, hsla_of, node_key, parse_key,
-        resolve_style, restore_plan, segment_distance, snapshot_doc, style_from_doc, wire_distance,
-        wrap,
+        Edge, FALLBACK_KIND_COLOR, Node, NodeId, NodeStyle, hex_of, hsla_of, input_alias,
+        input_handles, node_key, parse_key, publication_node, published_outputs, resolve_style,
+        restore_plan, segment_distance, snapshot_doc, snapshot_ports, style_from_doc,
+        wire_distance, wrap,
     };
     use crate::doc::{self, EdgeDoc, GraphDoc, NodeDoc, View};
     use crate::node_data::{
         DataConfig, DataFormat, DatabaseConfig, NodeData, NodeType, WRITE_COLOR,
     };
     use gpui_kit::{Hsla, point, px};
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap, HashSet};
 
     fn doc_node(id: &str, kind: Option<&str>, color: Option<&str>) -> NodeDoc {
         NodeDoc {
@@ -1200,6 +1736,7 @@ mod tests {
         EdgeDoc {
             from: from.into(),
             to: to.into(),
+            output: None,
         }
     }
 
@@ -1226,6 +1763,7 @@ mod tests {
 
     fn graph_doc(nodes: Vec<NodeDoc>, edges: Vec<EdgeDoc>) -> GraphDoc {
         GraphDoc {
+            outputs: BTreeMap::new(),
             version: doc::VERSION,
             name: "t".into(),
             view: View::default(),
@@ -1373,8 +1911,284 @@ mod tests {
         let restored = restore_plan(&doc, &HashMap::new());
         assert_eq!(
             restored.edges,
-            [Edge { from: 0, to: 1 }, Edge { from: 1, to: 2 }]
+            [
+                Edge {
+                    from: 0,
+                    to: 1,
+                    output: None
+                },
+                Edge {
+                    from: 1,
+                    to: 2,
+                    output: None
+                }
+            ]
         );
+    }
+
+    #[test]
+    fn named_ports_and_public_exports_survive_restore_without_collapsing_wires() {
+        let mut doc = graph_doc(
+            vec![doc_node("n2", None, None), doc_node("n7", None, None)],
+            vec![
+                EdgeDoc {
+                    from: "n2".into(),
+                    to: "n7".into(),
+                    output: Some("summary".into()),
+                },
+                EdgeDoc {
+                    from: "n2".into(),
+                    to: "n7".into(),
+                    output: Some("details".into()),
+                },
+                EdgeDoc {
+                    from: "n2".into(),
+                    to: "n7".into(),
+                    output: Some("summary".into()),
+                },
+            ],
+        );
+        doc.outputs.insert("report".into(), "n7".into());
+        doc.outputs.insert("source".into(), "n2.summary".into());
+        doc.outputs.insert("other".into(), "n2.details".into());
+        let restored = restore_plan(&doc, &HashMap::new());
+        assert_eq!(restored.edges.len(), 2);
+        assert_eq!(restored.edges[0].handle(), "n2.summary");
+        assert_eq!(restored.edges[1].handle(), "n2.details");
+        let saved = snapshot_doc(
+            "t",
+            &restored.nodes,
+            &restored.edges,
+            point(px(0.0), px(0.0)),
+            &HashMap::new(),
+            &restored.outputs,
+        );
+        assert_eq!(saved.outputs, doc.outputs);
+        assert_eq!(saved.edges[0].output.as_deref(), Some("details"));
+        assert_eq!(saved.edges[1].output.as_deref(), Some("summary"));
+        let again = restore_plan(&saved, &HashMap::new());
+        assert_eq!(again.outputs, restored.outputs);
+        assert_eq!(again.edges.len(), 2);
+    }
+
+    #[test]
+    fn publishing_is_atomic_and_keeps_other_nodes_exports() {
+        let current = BTreeMap::from([
+            ("summary".into(), "n2".into()),
+            ("report".into(), "n7".into()),
+        ]);
+        let changed =
+            published_outputs(&current, "n2", &["details".into(), "rows".into()]).unwrap();
+        assert_eq!(changed.get("report").map(String::as_str), Some("n7"));
+        assert_eq!(changed.get("details").map(String::as_str), Some("n2"));
+        assert!(!changed.contains_key("summary"));
+        for names in [
+            vec!["report".into()],
+            vec!["same".into(), "same".into()],
+            vec![" spaced ".into()],
+            vec!["bad.name".into()],
+        ] {
+            assert!(published_outputs(&current, "n2", &names).is_err());
+        }
+        assert_eq!(current.get("summary").map(String::as_str), Some("n2"));
+        assert_eq!(
+            published_outputs(&current, "n2", &[]).unwrap(),
+            BTreeMap::from([("report".into(), "n7".into())])
+        );
+    }
+
+    #[test]
+    fn republishing_one_child_port_preserves_sibling_exports_and_stale_targets() {
+        let current = BTreeMap::from([
+            ("digest".into(), "n2.summary".into()),
+            ("rows".into(), "n2.details".into()),
+            ("broken".into(), "missing.summary".into()),
+        ]);
+        let changed = published_outputs(&current, "n2.summary", &["report".into()]).unwrap();
+        assert!(!changed.contains_key("digest"));
+        assert_eq!(
+            changed.get("report").map(String::as_str),
+            Some("n2.summary")
+        );
+        assert_eq!(changed.get("rows").map(String::as_str), Some("n2.details"));
+        assert!(published_outputs(&current, "n2.summary", &["rows".into()]).is_err());
+        let mut doc = graph_doc(vec![doc_node("n2", None, None)], vec![]);
+        doc.outputs = changed;
+        let restored = restore_plan(&doc, &HashMap::new());
+        assert_eq!(restored.outputs, doc.outputs);
+        let mut remaining = restored.outputs;
+        remaining.retain(|_, target| publication_node(target) != Some(2));
+        assert_eq!(
+            remaining,
+            BTreeMap::from([("broken".into(), "missing.summary".into())])
+        );
+    }
+
+    #[test]
+    fn restoring_renumbered_nodes_preserves_qualified_export_ports() {
+        let mut doc = graph_doc(vec![doc_node("child", None, None)], vec![]);
+        doc.outputs.insert("report".into(), "child.summary".into());
+        let restored = restore_plan(&doc, &HashMap::new());
+        assert_eq!(
+            restored.outputs.get("report").map(String::as_str),
+            Some("n0.summary")
+        );
+    }
+
+    #[test]
+    fn child_output_geometry_has_distinct_named_positions() {
+        let mut node = Node {
+            id: 2,
+            pos: point(px(10.0), px(20.0)),
+            style: None,
+            name: None,
+            data: Some(NodeType::Workflow.default_data()),
+            named_ports: vec!["details".into(), "summary".into()],
+            missing_ports: HashSet::new(),
+        };
+        assert!(node.named_mode());
+        assert_ne!(node.output(None), node.output(Some("summary")));
+        assert!(node.has_output(Some("details")));
+        assert!(!node.has_output(None));
+        assert!(!node.has_output(Some("unknown")));
+        node.missing_ports.insert("details".into());
+        assert!(!node.has_output(Some("details")));
+        assert!(node.has_output(Some("summary")));
+        assert_eq!(node.output(None), node.output(Some("summary")));
+        assert!(node.output(Some("summary")).y > node.output(Some("details")).y);
+        assert!(node.bounds().bottom() > node.output(Some("summary")).y);
+        if let Some(NodeData::Workflow(config)) = &mut node.data {
+            config.output = "n0".into();
+        }
+        assert!(!node.named_mode());
+        assert!(node.has_output(None));
+        assert!(!node.has_output(Some("summary")));
+        assert_eq!(node.height(), super::NODE_H);
+    }
+
+    #[test]
+    fn input_handles_match_executor_order_including_double_digit_ids() {
+        let edge = |from, output: Option<&str>, to| Edge {
+            from,
+            output: output.map(str::to_string),
+            to,
+        };
+        let edges = vec![
+            edge(2, Some("summary"), 7),
+            edge(10, None, 7),
+            edge(2, Some("details"), 7),
+            edge(2, Some("summary"), 7),
+            edge(1, None, 8),
+        ];
+        assert_eq!(
+            input_handles(&edges, 7),
+            ["n10", "n2.details", "n2.summary"]
+        );
+    }
+
+    #[test]
+    fn template_aliases_require_explicit_valid_node_names() {
+        let mut node = Node {
+            id: 2,
+            pos: point(px(0.0), px(0.0)),
+            style: None,
+            name: None,
+            data: Some(NodeType::Agent.default_data()),
+            named_ports: Vec::new(),
+            missing_ports: HashSet::new(),
+        };
+        assert_eq!(input_alias(std::slice::from_ref(&node), "n2"), None);
+        node.style = Some(NodeStyle {
+            name: "Preset".into(),
+            color: FALLBACK_KIND_COLOR,
+        });
+        assert_eq!(input_alias(std::slice::from_ref(&node), "n2.summary"), None);
+        node.name = Some("parts".into());
+        assert_eq!(
+            input_alias(std::slice::from_ref(&node), "n2"),
+            Some("parts".into())
+        );
+        assert_eq!(
+            input_alias(std::slice::from_ref(&node), "n2.summary"),
+            Some("parts.summary".into())
+        );
+        node.name = Some("n4".into());
+        assert_eq!(input_alias(std::slice::from_ref(&node), "n2.summary"), None);
+        node.name = Some(" trimmed ".into());
+        assert_eq!(
+            input_alias(std::slice::from_ref(&node), "n2.summary"),
+            Some("trimmed.summary".into())
+        );
+    }
+
+    #[test]
+    fn recorded_interfaces_keep_old_ports_without_changing_the_saved_graph() {
+        let mut workflow = doc_node("n2", None, None);
+        workflow.data = Some(NodeType::Workflow.default_data());
+        let doc = graph_doc(
+            vec![workflow, doc_node("n7", None, None)],
+            vec![
+                EdgeDoc {
+                    from: "n2".into(),
+                    to: "n7".into(),
+                    output: Some("old".into()),
+                },
+                EdgeDoc {
+                    from: "n2".into(),
+                    to: "n7".into(),
+                    output: Some("removed".into()),
+                },
+            ],
+        );
+        let mut child = graph_doc(vec![doc_node("n0", None, None)], vec![]);
+        child.outputs = BTreeMap::from([
+            ("old".into(), "n0".into()),
+            ("recorded".into(), "n0".into()),
+            (" bad ".into(), "n0".into()),
+        ]);
+        let snapshots = BTreeMap::from([("n2".into(), child)]);
+        let names = snapshot_ports(&snapshots);
+        assert_eq!(names.get(&2).unwrap(), &["old", "recorded"]);
+        let mut restored = restore_plan(&doc, &HashMap::new());
+        let before = snapshot_doc(
+            "t",
+            &restored.nodes,
+            &restored.edges,
+            point(px(0.0), px(0.0)),
+            &HashMap::new(),
+            &restored.outputs,
+        );
+        for node in &mut restored.nodes {
+            node.set_output_ports(
+                names.get(&node.id).map(Vec::as_slice).unwrap_or_default(),
+                &restored.edges,
+            );
+        }
+        let workflow = restored.nodes.iter().find(|node| node.id == 2).unwrap();
+        assert!(workflow.has_output(Some("old")));
+        assert!(workflow.has_output(Some("recorded")));
+        assert!(!workflow.has_output(Some("removed")));
+        assert!(workflow.missing_ports.contains("removed"));
+        assert!(!workflow.named_ports.iter().any(|name| name == " bad "));
+        let after = snapshot_doc(
+            "t",
+            &restored.nodes,
+            &restored.edges,
+            point(px(0.0), px(0.0)),
+            &HashMap::new(),
+            &restored.outputs,
+        );
+        assert_eq!(
+            serde_json::to_value(&before).unwrap(),
+            serde_json::to_value(&after).unwrap()
+        );
+        let workflow = restored.nodes.iter_mut().find(|node| node.id == 2).unwrap();
+        if let Some(NodeData::Workflow(config)) = &mut workflow.data {
+            config.output = "n0".into();
+        }
+        workflow.set_output_ports(names.get(&2).unwrap(), &restored.edges);
+        assert!(workflow.named_ports.is_empty());
+        assert!(workflow.has_output(None));
     }
 
     #[test]
@@ -1388,6 +2202,8 @@ mod tests {
             style: None,
             name: None,
             data: None,
+            named_ports: Vec::new(),
+            missing_ports: HashSet::new(),
         };
         assert_eq!(label(&node), None);
         // A named blank node shows its name in the fallback grey.
@@ -1433,6 +2249,8 @@ mod tests {
                 style: None,
                 name: Some("sink".into()),
                 data: Some(NodeData::Database(DatabaseConfig::writable())),
+                named_ports: Vec::new(),
+                missing_ports: HashSet::new(),
             },
             Node {
                 id: 1,
@@ -1440,6 +2258,8 @@ mod tests {
                 style: style("Note", "#999999"),
                 name: None,
                 data: None,
+                named_ports: Vec::new(),
+                missing_ports: HashSet::new(),
             },
             Node {
                 id: 2,
@@ -1450,14 +2270,35 @@ mod tests {
                     path: "a.csv".into(),
                     format: DataFormat::Csv,
                 })),
+                named_ports: Vec::new(),
+                missing_ports: HashSet::new(),
             },
         ];
         let edges = vec![
-            Edge { from: 3, to: 1 },
-            Edge { from: 1, to: 2 },
-            Edge { from: 1, to: 3 },
+            Edge {
+                from: 3,
+                to: 1,
+                output: None,
+            },
+            Edge {
+                from: 1,
+                to: 2,
+                output: None,
+            },
+            Edge {
+                from: 1,
+                to: 3,
+                output: None,
+            },
         ];
-        let doc = snapshot_doc("g", &nodes, &edges, point(px(5.0), px(-6.0)), &kinds);
+        let doc = snapshot_doc(
+            "g",
+            &nodes,
+            &edges,
+            point(px(5.0), px(-6.0)),
+            &kinds,
+            &BTreeMap::new(),
+        );
         assert_eq!(doc.name, "g");
         assert_eq!((doc.view.pan_x, doc.view.pan_y), (5.0, -6.0));
         let ids: Vec<&str> = doc.nodes.iter().map(|n| n.id.as_str()).collect();
@@ -1491,6 +2332,7 @@ mod tests {
             &restored.edges,
             point(px(5.0), px(-6.0)),
             &kinds,
+            &restored.outputs,
         );
         assert_eq!(
             serde_json::to_value(&again).unwrap(),

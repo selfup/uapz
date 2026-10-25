@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "name": "use-note-parts",
+  "view": { "pan_x": 0.0, "pan_y": 0.0 },
+  "nodes": [
+    {
+      "id": "n0",
+      "x": 80.0,
+      "y": 80.0,
+      "name": "title",
+      "data": {
+        "type": "input",
+        "kind": "text",
+        "default": "# My composed note\n",
+        "required": true
+      }
+    },
+    {
+      "id": "n1",
+      "x": 80.0,
+      "y": 240.0,
+      "name": "message",
+      "data": {
+        "type": "input",
+        "kind": "text",
+        "default": "Two named outputs, one child execution.\n",
+        "required": true
+      }
+    },
+    {
+      "id": "n2",
+      "x": 360.0,
+      "y": 160.0,
+      "name": "parts",
+      "data": {
+        "type": "workflow",
+        "graph": "note-parts",
+        "output": "",
+        "inputs": {
+          "heading": { "kind": "output", "node": "n0" },
+          "body": { "kind": "output", "node": "n1" }
+        }
+      }
+    },
+    {
+      "id": "n3",
+      "x": 660.0,
+      "y": 80.0,
+      "name": "save-heading",
+      "data": {
+        "type": "file",
+        "path": "generated/heading.md",
+        "mode": "overwrite",
+        "unfence": false,
+        "bundle": false,
+        "review": true
+      }
+    },
+    {
+      "id": "n4",
+      "x": 660.0,
+      "y": 240.0,
+      "name": "save-body",
+      "data": {
+        "type": "file",
+        "path": "generated/body.md",
+        "mode": "overwrite",
+        "unfence": false,
+        "bundle": false,
+        "review": true
+      }
+    }
+  ],
+  "edges": [
+    { "from": "n0", "to": "n2" },
+    { "from": "n1", "to": "n2" },
+    { "from": "n2", "to": "n3", "output": "heading" },
+    { "from": "n2", "to": "n4", "output": "body" }
+  ]
+}

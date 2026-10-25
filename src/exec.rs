@@ -156,6 +156,10 @@ impl Output {
 
 #[derive(Debug)]
 pub struct Report {
+    /// Prepared immutable child graphs, including unstarted calls, by relative path.
+    pub workflows: BTreeMap<String, GraphDoc>,
+    /// Published child ports, keyed by local Workflow node id then output name.
+    pub named_outputs: BTreeMap<String, BTreeMap<String, Output>>,
     /// Child runs with the exact graph snapshots used, keyed by local Workflow node id.
     pub calls: BTreeMap<String, history::WorkflowRun>,
     /// Resolved run-form values, including defaults, for replay and history.
@@ -174,8 +178,18 @@ pub struct Report {
 }
 
 impl Report {
+    /// Resolve a local node output or a published port produced by a Workflow node.
+    pub fn output_handle(&self, handle: &str) -> Option<&Output> {
+        match handle.split_once('.') {
+            Some((id, name)) => self.named_outputs.get(id)?.get(name),
+            None => self.outputs.get(handle),
+        }
+    }
+
     fn failure(error: String, elapsed: Duration) -> Self {
         Self {
+            workflows: BTreeMap::new(),
+            named_outputs: BTreeMap::new(),
             calls: BTreeMap::new(),
             inputs: workflow::Values::new(),
             log: Vec::new(),
@@ -191,6 +205,8 @@ impl Report {
 /// Something that happened during a run, delivered as it happens.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Progress {
+    /// A prepared immutable child snapshot, published before execution starts.
+    Workflow { id: String, graph: Arc<GraphDoc> },
     /// A log line; the same line ends up in the [`Report`].
     Log(String),
     /// A piece of text an agent streamed back. `id` is the node producing it.
@@ -571,6 +587,7 @@ pub fn run_all_with(
 ) -> Report {
     let started = Instant::now();
     let plans = calls::prepare(doc, targets, &dirs.root, &control.cancel);
+    publish_workflows(&plans, "", control);
     let mut report = run_prepared(
         doc,
         targets,
@@ -586,6 +603,38 @@ pub fn run_all_with(
     );
     report.elapsed = started.elapsed();
     report
+}
+
+fn publish_workflows(plans: &calls::Plans, namespace: &str, control: &Control) {
+    let Some(progress) = &control.progress else {
+        return;
+    };
+    for (id, prepared) in plans {
+        if control.cancelled() {
+            return;
+        }
+        let Ok(prepared) = prepared else { continue };
+        let id = format!("{namespace}{id}");
+        progress(Progress::Workflow {
+            id: id.clone(),
+            graph: prepared.graph.clone(),
+        });
+        publish_workflows(&prepared.calls, &format!("{id}/"), control);
+    }
+}
+
+fn workflow_snapshots(plans: &calls::Plans) -> BTreeMap<String, GraphDoc> {
+    let mut snapshots = BTreeMap::new();
+    let mut pending = vec![(String::new(), plans)];
+    while let Some((namespace, plans)) = pending.pop() {
+        for (id, prepared) in plans {
+            let Ok(prepared) = prepared else { continue };
+            let path = format!("{namespace}{id}");
+            snapshots.insert(path.clone(), prepared.graph.as_ref().clone());
+            pending.push((format!("{path}/"), &prepared.calls));
+        }
+    }
+    snapshots
 }
 
 struct Scope<'a> {
@@ -604,6 +653,7 @@ fn run_prepared(
     scope: Scope<'_>,
 ) -> Report {
     let start = Instant::now();
+    let workflows = workflow_snapshots(scope.plans);
     let resolved = if control.cancelled() {
         Err(CANCELLED.into())
     } else {
@@ -612,9 +662,14 @@ fn run_prepared(
     };
     let inputs = match resolved {
         Ok(inputs) => inputs,
-        Err(error) => return Report::failure(error, start.elapsed()),
+        Err(error) => {
+            let mut report = Report::failure(error, start.elapsed());
+            report.workflows = workflows;
+            return report;
+        }
     };
     let mut runner = Runner {
+        named_outputs: BTreeMap::new(),
         scope,
         calls: BTreeMap::new(),
         inputs,
@@ -660,6 +715,8 @@ fn run_prepared(
         runner.log(format!("run all: {finished} of {} finished", targets.len()));
     }
     Report {
+        workflows,
+        named_outputs: runner.named_outputs,
         calls: runner.calls,
         inputs: runner.inputs,
         log: runner.log,
@@ -676,6 +733,7 @@ fn run_prepared(
 }
 
 struct Runner<'a> {
+    named_outputs: BTreeMap<String, BTreeMap<String, Output>>,
     scope: Scope<'a>,
     calls: BTreeMap<String, history::WorkflowRun>,
     inputs: workflow::Values,
@@ -700,6 +758,7 @@ struct Runner<'a> {
 struct GraphIndex<'a> {
     nodes: HashMap<&'a str, &'a NodeDoc>,
     upstream: HashMap<&'a str, Vec<&'a str>>,
+    wires: HashMap<&'a str, Vec<&'a crate::doc::EdgeDoc>>,
 }
 
 impl<'a> GraphIndex<'a> {
@@ -709,14 +768,24 @@ impl<'a> GraphIndex<'a> {
             nodes.entry(node.id.as_str()).or_insert(node);
         }
         let mut upstream: HashMap<&str, Vec<&str>> = HashMap::new();
+        let mut wires: HashMap<&str, Vec<&crate::doc::EdgeDoc>> = HashMap::new();
         for edge in &doc.edges {
             upstream.entry(&edge.to).or_default().push(&edge.from);
+            wires.entry(&edge.to).or_default().push(edge);
         }
         for inputs in upstream.values_mut() {
             inputs.sort_unstable();
             inputs.dedup();
         }
-        Self { nodes, upstream }
+        for edges in wires.values_mut() {
+            edges.sort_by_key(|edge| edge.handle());
+            edges.dedup();
+        }
+        Self {
+            nodes,
+            upstream,
+            wires,
+        }
     }
 
     fn upstream(&self, id: &str) -> &[&'a str] {
@@ -813,6 +882,178 @@ pub(crate) fn preflight(doc: &GraphDoc, target: &str, cancel: &AtomicBool) -> Re
         .map_err(|(_, e)| e)
 }
 
+fn validate_wire(
+    edge: &crate::doc::EdgeDoc,
+    graph: &GraphIndex<'_>,
+    plans: &calls::Plans,
+) -> Result<(), String> {
+    let source = graph
+        .nodes
+        .get(edge.from.as_str())
+        .ok_or_else(|| format!("{} is not in the graph", edge.from))?;
+    let config = match source.data.as_ref() {
+        Some(NodeData::Workflow(config)) if config.output.is_empty() => config,
+        _ => {
+            return if edge.output.is_some() {
+                Err(format!(
+                    "{} has no named outputs; select a Workflow using published outputs",
+                    edge.from
+                ))
+            } else {
+                Ok(())
+            };
+        }
+    };
+    let prepared = plans
+        .get(&edge.from)
+        .ok_or_else(|| format!("{}: workflow was not prepared", edge.from))?
+        .as_ref()
+        .map_err(Clone::clone)?;
+    match edge.output.as_deref() {
+        Some(name) => {
+            validate::output_name(name).map_err(|error| format!("{}: {error}", edge.handle()))?;
+            if !prepared.graph.outputs.contains_key(name) {
+                return Err(format!(
+                    "{} does not publish {name}; choose {}",
+                    config.graph,
+                    prepared
+                        .graph
+                        .outputs
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+        None if prepared.graph.outputs.len() > 1 => {
+            return Err(format!(
+                "{} publishes multiple outputs; choose {}",
+                edge.from,
+                prepared
+                    .graph
+                    .outputs
+                    .keys()
+                    .map(|name| format!("{}.{name}", edge.from))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+/// Follow statically binary outputs without reading files or invoking providers.
+/// File chains are iterative; recursion only follows the bounded prepared call tree.
+fn known_binary(graph: &GraphIndex<'_>, plans: &calls::Plans, handle: &str) -> bool {
+    let mut handle = handle.to_string();
+    let mut seen = HashSet::new();
+    while seen.insert(handle.clone()) {
+        let (id, port) = handle
+            .split_once('.')
+            .map_or((handle.as_str(), None), |(id, port)| (id, Some(port)));
+        let Some(node) = graph.nodes.get(id) else {
+            return false;
+        };
+        match node.data.as_ref() {
+            Some(NodeData::Data(config)) => return !config.format.is_text(),
+            Some(NodeData::Agent(config)) => return config.output == OutputType::Image,
+            Some(NodeData::File(config)) if !config.bundle => {
+                let Some(edges) = graph.wires.get(id) else {
+                    return false;
+                };
+                if let [edge] = edges.as_slice() {
+                    handle = edge.handle();
+                } else {
+                    return false;
+                }
+            }
+            Some(NodeData::Workflow(config)) => {
+                let Some(Ok(prepared)) = plans.get(id) else {
+                    return false;
+                };
+                let target = if config.output.is_empty() {
+                    match port {
+                        Some(name) => prepared.graph.outputs.get(name),
+                        None if prepared.graph.outputs.len() == 1 => {
+                            prepared.graph.outputs.values().next()
+                        }
+                        None => None,
+                    }
+                } else {
+                    Some(&config.output)
+                };
+                return target.is_some_and(|target| {
+                    known_binary(&GraphIndex::new(&prepared.graph), &prepared.calls, target)
+                });
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn validate_binary_bindings(
+    id: &str,
+    graph: &GraphIndex<'_>,
+    plans: &calls::Plans,
+) -> Result<(), String> {
+    if let Some(NodeData::Workflow(config)) =
+        graph.nodes.get(id).and_then(|node| node.data.as_ref())
+    {
+        for (name, binding) in &config.inputs {
+            if let calls::Binding::Output { node } = binding
+                && known_binary(graph, plans, node)
+            {
+                return Err(format!(
+                    "{id}: {name}: {node} produces binary data; workflow inputs require text or a data/ file path"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn preflight_wires(
+    doc: &GraphDoc,
+    targets: &[String],
+    plans: &calls::Plans,
+) -> Result<(), String> {
+    let graph = GraphIndex::new(doc);
+    for target in targets {
+        graph
+            .order(target, |id| {
+                validate_binary_bindings(id, &graph, plans)?;
+                for edge in graph.wires.get(id).into_iter().flatten() {
+                    validate_wire(edge, &graph, plans)?;
+                }
+                Ok(false)
+            })
+            .map_err(|(_, error)| error)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn preflight_publications(doc: &GraphDoc, plans: &calls::Plans) -> Result<(), String> {
+    let graph = GraphIndex::new(doc);
+    for (name, handle) in &doc.outputs {
+        let (from, output) = handle
+            .split_once('.')
+            .map_or((handle.as_str(), None), |(id, port)| {
+                (id, Some(port.to_string()))
+            });
+        let edge = crate::doc::EdgeDoc {
+            from: from.into(),
+            to: String::new(),
+            output,
+        };
+        validate_wire(&edge, &graph, plans)
+            .map_err(|error| format!("published output {name}: {error}"))?;
+    }
+    Ok(())
+}
+
 impl Runner<'_> {
     fn log(&mut self, line: impl Into<String>) {
         let line = line.into();
@@ -845,15 +1086,6 @@ impl Runner<'_> {
             .get(id)
             .copied()
             .ok_or_else(|| format!("{id} is not in the graph"))
-    }
-
-    /// Ids of the nodes wired into `id`, in a stable order.
-    fn upstream(&self, id: &str) -> Vec<String> {
-        self.graph
-            .upstream(id)
-            .iter()
-            .map(|id| (*id).to_string())
-            .collect()
     }
 
     fn secret(&self, name: &str) -> Result<String, String> {
@@ -929,13 +1161,22 @@ impl Runner<'_> {
 
     /// A node's name as a placeholder may use it: set and valid, else none.
     fn input_name(&self, id: &str) -> Option<String> {
-        let name = self.node(id).ok()?.name.as_deref()?.trim();
-        validate::node_name(name).ok().map(|()| name.to_string())
+        let (base, port) = id
+            .split_once('.')
+            .map_or((id, None), |(base, port)| (base, Some(port)));
+        let name = self.node(base).ok()?.name.as_deref()?.trim();
+        validate::node_name(name)
+            .ok()
+            .map(|()| port.map_or_else(|| name.to_string(), |port| format!("{name}.{port}")))
     }
 
     fn validate_node(&self, id: &str) -> Result<(), String> {
         let node = self.node(id)?;
         validate_content(node)?;
+        validate_binary_bindings(id, &self.graph, self.scope.plans)?;
+        for edge in self.graph.wires.get(id).into_iter().flatten() {
+            validate_wire(edge, &self.graph, self.scope.plans)?;
+        }
         if matches!(node.data, Some(NodeData::Workflow(_))) {
             self.scope
                 .plans
@@ -950,14 +1191,39 @@ impl Runner<'_> {
     fn run_fresh(&mut self, id: &str) -> Result<Done, String> {
         let node = self.node(id)?.clone();
         let data = node.data.as_ref().ok_or_else(|| format!("{id} is blank"))?;
-        let upstream = self.upstream(id);
+        let upstream: Vec<String> = self
+            .graph
+            .wires
+            .get(id)
+            .into_iter()
+            .flatten()
+            .map(|edge| edge.handle())
+            .collect();
         let mut inputs = Vec::with_capacity(upstream.len());
         for from in &upstream {
-            let done = self
+            let (base, port) = from
+                .split_once('.')
+                .map_or((from.as_str(), None), |(base, port)| (base, Some(port)));
+            let mut done = self
                 .done
-                .get(from)
+                .get(base)
                 .cloned()
                 .ok_or_else(|| format!("{from} did not run"))?;
+            if let Some(port) = port {
+                let output = self
+                    .named_outputs
+                    .get(base)
+                    .and_then(|ports| ports.get(port))
+                    .ok_or_else(|| format!("{from} did not publish an output"))?;
+                done.key = key_of(&[
+                    b"workflow-port-v1",
+                    &done.key.to_le_bytes(),
+                    port.as_bytes(),
+                    &output.bytes,
+                    &[u8::from(output.text)],
+                ]);
+                done.output = Arc::new(output.clone());
+            }
             inputs.push((from.clone(), done));
         }
         self.log(format!(
@@ -1048,14 +1314,15 @@ impl Runner<'_> {
                 && !self.calls.contains_key(id)
                 && let Some(Ok(prepared)) = self.scope.plans.get(id)
             {
-                let report = Report::failure(error.clone(), start.elapsed());
+                let mut report = Report::failure(error.clone(), start.elapsed());
+                report.workflows = workflow_snapshots(&prepared.calls);
                 self.calls.insert(
                     id.to_string(),
                     history::WorkflowRun {
                         graph: prepared.graph.as_ref().clone(),
                         run: history::record(
                             &prepared.graph,
-                            std::slice::from_ref(&config.output),
+                            &prepared.targets,
                             &report,
                             self.control.cache.as_deref(),
                         ),
@@ -1216,6 +1483,10 @@ impl Runner<'_> {
                         id: format!("{prefix}/{id}"),
                         text,
                     },
+                    Progress::Workflow { id, graph } => Progress::Workflow {
+                        id: format!("{prefix}/{id}"),
+                        graph,
+                    },
                 })
             }));
         }
@@ -1228,10 +1499,10 @@ impl Runner<'_> {
                 }))
             }));
         }
-        let targets = [config.output.clone()];
+        let targets = &prepared.targets;
         let report = run_prepared(
             &prepared.graph,
-            &targets,
+            targets,
             self.dirs.clone(),
             self.http,
             self.env,
@@ -1242,7 +1513,7 @@ impl Runner<'_> {
                 key: Some(scope_key),
             },
         );
-        let run = history::record(&prepared.graph, &targets, &report, control.cache.as_deref());
+        let run = history::record(&prepared.graph, targets, &report, control.cache.as_deref());
         self.calls.insert(
             id.to_string(),
             history::WorkflowRun {
@@ -1250,16 +1521,42 @@ impl Runner<'_> {
                 run,
             },
         );
+        let mut ports = BTreeMap::new();
+        if config.output.is_empty() && report.result.is_ok() {
+            for (name, target) in &prepared.graph.outputs {
+                let value = report
+                    .output_handle(target)
+                    .ok_or_else(|| format!("published output {name}: {target} did not run"))?;
+                ports.insert(name.clone(), value.clone());
+            }
+        }
         self.log
             .extend(report.log.into_iter().map(|line| format!("{id}/{line}")));
         self.check_cancel()?;
-        let output = report.result.map_err(|e| {
+        let mut output = report.result.map_err(|e| {
             if e == CANCELLED {
                 e
             } else {
                 format!("{id} ({}): {e}", config.graph)
             }
         })?;
+        if config.output.is_empty() {
+            output = if ports.len() == 1 {
+                ports
+                    .values()
+                    .next()
+                    .cloned()
+                    .ok_or("workflow has no outputs")?
+            } else {
+                let manifest = ports
+                    .iter()
+                    .map(|(name, value)| format!("{name}: {}", value.label))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Output::new(manifest.into_bytes(), true, "Workflow outputs")
+            };
+            self.named_outputs.insert(id.to_string(), ports);
+        }
         Ok(Done {
             key: key_of(&[
                 b"workflow-output-v1",
@@ -2903,6 +3200,7 @@ mod tests {
 
     fn graph(nodes: Vec<NodeDoc>, edges: &[(&str, &str)]) -> GraphDoc {
         GraphDoc {
+            outputs: BTreeMap::new(),
             version: 1,
             name: "t".into(),
             view: View::default(),
@@ -2910,6 +3208,7 @@ mod tests {
             edges: edges
                 .iter()
                 .map(|(from, to)| EdgeDoc {
+                    output: None,
                     from: from.to_string(),
                     to: to.to_string(),
                 })
@@ -4692,6 +4991,7 @@ mod tests {
                 .push(node(&format!("n{i}"), data("a.txt", DataFormat::Text)));
             if i > 0 {
                 doc.edges.push(EdgeDoc {
+                    output: None,
                     from: format!("n{}", i - 1),
                     to: format!("n{i}"),
                 });
@@ -6382,6 +6682,7 @@ mod tests {
             })),
         ));
         doc.edges.push(EdgeDoc {
+            output: None,
             from: "n1".into(),
             to: "n2".into(),
         });

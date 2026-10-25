@@ -45,7 +45,15 @@ impl Config {
         if self.graph.is_empty() {
             "choose a saved graph".into()
         } else {
-            format!("{} → {}", self.graph, self.output)
+            format!(
+                "{} → {}",
+                self.graph,
+                if self.output.is_empty() {
+                    "published outputs"
+                } else {
+                    &self.output
+                }
+            )
         }
     }
 
@@ -54,7 +62,7 @@ impl Config {
         if self.graph.is_empty() || validate::file_stem(&self.graph) != self.graph {
             issues.push(Issue::new("workflow", "choose a saved graph name"));
         }
-        if !validate::is_node_id(&self.output) {
+        if !self.output.is_empty() && !validate::is_node_id(&self.output) {
             issues.push(Issue::new("output", "choose an output node"));
         }
         if self.inputs.len() > workflow::MAX_FIELDS {
@@ -75,7 +83,7 @@ impl Config {
                         issues.push(Issue::new("inputs", format!("{name}: {error}")));
                     }
                 }
-                Binding::Output { node } if !validate::is_node_id(node) => {
+                Binding::Output { node } if !validate::is_output_handle(node) => {
                     issues.push(Issue::new("inputs", format!("{name}: select a wired node")));
                 }
                 Binding::Output { .. } => {}
@@ -134,6 +142,7 @@ pub type Plans = BTreeMap<String, Result<Arc<Prepared>, String>>;
 #[derive(Debug)]
 pub struct Prepared {
     pub graph: Arc<GraphDoc>,
+    pub targets: Vec<String>,
     pub fields: Vec<Field>,
     pub calls: Plans,
     pub key: Key,
@@ -165,8 +174,13 @@ impl Loader<'_> {
     fn calls(&mut self, doc: &GraphDoc, targets: &[String], stack: &mut Vec<String>) -> Plans {
         let nodes: HashMap<_, _> = doc.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
         let mut incoming: HashMap<&str, Vec<&str>> = HashMap::new();
+        let mut incoming_handles: HashMap<&str, Vec<String>> = HashMap::new();
         for edge in &doc.edges {
             incoming.entry(&edge.to).or_default().push(&edge.from);
+            incoming_handles
+                .entry(&edge.to)
+                .or_default()
+                .push(edge.handle());
         }
         let mut pending: Vec<&str> = targets.iter().map(String::as_str).collect();
         let mut seen = HashSet::new();
@@ -175,12 +189,18 @@ impl Loader<'_> {
             if !seen.insert(id) {
                 continue;
             }
-            let upstream = incoming.get(id).map(Vec::as_slice).unwrap_or_default();
-            pending.extend(upstream);
+            let upstream_nodes = incoming.get(id).map(Vec::as_slice).unwrap_or_default();
+            pending.extend(upstream_nodes);
+            let upstream: Vec<&str> = incoming_handles
+                .get(id)
+                .into_iter()
+                .flatten()
+                .map(String::as_str)
+                .collect();
             if let Some(NodeData::Workflow(config)) = nodes.get(id).and_then(|n| n.data.as_ref()) {
                 calls.insert(
                     id.to_string(),
-                    self.call(config, upstream, stack).map(Arc::new),
+                    self.call(config, &upstream, stack).map(Arc::new),
                 );
             }
             if self.cancel.load(Ordering::Relaxed) {
@@ -235,8 +255,48 @@ impl Loader<'_> {
             return Err("workflow snapshots exceed the 4 MB combined limit".into());
         }
         // This uses the same dependency planner as execution, without performing steps.
-        exec::preflight(&graph, &config.output, self.cancel)?;
-        let targets = [config.output.clone()];
+        let targets = if config.output.is_empty() {
+            if graph.outputs.is_empty() {
+                return Err("this graph has no published outputs; publish outputs or choose a legacy output node".into());
+            }
+            let mut targets: Vec<_> = graph
+                .outputs
+                .values()
+                .map(|handle| {
+                    handle
+                        .split_once('.')
+                        .map_or(handle.as_str(), |(id, _)| id)
+                        .to_string()
+                })
+                .collect();
+            targets.sort();
+            targets.dedup();
+            targets
+        } else {
+            vec![config.output.clone()]
+        };
+        if config.output.is_empty() {
+            for (name, target) in &graph.outputs {
+                validate::output_name(name).map_err(|e| format!("published output {name}: {e}"))?;
+                if !validate::is_output_handle(target) {
+                    return Err(format!(
+                        "published output {name}: choose a node id or named output handle"
+                    ));
+                }
+                let base = target.split_once('.').map_or(target.as_str(), |(id, _)| id);
+                if !graph.nodes.iter().any(|node| node.id == base) {
+                    return Err(format!(
+                        "published output {name}: {target} is not in the graph"
+                    ));
+                }
+            }
+            if graph.outputs.len() > workflow::MAX_FIELDS {
+                return Err("a graph can publish at most 64 outputs".into());
+            }
+        }
+        for target in &targets {
+            exec::preflight(&graph, target, self.cancel)?;
+        }
         let fields = workflow::fields(&graph, &targets)?;
         config.validate_bindings(&fields, upstream, &self.root.join(crate::library::DATA_DIR))?;
         stack.push(config.graph.clone());
@@ -247,10 +307,15 @@ impl Loader<'_> {
             let child = prepared.as_ref().map_err(|e| format!("{id}: {e}"))?;
             keys.push((id, child.key));
         }
+        exec::preflight_wires(&graph, &targets, &calls)?;
+        if config.output.is_empty() {
+            exec::preflight_publications(&graph, &calls)?;
+        }
         let nested = serde_json::to_vec(&keys).map_err(|e| e.to_string())?;
         let key = exec::key_of(&[b"workflow-snapshot-v1", &bytes, &nested]);
         Ok(Prepared {
             graph,
+            targets,
             fields,
             calls,
             key,

@@ -16,8 +16,8 @@
 //! middle of a graph shows what it produced (or why it failed) in the last run that
 //! included it, with a note when the node has been edited since.
 //!
-//! Every finished run is also written to the run history ([`history`]), listed at the
-//! bottom of the panel. Opening one brings its outputs, dots and log back without running
+//! Every finished run is also written to the run history ([`history`]), listed in the
+//! History tab. Opening one brings its outputs, dots and log back without running
 //! anything, and the selected node's previous output is shown under its current one. Run
 //! all starts every end node of the graph in one pass.
 //!
@@ -58,17 +58,20 @@ use crate::{
 };
 
 /// Initial inspector width; the divider next to it resizes it.
-pub const INSPECTOR_W: f32 = 320.0;
+pub const INSPECTOR_W: f32 = 370.0;
 /// How often the panel pulls progress from a running job.
 const PROGRESS_POLL: Duration = Duration::from_millis(80);
 /// Characters of a text preview, streamed or final.
 const PREVIEW_CHARS: usize = history::PREVIEW_CHARS;
 /// Past runs listed in the panel; the rest stay on disk.
 const RUNS_SHOWN: usize = 12;
+const PUBLISHED_OUTPUTS: &str = "Published outputs";
+const NODE_RESULT: &str = "Node result";
 
 /// What the executor's thread writes and the panel reads while a run is going.
 #[derive(Default)]
 struct Live {
+    workflows: HashMap<String, Arc<GraphDoc>>,
     review: Option<review::Pending>,
     log: Vec<String>,
     /// The node whose text is streaming in, and the text so far.
@@ -82,6 +85,9 @@ struct Live {
 impl Live {
     fn take_in(&mut self, progress: Progress) {
         match progress {
+            Progress::Workflow { id, graph } => {
+                self.workflows.insert(id, graph);
+            }
             Progress::Log(line) => self.log.push(line),
             Progress::Text { id, text } => match &mut self.stream {
                 Some((current, so_far)) if *current == id => so_far.push_str(&text),
@@ -104,6 +110,7 @@ struct Job {
 
 /// What a node produced the last time a run included it.
 struct NodeResult {
+    named_outputs: BTreeMap<String, exec::Output>,
     result: Result<exec::Output, String>,
     /// The node's content when it ran, to tell whether it has changed since.
     data: Option<NodeData>,
@@ -114,6 +121,12 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 pub enum InspectorEvent {
+    OpenWorkflow {
+        node: NodeId,
+        graph: GraphDoc,
+        run: Option<Box<history::Run>>,
+    },
+    ExecutionChanged,
     /// A preset or prompt was written or removed; the sidebar should re-list.
     LibraryChanged,
     Status {
@@ -147,7 +160,34 @@ struct CallField {
     value: Entity<TextareaState>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InspectorTab {
+    Configure,
+    Results,
+    History,
+}
+
+pub struct ChildExecution {
+    pub graph: GraphDoc,
+    pub workflows: BTreeMap<String, GraphDoc>,
+    pub running: bool,
+    pub run: Option<history::Run>,
+    pub marks: HashMap<NodeId, Mark>,
+    pub log: Vec<String>,
+    pub stream: Option<(String, String)>,
+}
+
 pub struct Inspector {
+    tab: InspectorTab,
+    preview: bool,
+    preview_live: bool,
+    preview_snapshot: bool,
+    preview_run: Option<history::Run>,
+    published: Entity<InputState>,
+    publish_source: Entity<StrSelect>,
+    publish_issue: Option<String>,
+    show_advanced: bool,
+    show_log: bool,
     workflow_graph: Entity<StrSelect>,
     workflow_output: Entity<StrSelect>,
     workflow_fields: Vec<CallField>,
@@ -365,6 +405,15 @@ impl Inspector {
         };
 
         let node_name = text("name, for {{name}} in agent prompts", window, cx);
+        let published = text("summary, details", window, cx);
+        let publish_source = cx.new(|cx| {
+            SelectState::new(
+                vec![SharedString::from(NODE_RESULT)],
+                Some(IndexPath::new(0)),
+                window,
+                cx,
+            )
+        });
         let preset_name = text("preset name", window, cx);
         let input_kind = enum_select(&InputType::ALL, InputType::label, window, cx);
         let input_default = area("Optional default for the Run form", 3, window, cx);
@@ -424,6 +473,8 @@ impl Inspector {
                     match event {
                         GraphEvent::SelectionChanged => this.reload(window, cx),
                         GraphEvent::Replaced => this.forget_results(cx),
+                        GraphEvent::OpenWorkflow(id) => this.open_workflow(*id, cx),
+                        GraphEvent::Changed => cx.notify(),
                     }
                 }),
             ];
@@ -470,6 +521,24 @@ impl Inspector {
             ));
         }
         // The name is not part of the node's content: it goes to the graph directly.
+        subscriptions.push(cx.subscribe_in(
+            &publish_source,
+            window,
+            |this, _, _: &SelectEvent<Vec<SharedString>>, window, cx| {
+                if !this.loading {
+                    this.load_published_names(window, cx);
+                }
+            },
+        ));
+        subscriptions.push(cx.subscribe_in(
+            &published,
+            window,
+            |this, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.publish_outputs(cx);
+                }
+            },
+        ));
         subscriptions.push(cx.subscribe_in(
             &node_name,
             window,
@@ -555,6 +624,16 @@ impl Inspector {
         ));
 
         let mut inspector = Self {
+            tab: InspectorTab::Configure,
+            preview: false,
+            preview_live: false,
+            preview_snapshot: false,
+            preview_run: None,
+            published,
+            publish_source,
+            publish_issue: None,
+            show_advanced: false,
+            show_log: false,
             workflow_graph,
             workflow_output,
             workflow_fields: Vec::new(),
@@ -643,6 +722,8 @@ impl Inspector {
 
     /// A different graph is loaded: node ids mean other nodes now.
     fn forget_results(&mut self, cx: &mut Context<Self>) {
+        self.preview_run = None;
+        self.preview_live = false;
         self.child_states.clear();
         if let Some(job) = self.job.take() {
             job.cancel.store(true, Ordering::Relaxed);
@@ -679,6 +760,244 @@ impl Inspector {
 
     pub fn running(&self) -> bool {
         self.job.is_some() || self.run_form.is_some()
+    }
+
+    pub fn needs_review(&self) -> bool {
+        self.pending_review.is_some()
+    }
+
+    pub fn set_preview(&mut self, run: Option<history::Run>, cx: &mut Context<Self>) {
+        self.preview = true;
+        self.preview_live = false;
+        self.preview_snapshot = run.is_some();
+        self.graph
+            .update(cx, |graph, cx| graph.set_read_only(true, cx));
+        self.results.clear();
+        self.marks.clear();
+        if let Some(run) = &run {
+            let report = run.report(Some(&self.cache));
+            self.remember(
+                &|id| run.nodes.get(id).and_then(|n| n.data.clone()),
+                &report,
+                cx,
+            );
+            self.report = Some((
+                run.targets.iter().filter_map(|id| node_id(id)).collect(),
+                report,
+            ));
+            self.tab = InspectorTab::Results;
+        } else {
+            self.report = None;
+            self.tab = InspectorTab::Configure;
+        }
+        self.preview_run = run;
+        cx.notify();
+    }
+
+    pub fn set_live_preview(&mut self, execution: ChildExecution, cx: &mut Context<Self>) {
+        self.graph.update(cx, |graph, cx| {
+            graph.set_workflow_snapshots(&execution.workflows, cx)
+        });
+        if let Some(run) = execution.run {
+            if self.preview_run.as_ref().map(|r| &r.id) != Some(&run.id) {
+                self.set_preview(Some(run), cx);
+            }
+            return;
+        }
+        self.preview = true;
+        if !self.preview_snapshot {
+            self.tab = InspectorTab::Results;
+        }
+        self.preview_snapshot = true;
+        self.preview_live = execution.running;
+        self.live_log = execution.log;
+        self.live_stream = execution.stream;
+        self.graph
+            .update(cx, |graph, cx| graph.set_marks(execution.marks, cx));
+        cx.notify();
+    }
+
+    pub fn child_execution(&self, path: &str) -> Option<ChildExecution> {
+        if let Some(job) = &self.job {
+            let live = lock(&job.live);
+            let graph = live.workflows.get(path)?.as_ref().clone();
+            let prefix = format!("{path}/");
+            let marks = live
+                .states
+                .iter()
+                .filter_map(|(id, state)| {
+                    let id = node_id(id.strip_prefix(&prefix)?)?;
+                    Some((
+                        id,
+                        match state {
+                            NodeState::Running => Mark::Running,
+                            NodeState::Done => Mark::Ran,
+                            NodeState::Reused => Mark::Reused,
+                            NodeState::Failed => Mark::Failed,
+                        },
+                    ))
+                })
+                .collect();
+            return Some(ChildExecution {
+                graph,
+                running: true,
+                workflows: live
+                    .workflows
+                    .iter()
+                    .filter_map(|(id, graph)| {
+                        let id = id.strip_prefix(&prefix)?;
+                        (!id.contains('/')).then(|| (id.to_string(), graph.as_ref().clone()))
+                    })
+                    .collect(),
+                run: None,
+                marks,
+                log: live
+                    .log
+                    .iter()
+                    .filter_map(|line| line.strip_prefix(&prefix).map(str::to_string))
+                    .collect(),
+                stream: live.stream.as_ref().and_then(|(id, text)| {
+                    Some((id.strip_prefix(&prefix)?.to_string(), text.clone()))
+                }),
+            });
+        }
+        let (_, report) = self.report.as_ref()?;
+        let mut calls = &report.calls;
+        let mut found = None;
+        for id in path.split('/') {
+            found = calls.get(id);
+            let Some(call) = found else { break };
+            calls = &call.run.calls;
+        }
+        let graph = report
+            .workflows
+            .get(path)
+            .cloned()
+            .or_else(|| found.map(|call| call.graph.clone()))?;
+        let prefix = format!("{path}/");
+        let mut workflows: BTreeMap<_, _> = report
+            .workflows
+            .iter()
+            .filter_map(|(id, graph)| {
+                let id = id.strip_prefix(&prefix)?;
+                (!id.contains('/')).then(|| (id.to_string(), graph.clone()))
+            })
+            .collect();
+        if let Some(call) = found {
+            workflows.extend(
+                call.run
+                    .calls
+                    .iter()
+                    .map(|(id, call)| (id.clone(), call.graph.clone())),
+            );
+        }
+        Some(ChildExecution {
+            graph,
+            workflows,
+            running: false,
+            run: found.map(|call| call.run.clone()),
+            marks: HashMap::new(),
+            log: found.map(|call| call.run.log.clone()).unwrap_or_default(),
+            stream: None,
+        })
+    }
+
+    pub fn open_workflow(&mut self, id: NodeId, cx: &mut Context<Self>) {
+        let key = format!("n{id}");
+        if let Some(execution) = self.child_execution(&key) {
+            cx.emit(InspectorEvent::OpenWorkflow {
+                node: id,
+                graph: execution.graph,
+                run: execution.run.map(Box::new),
+            });
+            return;
+        }
+        if self.job.is_some() {
+            self.status("This child has not started yet. Its run snapshot will be available when it starts.".into(), false, cx);
+            return;
+        }
+        if self.preview_snapshot {
+            // The workspace resolves this path from the root run's fixed snapshots.
+            cx.emit(InspectorEvent::OpenWorkflow {
+                node: id,
+                graph: GraphDoc::default(),
+                run: None,
+            });
+            return;
+        }
+        if self.shown_run.is_some() {
+            self.status(
+                "No child snapshot was recorded for this node in the displayed run.".into(),
+                false,
+                cx,
+            );
+            return;
+        }
+        let Some(NodeData::Workflow(config)) = self.graph.read(cx).node_data(id) else {
+            return;
+        };
+        match crate::doc::load_under(Path::new("."), &config.graph) {
+            Ok(graph) => cx.emit(InspectorEvent::OpenWorkflow {
+                node: id,
+                graph,
+                run: None,
+            }),
+            Err(error) => self.status(error, true, cx),
+        }
+    }
+
+    fn publish_outputs(&mut self, cx: &mut Context<Self>) {
+        if self.loading || self.preview {
+            return;
+        }
+        let Some(id) = self.node else {
+            return;
+        };
+        let names: Vec<String> = self
+            .published
+            .read(cx)
+            .value()
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        let port = self
+            .publish_source
+            .read(cx)
+            .selected_value()
+            .filter(|name| name.as_ref() != NODE_RESULT)
+            .map(ToString::to_string);
+        self.publish_issue = self
+            .graph
+            .update(cx, |graph, cx| match port.as_deref() {
+                Some(port) => graph.publish_output_port(id, Some(port), &names, cx),
+                None => graph.publish_outputs(id, &names, cx),
+            })
+            .err();
+        cx.notify();
+    }
+
+    fn load_published_names(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.node else {
+            return;
+        };
+        let port = self
+            .publish_source
+            .read(cx)
+            .selected_value()
+            .filter(|name| name.as_ref() != NODE_RESULT)
+            .map(ToString::to_string);
+        let names = self
+            .graph
+            .read(cx)
+            .published_port_names(id, port.as_deref());
+        let loading = self.loading;
+        self.loading = true;
+        set_text(&self.published, names.join(", "), window, cx);
+        self.publish_issue = None;
+        self.loading = loading;
+        cx.notify();
     }
 
     fn push_marks(&self, cx: &mut Context<Self>) {
@@ -730,6 +1049,31 @@ impl Inspector {
             }
             Some((id, preset, name, data)) => {
                 self.node = Some(id);
+                let ports = self.graph.read(cx).output_ports(id);
+                let mut sources = if ports.is_empty() {
+                    vec![NODE_RESULT.to_string()]
+                } else {
+                    ports
+                };
+                let doc = self.graph.read(cx).snapshot(&self.graph_name);
+                if doc
+                    .outputs
+                    .values()
+                    .any(|target| target == &format!("n{id}"))
+                    && !sources.iter().any(|source| source == NODE_RESULT)
+                {
+                    sources.push(NODE_RESULT.to_string());
+                }
+                let prefix = format!("n{id}.");
+                for target in doc.outputs.values() {
+                    if let Some(port) = target.strip_prefix(&prefix)
+                        && !sources.iter().any(|source| source == port)
+                    {
+                        sources.push(port.to_string());
+                    }
+                }
+                set_picker(&self.publish_source, sources, Some(0), window, cx);
+                self.load_published_names(window, cx);
                 set_text(&self.node_name, name.unwrap_or_default(), window, cx);
                 set_text(
                     &self.preset_name,
@@ -821,7 +1165,7 @@ impl Inspector {
 
     /// Write the form into the selected node and re-validate.
     fn sync(&mut self, cx: &mut Context<Self>) {
-        if self.loading {
+        if self.loading || self.preview {
             return;
         }
         let (Some(id), Some(kind)) = (self.node, self.kind) else {
@@ -879,7 +1223,13 @@ impl Inspector {
                         .workflow_output
                         .read(cx)
                         .selected_value()
-                        .map(|s| s.split(" · ").next().unwrap_or_default().to_string())
+                        .map(|s| {
+                            if s.starts_with(PUBLISHED_OUTPUTS) {
+                                String::new()
+                            } else {
+                                s.split(" · ").next().unwrap_or_default().to_string()
+                            }
+                        })
                         .unwrap_or_default(),
                     inputs,
                 })
@@ -1061,32 +1411,52 @@ impl Inspector {
         );
         let loaded = crate::doc::load_under(Path::new("."), &config.graph);
         let result = loaded.and_then(|doc| {
-            let mut outputs: Vec<_> = doc
-                .nodes
-                .iter()
-                .filter(|n| n.data.is_some())
-                .map(|n| {
-                    format!(
-                        "{} · {}",
-                        n.id,
-                        n.name.as_deref().unwrap_or_else(|| n
-                            .data
-                            .as_ref()
-                            .map(NodeData::label)
-                            .unwrap_or("node"))
-                    )
-                })
-                .collect();
-            let mut selected = doc
-                .nodes
-                .iter()
-                .filter(|n| n.data.is_some())
-                .position(|n| n.id == config.output);
+            let mut outputs = vec![format!("{PUBLISHED_OUTPUTS} · {}", doc.outputs.len())];
+            outputs.extend(
+                doc.nodes
+                    .iter()
+                    .filter(|n| n.data.is_some())
+                    .map(|n| {
+                        format!(
+                            "{} · {}",
+                            n.id,
+                            n.name.as_deref().unwrap_or_else(|| n
+                                .data
+                                .as_ref()
+                                .map(NodeData::label)
+                                .unwrap_or("node"))
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let mut selected = if config.output.is_empty() {
+                Some(0)
+            } else {
+                doc.nodes
+                    .iter()
+                    .filter(|n| n.data.is_some())
+                    .position(|n| n.id == config.output)
+                    .map(|i| i + 1)
+            };
             if selected.is_none() && !config.output.is_empty() {
                 selected = Some(outputs.len());
                 outputs.push(format!("{} · missing node", config.output));
             }
             set_picker(&self.workflow_output, outputs, selected, window, cx);
+            if config.output.is_empty() {
+                if doc.outputs.is_empty() {
+                    return Err(
+                        "Publish named outputs in the child graph, or select one node to return."
+                            .into(),
+                    );
+                }
+                let targets = doc
+                    .outputs
+                    .values()
+                    .map(|handle| handle.split('.').next().unwrap_or(handle).to_string())
+                    .collect::<Vec<_>>();
+                return workflow::fields(&doc, &targets);
+            }
             let node = doc
                 .nodes
                 .iter()
@@ -1106,10 +1476,13 @@ impl Inspector {
             }
             Ok(fields) => {
                 let graph = self.graph.read(cx);
-                let upstream = self.node.map(|id| graph.inputs(id)).unwrap_or_default();
+                let upstream = self
+                    .node
+                    .map(|id| graph.input_handles(id))
+                    .unwrap_or_default();
                 let wire_labels: Vec<_> = upstream
                     .iter()
-                    .map(|id| format!("n{id} · {}", graph.node_name(*id).unwrap_or("wired output")))
+                    .map(|handle| format!("{handle} · {}", graph.input_label(handle)))
                     .collect();
                 for field in fields {
                     let binding = config.inputs.get(&field.name);
@@ -1174,7 +1547,7 @@ impl Inspector {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.loading || self.kind != Some(NodeType::Workflow) {
+        if self.loading || self.preview || self.kind != Some(NodeType::Workflow) {
             return;
         }
         let Some(id) = self.node else {
@@ -1198,14 +1571,26 @@ impl Inspector {
             config.inputs.clear();
             config.output = crate::doc::load_under(Path::new("."), &config.graph)
                 .ok()
-                .and_then(|doc| exec::sinks(&doc).into_iter().next())
+                .and_then(|doc| {
+                    if doc.outputs.is_empty() {
+                        exec::sinks(&doc).into_iter().next()
+                    } else {
+                        Some(String::new())
+                    }
+                })
                 .unwrap_or_default();
         } else {
             let output = self
                 .workflow_output
                 .read(cx)
                 .selected_value()
-                .map(|s| s.split(" · ").next().unwrap_or_default().to_string())
+                .map(|s| {
+                    if s.starts_with(PUBLISHED_OUTPUTS) {
+                        String::new()
+                    } else {
+                        s.split(" · ").next().unwrap_or_default().to_string()
+                    }
+                })
                 .unwrap_or_default();
             if config.output == output {
                 return;
@@ -1215,7 +1600,7 @@ impl Inspector {
         self.graph.update(cx, |graph, cx| {
             graph.set_node_data(id, Some(NodeData::Workflow(config.clone())), cx)
         });
-        self.fill_workflow(&config, window, cx);
+        self.reload(window, cx);
         self.sync(cx);
     }
 
@@ -1229,19 +1614,27 @@ impl Inspector {
             )
             .child(
                 field()
-                    .label("Return output")
-                    .description("Runs this node and its dependencies in the saved graph.")
+                    .label("Outputs")
+                    .description("Published outputs create labeled ports. A selected node keeps a single output.")
                     .child(Select::new(&self.workflow_output).small()),
             )
             .child(
                 field().child(
+                    h_flex().gap_2().flex_wrap()
+                    .child(Button::new("inspect-workflow").outline().small().label("Open child graph")
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| { if let Some(id) = this.node { this.open_workflow(id, cx); } })))
+                    .child(
                     Button::new("refresh-workflows")
-                        .outline()
+                        .ghost()
                         .small()
-                        .label("Refresh workflows and wires")
+                        .label("Refresh")
                         .on_click(
-                            cx.listener(|this, _: &ClickEvent, window, cx| this.reload(window, cx)),
+                            cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.graph.update(cx, |graph, cx| graph.refresh_workflow_ports(cx));
+                                this.reload(window, cx);
+                            }),
                         ),
+                    )
                 ),
             )
             .children(self.workflow_fields.iter().map(|item| {
@@ -1369,7 +1762,7 @@ impl Inspector {
     /// The name lives on the node itself, not in its content, so it is written to the
     /// graph as typed; what is wrong with it shows under the form.
     fn on_name_change(&mut self, cx: &mut Context<Self>) {
-        if self.loading {
+        if self.loading || self.preview {
             return;
         }
         let Some(id) = self.node else { return };
@@ -1394,7 +1787,7 @@ impl Inspector {
                     .iter()
                     .map(|f| f.field.clone())
                     .collect();
-                let upstream: Vec<_> = graph.inputs(id).iter().map(|n| format!("n{n}")).collect();
+                let upstream = graph.input_handles(id);
                 let upstream: Vec<_> = upstream.iter().map(String::as_str).collect();
                 if let Err(error) =
                     config.validate_bindings(&fields, &upstream, &exec::Dirs::from_cwd().data)
@@ -1432,14 +1825,12 @@ impl Inspector {
             }
         }
         if let Some(NodeData::Agent(agent)) = data {
-            let inputs = graph.inputs(id);
+            let inputs = graph.input_handles(id);
             let mut handles: Vec<String> = Vec::new();
             for input in &inputs {
-                handles.push(format!("n{input}"));
-                if let Some(name) = graph.node_name(*input)
-                    && validate::node_name(name).is_ok()
-                {
-                    handles.push(name.to_string());
+                handles.push(input.clone());
+                if let Some(alias) = graph.input_alias(input) {
+                    handles.push(alias);
                 }
             }
             for (field, template) in [("prompt", &agent.prompt), ("message", &agent.message)] {
@@ -1566,6 +1957,9 @@ impl Inspector {
 
     /// Give a blank node content, or replace a typed node's content.
     fn set_content(&mut self, data: NodeData, window: &mut Window, cx: &mut Context<Self>) {
+        if self.preview {
+            return;
+        }
         let Some(id) = self.node else { return };
         self.graph.update(cx, |graph, cx| {
             graph.set_node_data(id, Some(data), cx);
@@ -1575,6 +1969,9 @@ impl Inspector {
     }
 
     fn clear_content(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.preview {
+            return;
+        }
         let Some(id) = self.node else { return };
         self.graph.update(cx, |graph, cx| {
             graph.set_node_data(id, None, cx);
@@ -1585,6 +1982,9 @@ impl Inspector {
 
     /// Save the node's content under the preset name, so it appears in the sidebar.
     fn save_preset(&mut self, cx: &mut Context<Self>) {
+        if self.preview {
+            return;
+        }
         let Some(id) = self.node else { return };
         let Some(data) = self.graph.read(cx).node_data(id).cloned() else {
             return;
@@ -1642,7 +2042,7 @@ impl Inspector {
     }
 
     fn save_prompt(&mut self, cx: &mut Context<Self>) {
-        if self.kind != Some(NodeType::Agent) {
+        if self.preview || self.kind != Some(NodeType::Agent) {
             return;
         }
         let raw = text_of(&self.prompt_name, cx);
@@ -1666,6 +2066,9 @@ impl Inspector {
 
     /// Load a saved prompt into the selected agent node.
     pub fn apply_prompt(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.preview {
+            return;
+        }
         if self.node.is_none() || self.kind != Some(NodeType::Agent) {
             self.status(
                 "Select an agent node to load a prompt into".into(),
@@ -1694,6 +2097,9 @@ impl Inspector {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.preview {
+            return false;
+        }
         if self.node.is_none() || self.kind != Some(ty) {
             return false;
         }
@@ -1729,6 +2135,9 @@ impl Inspector {
 
     /// Run every end node of the graph, which runs the whole graph in one pass.
     pub fn run_all(&mut self, fresh: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.preview {
+            return;
+        }
         let doc = self.graph.read(cx).snapshot(&self.graph_name);
         let targets: Vec<NodeId> = exec::sinks(&doc)
             .iter()
@@ -1748,7 +2157,7 @@ impl Inspector {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.running() {
+        if self.preview || self.running() {
             return;
         }
         let doc = self.graph.read(cx).snapshot(&self.graph_name);
@@ -1885,6 +2294,10 @@ impl Inspector {
         inputs: workflow::Values,
         cx: &mut Context<Self>,
     ) {
+        if self.preview {
+            return;
+        }
+        self.tab = InspectorTab::Results;
         if self
             .job
             .as_ref()
@@ -2024,6 +2437,7 @@ impl Inspector {
         }
         cx.notify();
         let Some((report, run)) = report else {
+            cx.emit(InspectorEvent::ExecutionChanged);
             return false;
         };
         let Some(job) = self.job.take() else {
@@ -2048,7 +2462,7 @@ impl Inspector {
             n => format!(" ({n} nodes from the cache)"),
         };
         let (text, error) = match &report.result {
-            Ok(output) if all => {
+            Ok(_) if all => {
                 let ran = report.outputs.len().saturating_sub(report.reused.len());
                 (
                     format!(
@@ -2087,6 +2501,7 @@ impl Inspector {
         self.history.insert(0, run);
         self.history.truncate(history::MAX_RUNS);
         self.status(text, error, cx);
+        cx.emit(InspectorEvent::ExecutionChanged);
         cx.notify();
         true
     }
@@ -2106,6 +2521,7 @@ impl Inspector {
                 self.results.insert(
                     node,
                     NodeResult {
+                        named_outputs: report.named_outputs.get(id).cloned().unwrap_or_default(),
                         result: Ok(output.clone()),
                         data: data_of(id),
                     },
@@ -2124,6 +2540,7 @@ impl Inspector {
             self.results.insert(
                 node,
                 NodeResult {
+                    named_outputs: BTreeMap::new(),
                     result: Err(e.clone()),
                     data: data_of(id),
                 },
@@ -2827,15 +3244,12 @@ impl Inspector {
         let graph = self.graph.read(cx);
         let in_prompt = validate::placeholders(&agent.prompt);
         let in_message = validate::placeholders(&agent.message);
-        let inputs = graph.inputs(id);
+        let inputs = graph.input_handles(id);
         let rows: Vec<AnyElement> = inputs
             .iter()
             .map(|input| {
-                let key = format!("n{input}");
-                let name = graph
-                    .node_name(*input)
-                    .filter(|n| validate::node_name(n).is_ok())
-                    .map(str::to_string);
+                let key = input.clone();
+                let name = graph.input_alias(input);
                 let refers = |holes: &[String]| {
                     holes
                         .iter()
@@ -2849,12 +3263,21 @@ impl Inspector {
                 };
                 let (handle, detail) = match &name {
                     Some(n) => (format!("{{{{{n}}}}}"), format!("{key} · {placement}")),
-                    None => (key.clone(), placement.to_string()),
+                    None => (format!("{{{{{key}}}}}"), placement.to_string()),
                 };
-                let (last, color) = match self.results.get(input).map(|r| &r.result) {
-                    Some(Ok(output)) => (output.label.clone(), muted),
-                    Some(Err(_)) => ("failed last time".to_string(), danger),
-                    None => ("not run yet".to_string(), muted),
+                let (base, port) = input
+                    .split_once('.')
+                    .map_or((input.as_str(), None), |(base, port)| (base, Some(port)));
+                let result = node_id(base).and_then(|id| self.results.get(&id));
+                let named = port.and_then(|port| result?.named_outputs.get(port));
+                let (last, color) = if let Some(output) = named {
+                    (output.label.clone(), muted)
+                } else {
+                    match result.map(|r| &r.result) {
+                        Some(Ok(output)) => (output.label.clone(), muted),
+                        Some(Err(_)) => ("failed last time".to_string(), danger),
+                        None => ("not run yet".to_string(), muted),
+                    }
                 };
                 h_flex()
                     .gap_2()
@@ -3016,6 +3439,425 @@ impl Inspector {
                     }))
             }))
     }
+
+    fn render_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
+        let border = cx.theme().sidebar_border;
+        h_flex()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(border)
+            .children(
+                [
+                    (InspectorTab::Configure, "Configure"),
+                    (InspectorTab::Results, "Results"),
+                    (InspectorTab::History, "History"),
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(i, (tab, label))| {
+                    Button::new(("inspector-tab", i))
+                        .ghost()
+                        .small()
+                        .label(label)
+                        .when(self.tab == tab, |button| button.outline())
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.tab = tab;
+                            this.scroll.set_offset(point(px(0.0), px(0.0)));
+                            cx.notify();
+                        }))
+                }),
+            )
+            .into_any_element()
+    }
+
+    fn render_named_outputs(&self, id: NodeId, cx: &mut Context<Self>) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let border = cx.theme().border;
+        let outputs = self.results.get(&id).map(|result| &result.named_outputs);
+        v_flex()
+            .gap_3()
+            .children(outputs.into_iter().flat_map(|outputs| outputs.iter()).map(
+                |(name, output)| {
+                    let preview = output
+                        .as_text()
+                        .map(|text| text.chars().take(PREVIEW_CHARS).collect::<String>());
+                    v_flex()
+                        .gap_2()
+                        .p_3()
+                        .border_1()
+                        .border_color(border)
+                        .rounded_lg()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .ml_auto()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child(output.label.clone()),
+                                ),
+                        )
+                        .children(preview.map(|text| div().text_xs().child(text)))
+                        .when(!output.text, |d| {
+                            d.child(div().text_xs().text_color(muted).child("Binary output"))
+                        })
+                        .when(
+                            output
+                                .as_text()
+                                .is_some_and(|s| s.chars().count() > PREVIEW_CHARS),
+                            |d| {
+                                d.child(
+                                    div().text_xs().text_color(muted).child("Preview truncated"),
+                                )
+                            },
+                        )
+                        .children(output.saved.as_ref().map(|path| {
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(path.display().to_string())
+                        }))
+                },
+            ))
+            .into_any_element()
+    }
+
+    fn render_activity(&self, cx: &mut Context<Self>) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let danger = cx.theme().danger;
+        let success = cx.theme().success;
+        let running = self.job.is_some() || self.preview_live;
+        let (headline, color) = if running {
+            ("Running…".to_string(), muted)
+        } else if let Some((_, report)) = &self.report {
+            match &report.result {
+                Ok(_) => (
+                    format!("Completed in {:.1}s", report.elapsed.as_secs_f32()),
+                    success,
+                ),
+                Err(error) if error == exec::CANCELLED => ("Run cancelled".to_string(), muted),
+                Err(error) => (error.clone(), danger),
+            }
+        } else if self.preview_snapshot {
+            (
+                "This child did not execute in the displayed run.".to_string(),
+                muted,
+            )
+        } else {
+            (
+                "No run to show yet. Run the workflow to inspect its results.".to_string(),
+                muted,
+            )
+        };
+        let log = if running {
+            self.live_log.clone()
+        } else {
+            self.report
+                .as_ref()
+                .map(|(_, report)| report.log.clone())
+                .unwrap_or_default()
+        };
+        let stream = self
+            .live_stream
+            .as_ref()
+            .filter(|_| running)
+            .map(|(id, text)| {
+                let preview: String = text
+                    .chars()
+                    .rev()
+                    .take(PREVIEW_CHARS)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                v_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(format!("{id} · streaming")),
+                    )
+                    .child(div().text_xs().child(preview))
+            });
+        v_flex()
+            .gap_3()
+            .child(div().text_sm().text_color(color).child(headline))
+            .children(stream)
+            .when(!log.is_empty(), |d| {
+                d.child(
+                    Button::new("activity-log")
+                        .ghost()
+                        .small()
+                        .label(if self.show_log {
+                            "Hide execution log"
+                        } else {
+                            "Show execution log"
+                        })
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.show_log = !this.show_log;
+                            cx.notify();
+                        })),
+                )
+            })
+            .when(self.show_log, |d| {
+                d.children(
+                    log.into_iter()
+                        .map(|line| div().text_xs().text_color(muted).child(line)),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_preview(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let bg = theme.sidebar;
+        let border = theme.sidebar_border;
+        let muted = theme.muted_foreground;
+        let danger = theme.danger;
+        let selected = self.graph.read(cx).selected();
+        let node = selected.as_ref().map(|node| node.id);
+        let title = selected
+            .as_ref()
+            .map(|node| {
+                node.name.map(str::to_string).unwrap_or_else(|| {
+                    node.data
+                        .map(NodeData::label)
+                        .unwrap_or("Blank node")
+                        .into()
+                })
+            })
+            .unwrap_or_else(|| "Child workflow".into());
+        let data = selected.as_ref().and_then(|node| node.data.cloned());
+        let mut body = v_flex().gap_3();
+        if let Some(id) = node {
+            if self.tab == InspectorTab::Configure {
+                body = body.child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child("Read-only preview. Your parent workflow is preserved."),
+                );
+                if let Some(data) = &data {
+                    body = body.children(config_details(data).into_iter().map(|(name, value)| {
+                        v_flex()
+                            .gap_1()
+                            .child(div().text_xs().text_color(muted).child(name))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .child(value.chars().take(PREVIEW_CHARS).collect::<String>()),
+                            )
+                    }));
+                }
+                let names = self.graph.read(cx).published_names(id);
+                if !names.is_empty() {
+                    body = body.child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(format!("Published as {}", names.join(", "))),
+                    );
+                }
+            } else if self.tab == InspectorTab::Results {
+                if let Some(result) = self.results.get(&id) {
+                    match &result.result {
+                        Ok(output) => {
+                            body = body.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(output.label.clone()),
+                            );
+                            if result.named_outputs.is_empty() {
+                                body = body.children(output.as_text().map(|text| {
+                                    div()
+                                        .text_xs()
+                                        .child(text.chars().take(PREVIEW_CHARS).collect::<String>())
+                                }));
+                            }
+                        }
+                        Err(error) => {
+                            body =
+                                body.child(div().text_sm().text_color(danger).child(error.clone()))
+                        }
+                    }
+                    body = body.child(self.render_named_outputs(id, cx));
+                } else {
+                    body = body.child(div().text_xs().text_color(muted).child(
+                        if self.preview_live {
+                            "This node has not produced a result yet."
+                        } else {
+                            "No recorded result for this node."
+                        },
+                    ));
+                }
+                body = body.child(self.render_activity(cx));
+            }
+            if matches!(data, Some(NodeData::Workflow(_))) {
+                body = body.child(
+                    Button::new("preview-open-child")
+                        .outline()
+                        .small()
+                        .label("Open child graph")
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.open_workflow(id, cx)
+                        })),
+                );
+            }
+        } else {
+            body = body.child(div().text_sm().text_color(muted).child("Select a node to inspect its configuration and recorded outputs. Double-click a Workflow card to go deeper."));
+            if self.tab == InspectorTab::Results {
+                body = body.child(self.render_activity(cx));
+            }
+        }
+        if self.tab == InspectorTab::History {
+            body = v_flex().gap_3();
+            if let Some(run) = &self.preview_run {
+                body =
+                    body.child(div().text_sm().child(run.headline()))
+                        .child(
+                            div().text_xs().text_color(muted).child(
+                                "This canvas shows the graph snapshot captured for this run.",
+                            ),
+                        )
+                        .children(run.inputs.iter().map(|(name, value)| {
+                            div().text_xs().child(format!(
+                                "{name}: {}",
+                                value.chars().take(240).collect::<String>()
+                            ))
+                        }));
+            } else {
+                body = body.child(div().text_sm().text_color(muted).child(if self.preview_live {
+                    "This execution is still running."
+                } else if self.preview_snapshot {
+                    "This graph was prepared for the displayed run, but the child did not execute."
+                } else {
+                    "This is the saved graph. Open a run from the parent history to inspect its snapshot."
+                }));
+            }
+        }
+        v_flex()
+            .size_full()
+            .min_w_0()
+            .bg(bg)
+            .border_l_1()
+            .border_color(border)
+            .child(
+                v_flex()
+                    .gap_1()
+                    .px_3()
+                    .py_3()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(if self.preview_live {
+                                "Live child execution"
+                            } else if self.preview_snapshot {
+                                "Run snapshot · read only"
+                            } else {
+                                "Saved workflow · read only"
+                            }),
+                    ),
+            )
+            .child(self.render_tabs(cx))
+            .child(
+                div()
+                    .id("preview-inspector")
+                    .track_scroll(&self.scroll)
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .p_3()
+                    .child(body),
+            )
+            .into_any_element()
+    }
+}
+
+fn config_details(data: &NodeData) -> Vec<(String, String)> {
+    let pairs: Vec<(&str, String)> = match data {
+        NodeData::Input(c) => vec![
+            ("Input type", c.kind.label().into()),
+            ("Default", c.default.clone()),
+            ("Required", c.required.to_string()),
+        ],
+        NodeData::Workflow(c) => {
+            let mut pairs = vec![
+                ("Workflow", c.graph.clone()),
+                (
+                    "Outputs",
+                    if c.output.is_empty() {
+                        "Published outputs".into()
+                    } else {
+                        c.output.clone()
+                    },
+                ),
+            ];
+            for (name, binding) in &c.inputs {
+                pairs.push((
+                    "Input mapping",
+                    match binding {
+                        calls::Binding::Value { value } => format!("{name} ← {value}"),
+                        calls::Binding::Output { node } => format!("{name} ← {node}"),
+                    },
+                ));
+            }
+            pairs
+        }
+        NodeData::Agent(c) => vec![
+            ("Provider", c.provider.label().into()),
+            ("Model", c.model.clone()),
+            ("Prompt", c.prompt.clone()),
+            ("Message", c.message.clone()),
+            ("Output", c.output.label().into()),
+        ],
+        NodeData::Database(c) => vec![
+            ("Engine", c.engine.label().into()),
+            ("Database", c.path.clone()),
+            ("Query", c.query.clone()),
+            ("Read only", c.read_only.to_string()),
+        ],
+        NodeData::Script(c) => vec![
+            ("Script", c.path.clone()),
+            ("Runtime", c.runtime.label().into()),
+            ("Arguments", validate::join_args(&c.args)),
+        ],
+        NodeData::Data(c) => vec![
+            ("File", c.path.clone()),
+            ("Format", c.format.label().into()),
+        ],
+        NodeData::Directory(c) => vec![
+            ("Directory", c.path.clone()),
+            ("Include", c.include.join(", ")),
+            ("Exclude", c.exclude.join(", ")),
+        ],
+        NodeData::File(c) => vec![
+            ("Destination", c.path.clone()),
+            ("Mode", c.mode.label().into()),
+            ("Review before writing", c.review.to_string()),
+        ],
+    };
+    pairs
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value))
+        .collect()
 }
 
 impl Drop for Inspector {
@@ -3028,6 +3870,9 @@ impl Drop for Inspector {
 
 impl Render for Inspector {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.preview {
+            return self.render_preview(cx);
+        }
         let theme = cx.theme();
         let bg = theme.sidebar;
         let border = theme.sidebar_border;
@@ -3235,55 +4080,6 @@ impl Render for Inspector {
                         .text_color(fg)
                         .child(text)
                 };
-                // While a run is going: its log so far and the text streaming in, tail first
-                // so the newest words are visible.
-                let live_section = self.job.as_ref().map(|_| {
-                    let stream = self.live_stream.as_ref().map(|(id, text)| {
-                        let count = text.chars().count();
-                        let shown: String = if count > PREVIEW_CHARS {
-                            format!(
-                                "…{}",
-                                text.chars().skip(count - PREVIEW_CHARS).collect::<String>()
-                            )
-                        } else {
-                            text.clone()
-                        };
-                        v_flex()
-                            .gap_1()
-                            .child(hint(format!(
-                                "{id} is answering ({count} characters so far)"
-                            )))
-                            .child(preview_box(shown))
-                    });
-                    v_flex()
-                        .gap_1()
-                        .child(div().text_xs().text_color(muted).child("Running…"))
-                        .children(self.live_log.iter().map(|line| hint(line.clone())))
-                        .children(stream)
-                });
-                // The run's headline and log stay with the node Run was pressed on.
-                let run_section = self
-                    .report
-                    .as_ref()
-                    .filter(|(targets, _)| targets.contains(&id))
-                    .map(|(_, report)| {
-                        let (headline, color) = match &report.result {
-                            Ok(output) => (
-                                format!(
-                                    "✓ {} in {:.1}s",
-                                    output.label,
-                                    report.elapsed.as_secs_f32()
-                                ),
-                                success,
-                            ),
-                            Err(e) if e == exec::CANCELLED => ("■ Cancelled".to_string(), muted),
-                            Err(e) => (format!("✗ {e}"), danger),
-                        };
-                        v_flex()
-                            .gap_1()
-                            .child(div().text_xs().text_color(color).child(headline))
-                            .children(report.log.iter().map(|line| hint(line.clone())))
-                    });
                 // What this node produced the last time a run included it, whether it was
                 // the target or somewhere upstream.
                 let output_section = self.node.and_then(|id| self.results.get(&id)).map(|last| {
@@ -3299,14 +4095,17 @@ impl Render for Inspector {
                     let saved = output
                         .and_then(|o| o.saved.clone())
                         .map(|p| hint(format!("saved {}", p.display())));
-                    let preview = output.and_then(|o| o.as_text()).map(|text| {
-                        let shown: String = text.chars().take(PREVIEW_CHARS).collect();
-                        let cut = text.chars().count() > PREVIEW_CHARS;
-                        v_flex()
-                            .gap_1()
-                            .child(preview_box(shown))
-                            .when(cut, |d| d.child(hint("… truncated in this preview".into())))
-                    });
+                    let preview = output
+                        .filter(|_| last.named_outputs.is_empty())
+                        .and_then(|o| o.as_text())
+                        .map(|text| {
+                            let shown: String = text.chars().take(PREVIEW_CHARS).collect();
+                            let cut = text.chars().count() > PREVIEW_CHARS;
+                            v_flex()
+                                .gap_1()
+                                .child(preview_box(shown))
+                                .when(cut, |d| d.child(hint("… truncated in this preview".into())))
+                        });
                     let binary = output
                         .filter(|o| !o.text)
                         .map(|o| hint(format!("{}: binary, no preview", o.label)));
@@ -3404,27 +4203,25 @@ impl Render for Inspector {
                                 })),
                         )
                 });
-                v_flex()
+                let configuration = v_flex()
                     .gap_3()
                     .children(name_field)
                     .child(form)
                     .children(inputs_section)
                     .child(div().h(px(1.0)).flex_shrink_0().bg(border))
                     .child(v_flex().gap_1().children(issues))
-                    .children(live_section)
-                    .children(run_section)
-                    .children(output_section)
-                    .children(
-                        (ty == NodeType::Workflow).then(|| self.render_workflow_details(id, cx)),
-                    )
-                    .children(cache_row)
+                    .child(v_form().small().child(field().label("Publish this output")
+                        .description("Give this result a name for other workflows. Separate additional names with commas.")
+                        .child(v_flex().gap_2()
+                            .when(ty == NodeType::Workflow, |d| d.child(Select::new(&self.publish_source).small().w_full()))
+                            .child(Input::new(&self.published).small()))))
+                    .children(self.publish_issue.as_ref().map(|error| div().text_xs().text_color(danger).child(error.clone())))
                     .children(save_row)
                     .child(div().h(px(1.0)).flex_shrink_0().bg(border))
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(hint("Change type:".into()))
+                    .child(Button::new("node-options").ghost().small().label(if self.show_advanced { "Hide node options" } else { "Node options" })
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| { this.show_advanced = !this.show_advanced; cx.notify(); })))
+                    .when(self.show_advanced, |d| d.child(
+                        v_flex().gap_2()
                             .child(self.render_type_buttons(cx))
                             .child(
                                 Button::new("clear-content")
@@ -3435,17 +4232,38 @@ impl Render for Inspector {
                                         this.clear_content(window, cx)
                                     })),
                             ),
-                    )
-                    .into_any_element()
+                    ));
+                if self.tab == InspectorTab::Configure {
+                    configuration.into_any_element()
+                } else {
+                    v_flex()
+                        .gap_3()
+                        .children(output_section)
+                        .child(self.render_named_outputs(id, cx))
+                        .children(
+                            (ty == NodeType::Workflow)
+                                .then(|| self.render_workflow_details(id, cx)),
+                        )
+                        .when(!self.results.contains_key(&id) && self.job.is_none(), |d| {
+                            d.child(hint("Run this node to inspect its output here.".into()))
+                        })
+                        .child(self.render_activity(cx))
+                        .children(cache_row)
+                        .into_any_element()
+                }
             }
         };
         let body = v_flex()
             .gap_3()
             .children(self.render_run_form(cx))
             .children(self.render_review(cx))
-            .child(node_body)
-            .child(div().h(px(1.0)).flex_shrink_0().bg(border))
-            .child(self.render_runs(cx));
+            .child(if self.tab == InspectorTab::History {
+                self.render_runs(cx).into_any_element()
+            } else if self.tab == InspectorTab::Results && self.node.is_none() {
+                self.render_activity(cx)
+            } else {
+                node_body
+            });
 
         v_flex()
             .size_full()
@@ -3454,6 +4272,7 @@ impl Render for Inspector {
             .border_l_1()
             .border_color(border)
             .child(header)
+            .child(self.render_tabs(cx))
             .child(
                 div()
                     .id("inspector-body")
@@ -3464,5 +4283,6 @@ impl Render for Inspector {
                     .p_3()
                     .child(body),
             )
+            .into_any_element()
     }
 }

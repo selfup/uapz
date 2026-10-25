@@ -30,6 +30,17 @@ provider's shape and the request shape for every provider:
 cargo test
 ```
 
+The optional macOS UI check renders the native workspace with Metal and checks child
+navigation, read-only previews and preservation of the parent's pending Run form:
+
+```sh
+cargo test --features ui-tests --test workspace_rendering
+```
+
+It writes screenshots to `/private/tmp/uapz-ui-<pid>/`; set `UAPZ_UI_SCREENSHOT_DIR`
+to choose another directory. It does not open a visible window or execute the fixture
+workflow.
+
 CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets -D
 warnings` and `cargo test` on a macOS runner for every push and pull request.
 `scripts/run-tests.sh` runs the unit suite. `scripts/run-tests.sh local` also starts LM
@@ -48,8 +59,10 @@ cargo test live_ -- --ignored --nocapture
 
 ## Using it
 
-The window has a sidebar on the left, a toolbar above the canvas, the canvas itself, and
-an inspector on the right. Drag the divider beside either side panel to resize it.
+The project header holds the workflow name, Save, New and Run. A searchable library
+is on the left, the canvas is in the center, and the inspector is on the right. Drag
+the dividers to resize either panel. Run status and review shortcuts stay visible in
+the footer, including while inspecting a child workflow.
 
 **Canvas**
 
@@ -62,10 +75,17 @@ an inspector on the right. Drag the divider beside either side panel to resize i
   the toolbar dropdown has selected: **Blank**, one of the eight types, **Database
   (write)**, or a saved kind.
 - Escape cancels a drag and clears the selection.
-- A typed node shows its label (its name if it has one, else its type or the preset it
-  came from) and a one-line summary such as `Ollama · llama3.1` or `SQLite ·
-  sales.sqlite`. Red nodes write: a database node whose read-only switch is off (its
-  summary says `· write`) and a **Write file** node.
+- Neutral node cards show their name, type, summary and run status. Type accents keep
+  nodes recognizable; red accents identify write-file nodes and writable databases.
+  Workflow cards have a labeled port for each published output. Drag from the specific
+  port to choose the value sent along that wire. Two ports can feed the same target.
+- **Center graph** recenters the layout at its existing scale. New graphs start empty.
+- Double-click a Workflow card, or choose **Open child graph** in the inspector, to
+  inspect its child on the canvas. Breadcrumbs return to any ancestor while preserving
+  the parent's draft, selection, view and active run. Child previews are read-only.
+  During execution they use prepared snapshots and show live status; from history they
+  use the recorded graph, outputs and nested snapshots. **Return to run** and **Review
+  changes** bring you back to the parent when it needs attention.
 - The dots in the nodes' corners follow the latest run. Press Run and every node that
   takes part gets a hollow dot; each turns the accent color while its own step runs, then
   green when it ran and produced output, grey when its output came from the cache, red
@@ -78,13 +98,17 @@ an inspector on the right. Drag the divider beside either side panel to resize i
 
 - Select a node and its content appears as a form. Every edit writes straight back into
   the node; nothing is saved to disk until you save the graph or a preset.
+- **Configure**, **Results** and **History** separate editing from execution. Configure
+  holds input mappings, publication names and optional node-type controls. Results shows
+  individual named outputs, child execution and an expandable execution log. History
+  opens earlier runs. Run forms and pending file reviews appear above the current tab.
 - **Name**, at the top of every node's form, labels the node on the canvas and lets an
   agent wired after it write `{{name}}` for its output. Names are letters, digits, `_`
   and `-`, start with a letter, and must be unique to be useful; the panel says when one
   is not.
 - A blank node offers buttons to give it content: the eight types plus **Database (write)**,
   a database node that starts with its read-only switch off. A typed node can change type
-  or go back to blank at the bottom of the panel.
+  or go back to blank under **Node options** in Configure.
 - Problems are listed under the form as they happen (`model: model is empty`, `query:
   DELETE is not allowed in a read-only query`). A valid config says so.
 - **Save agent** / **Save database** writes the config into the library under the name in
@@ -99,7 +123,7 @@ an inspector on the right. Drag the divider beside either side panel to resize i
   reported as a problem before you run.
 - **Run** executes the selected node after everything wired into it. While it runs, the
   log grows line by line and an agent's answer streams into a preview as it is generated;
-  **Cancel** stops it. The result and the log appear under the form of the node you ran;
+  **Cancel** stops it. The result and the log appear in Results;
   the status line says where an agent's output was saved and how many nodes came from the
   cache. **Run fresh** ignores the cache. See *Running nodes*.
 - Every node that took part in a run keeps its result. Select a node in the middle of the
@@ -107,7 +131,7 @@ an inspector on the right. Drag the divider beside either side panel to resize i
   it failed, with a warning when the node has been edited since. Under it, **Previous**
   shows the same node's output from the run before, or says it was the same, and notes
   when the node was configured differently then. Loading another graph forgets these.
-- **Runs**, at the bottom of the panel whatever is selected, lists the graph's past runs
+- **History** lists the graph's past runs
   (newest first, times in UTC) with **Run all** and **Clear**. Click a run to bring back
   its outputs, dots and log without running anything; the status line says so. **Run all**
   (also cmd-enter and the toolbar button) runs every end node of the graph in one pass.
@@ -115,19 +139,22 @@ an inspector on the right. Drag the divider beside either side panel to resize i
 - **Run input** nodes turn a saved graph into a reusable tool. Run and Run all first ask
   for the named inputs their targets need. Change the values in the Run form and press
   **Start run**; the graph's saved configuration and defaults stay unchanged.
-- **Workflow** nodes call another saved graph. Select its output and map its named
-  inputs to defaults, values, or wired parent outputs. **Show child execution** expands
-  its progress, output previews, logs and failures, including in reopened run history.
+- **Workflow** nodes call another saved graph. Use its published outputs or select one
+  output node, then map named inputs to defaults, values or wired parent outputs.
+  **Open child graph** opens the visual preview. **Show child execution** in Results
+  expands its progress, previews, logs and failures.
 - A write-file node with **Review changes before writing** enabled pauses with a diff
   for every proposed file. **Apply** approves the entire batch and continues downstream;
   **Reject batch** leaves that batch untouched; **Cancel run** stops the whole run.
 
 **Sidebar**
 
-Every section header collapses on click. Sections, top to bottom:
+Search by name, category or path. Matching sections expand while searching; their
+headers show matching counts. Every section header also collapses on click.
 
-- **Graphs**: name, Save (Enter, cmd-s), New (cmd-shift-n), and the saved graphs. Click
-  one to load it.
+- **Workflows**: saved graphs. Click one to load it; name, Save (Enter, cmd-s) and New
+  (cmd-shift-n) are in the project header.
+- **Nodes**: built-in node types, ready to add to the current workflow.
 - **Kinds**: blank, colored node kinds. Name, color, **Save kind**. Click a row to make it
   current and load it into the creator; **+** adds one; **×** deletes it. Type names are
   reserved.
@@ -188,9 +215,10 @@ and apply or reject the proposed change to `generated/note.md`.
 | Field | Notes |
 | --- | --- |
 | Saved workflow | A graph in `graphs/`; save the child before calling it |
-| Return output | One child node. Executes that node and its dependencies, then returns its text or binary output on the parent wire |
-| Named input mappings | Only inputs reachable from that output. Choose **Use default**, **Value**, or a directly wired parent node; wires are identified by node ID and labeled with their names |
-| Refresh workflows and wires | Re-reads the saved graph and available parent wires after edits |
+| Outputs | **Published outputs** exposes the child's named ports. Selecting a single child node retains the original single-output behavior |
+| Named input mappings | Inputs reachable from the selected outputs. Choose **Use default**, **Value**, or a directly wired parent output, labeled by node and port |
+| Open child graph | Opens the saved child or the exact snapshot from the displayed run, with breadcrumbs back to the parent |
+| Refresh | Re-reads the saved graph, output ports and available parent wires after edits |
 
 For example, save a graph with a Run input named `question`, wire that input to an
 agent, and select that agent as the return output of a Workflow node in another graph.
@@ -198,6 +226,28 @@ Wire the parent's source into the Workflow node and select it for `question`. Yo
 also enter a fixed value or use the child's default. Omitted mappings use defaults;
 an explicitly empty value still fails a required input. The parent Run form only asks
 for the parent's reachable Run inputs; child values come from these mappings.
+
+To publish multiple outputs, select each result node in the child graph and enter a
+name under **Configure → Publish this output**, then save the child. A comma-separated
+list publishes the same result under multiple names. Names follow the same identifier
+rules as Run inputs and must be unique across the graph. A graph can publish up to 64
+outputs. In the parent Workflow node choose **Published outputs**; its card now exposes
+one labeled port per name. All outputs share one child execution, so common upstream
+agents and side effects are not repeated for each wire.
+
+Agents can address a wired named output as `{{parts.heading}}` or `{{n2.heading}}`.
+Workflow input mappings offer that same wired output. Each port keeps its own bytes and
+text/binary metadata; binary outputs can flow to a write-file node. A multi-output call
+requires a named wire, while a call with exactly one published output also accepts an
+ordinary wire. Old graphs with a selected output node continue to work unchanged.
+When publishing from a nested Workflow node, choose its source port before entering the
+publication name. This forwards that port directly, including binary output.
+
+Graph JSON stores publications as `"outputs": {"heading": "n0", "body": "n2.body"}`;
+a named wire adds `"output": "heading"` to its usual `from`/`to` object. These fields
+are optional, so older documents and history remain readable. Missing ports and invalid
+or ambiguous publications fail preflight before upstream side effects. A stale port
+stays visible on existing wires, but cannot start a new connection.
 
 Values retain the Run input limits and type checks: up to 64 fields, 256 KB per value,
 and 1 MB combined per invocation. File mappings supply a path relative to the shared
@@ -216,7 +266,8 @@ Independent parent targets retain the normal behavior of continuing after a fail
 
 Calls use saved snapshots for that entire run, even if a graph is edited while it runs.
 The parent's history contains each child's snapshot, effective inputs, node results,
-logs and nested runs. Reopening history displays those recorded results; a new run reads
+logs and nested runs. Prepared children that were never reached retain their snapshots
+without being marked as executed. Reopening history displays those recorded results; a new run reads
 the current saved graphs. All paths use the parent's working directory. Child node IDs
 are qualified by their callers in progress, reviews and cache bookkeeping, for example
 `n3/n1`; unassigned agent outputs use a corresponding folder such as `agents/n3-n1/`.
@@ -239,7 +290,14 @@ cp examples/call-reviewed-note.json examples/call-reviewed-note.md graphs/
 
 Open **call-reviewed-note**, press **Run all**, edit `message`, and start the run.
 The child **reviewed-note** asks for review before writing `generated/note.md`.
-Select the parent's **save-note** node and expand **Show child execution** to inspect it.
+Select the parent's **save-note** node and expand **Show child execution** in Results,
+or double-click its Workflow card to inspect the child canvas.
+
+For two named outputs and visual navigation, copy `examples/note-parts.json`,
+`examples/note-parts.md`, `examples/use-note-parts.json` and `examples/use-note-parts.md`
+into `graphs/`. Open **use-note-parts** and double-click **parts** to inspect the child;
+return with the breadcrumb, then **Run**. The heading and body are reviewed separately
+before being written to `generated/heading.md` and `generated/body.md`.
 
 **Agent**
 
@@ -640,7 +698,7 @@ ids and `-->` edges (node shapes and `|labels|` are tolerated) and laid out left
 | File | Role |
 | --- | --- |
 | `src/main.rs` | App setup, key bindings, window |
-| `src/sidebar.rs` | Workspace: sidebar sections, toolbar, layout |
+| `src/sidebar.rs` | Workspace header, searchable library, child breadcrumbs and layout |
 | `src/inspector.rs` | The node content editor on the right, with Run |
 | `src/exec.rs` | The executor: upstream ordering, files, child processes, database tools, agent runs |
 | `src/workflow.rs` | Run input definitions, reachable fields, typed values and validation |

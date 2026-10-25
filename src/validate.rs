@@ -145,8 +145,27 @@ pub fn is_node_id(s: &str) -> bool {
         .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// A directly wired node id, optionally qualified by a published output name.
+pub fn is_output_handle(s: &str) -> bool {
+    match s.split_once('.') {
+        Some((node, port)) => is_node_id(node) && output_name(port).is_ok(),
+        None => is_node_id(s),
+    }
+}
+
+/// Published names are exact wire identifiers and cannot carry outer whitespace.
+pub fn output_name(name: &str) -> Result<(), String> {
+    if name != name.trim() {
+        return Err("output names cannot have leading or trailing spaces".into());
+    }
+    node_name(name)
+}
+
 /// What may stand between the braces of a placeholder: a node name or a node id.
 fn is_placeholder_name(s: &str) -> bool {
+    if let Some((node, port)) = s.split_once('.') {
+        return is_placeholder_name(node) && !node.contains('.') && output_name(port).is_ok();
+    }
     let mut chars = s.chars();
     chars
         .next()
@@ -1247,6 +1266,13 @@ mod tests {
         );
         assert_eq!(placeholders("{{n3}} {{{x}}}"), ["n3"]);
         assert!(placeholders("no holes").is_empty());
+        assert_eq!(
+            placeholders("{{n0.summary}} {{report.details}} {{n0.bad.port}} {{n0.}}"),
+            ["n0.summary", "report.details"]
+        );
+        assert!(is_output_handle("n0.summary"));
+        assert!(!is_output_handle("report.summary"));
+        assert!(!is_output_handle("n0.summary.extra"));
 
         let filled = render(
             "A: {{a}}, B: {{ b }}, {{not a name}}, {{a}}",

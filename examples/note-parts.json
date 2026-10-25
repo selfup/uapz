@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "name": "note-parts",
+  "outputs": { "heading": "n0", "body": "n1" },
+  "view": { "pan_x": 0.0, "pan_y": 0.0 },
+  "nodes": [
+    {
+      "id": "n0",
+      "x": 80.0,
+      "y": 80.0,
+      "name": "heading",
+      "data": {
+        "type": "input",
+        "kind": "text",
+        "default": "# A reusable note\n",
+        "required": true
+      }
+    },
+    {
+      "id": "n1",
+      "x": 80.0,
+      "y": 220.0,
+      "name": "body",
+      "data": {
+        "type": "input",
+        "kind": "text",
+        "default": "A separate body published by the same child run.\n",
+        "required": true
+      }
+    }
+  ],
+  "edges": []
+}
