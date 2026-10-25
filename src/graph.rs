@@ -234,8 +234,8 @@ impl Graph {
         data: Option<NodeData>,
         cx: &mut Context<Self>,
     ) -> NodeId {
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = next_free_id(self.next_id, |id| self.nodes.iter().any(|n| n.id == id));
+        self.next_id = id.wrapping_add(1);
         self.nodes.push(Node {
             id,
             pos,
@@ -953,8 +953,9 @@ struct Restored {
 }
 
 /// Ids of the form `n<number>` are kept, the first time each appears, so the JSON stays
-/// stable across a load/save cycle; anything else gets a fresh id above them. Edges that
-/// name unknown nodes, loop on one node or repeat an earlier edge are dropped.
+/// stable across a load/save cycle; anything else gets a fresh id above them, wrapping
+/// to unused lower ids at the integer limit. Edges that name unknown nodes, loop on one
+/// node or repeat an earlier edge are dropped.
 fn restore_plan(doc: &GraphDoc, kinds: &HashMap<String, Hsla>) -> Restored {
     let mut taken: HashSet<NodeId> = HashSet::new();
     let parsed: Vec<Option<NodeId>> = doc
@@ -962,9 +963,10 @@ fn restore_plan(doc: &GraphDoc, kinds: &HashMap<String, Hsla>) -> Restored {
         .iter()
         .map(|n| parse_key(&n.id).filter(|id| taken.insert(*id)))
         .collect();
-    // A file can name `n<usize::MAX>`; adding one to that would panic in debug and wrap
-    // in release, so the counter saturates and new ids reuse the top of the range.
-    let mut next = taken.iter().max().map_or(0, |max| max.saturating_add(1));
+    let mut next = next_free_id(
+        taken.iter().max().map_or(0, |max| max.wrapping_add(1)),
+        |id| taken.contains(&id),
+    );
 
     let mut ids: HashMap<&str, NodeId> = HashMap::new();
     let nodes: Vec<Node> = doc
@@ -973,8 +975,10 @@ fn restore_plan(doc: &GraphDoc, kinds: &HashMap<String, Hsla>) -> Restored {
         .zip(parsed)
         .map(|(n, parsed)| {
             let id = parsed.unwrap_or_else(|| {
-                next = next.saturating_add(1);
-                next - 1
+                let id = next;
+                taken.insert(id);
+                next = next_free_id(id.wrapping_add(1), |id| taken.contains(&id));
+                id
             });
             ids.insert(n.id.as_str(), id);
             Node {
@@ -1007,6 +1011,15 @@ fn restore_plan(doc: &GraphDoc, kinds: &HashMap<String, Hsla>) -> Restored {
         edges,
         next_id: next,
     }
+}
+
+/// A graph held in memory cannot fill the entire usize id space. After wrapping,
+/// advance over occupied ids instead of saturating onto an existing node.
+fn next_free_id(mut next: NodeId, is_taken: impl Fn(NodeId) -> bool) -> NodeId {
+    while is_taken(next) {
+        next = next.wrapping_add(1);
+    }
+    next
 }
 
 // ----- geometry helpers -----
@@ -1322,22 +1335,22 @@ mod tests {
     #[test]
     fn restore_does_not_panic_on_the_largest_id() {
         // A hand-edited sidecar can name the top of the range. Adding one to it must not
-        // panic in debug or wrap in release.
+        // panic or assign overlapping ids, even when lower ids are already in use.
         let top = usize::MAX;
         let doc = graph_doc(
             vec![
                 doc_node(&format!("n{top}"), None, None),
+                doc_node(&format!("n{}", top - 1), None, None),
+                doc_node("n0", None, None),
                 doc_node("x", None, None),
+                doc_node("y", None, None),
             ],
             vec![],
         );
         let restored = restore_plan(&doc, &HashMap::new());
-        assert_eq!(restored.nodes.len(), 2);
-        // The named node keeps its key; nothing overlapped it, so both nodes are distinct
-        // and the counter stayed at the top of the range instead of wrapping to zero.
-        assert_eq!(restored.nodes[0].id, usize::MAX);
-        assert_ne!(restored.nodes[1].id, restored.nodes[0].id);
-        assert_eq!(restored.next_id, usize::MAX);
+        let ids: Vec<_> = restored.nodes.iter().map(|n| n.id).collect();
+        assert_eq!(ids, [top, top - 1, 0, 1, 2]);
+        assert_eq!(restored.next_id, 3);
     }
 
     #[test]

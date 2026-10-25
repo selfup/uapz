@@ -31,8 +31,8 @@ cargo test
 
 CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets -D
 warnings` and `cargo test` on a macOS runner for every push and pull request.
-`scripts/run-tests.sh` runs the unit suite and then the live suite with this machine's
-defaults.
+`scripts/run-tests.sh` runs the unit suite. `scripts/run-tests.sh local` also starts LM
+Studio, reloads its models and runs the live suite with this machine's defaults.
 
 Live tests drive the executor against a real OpenAI-compatible server and a PostgreSQL
 server; they are ignored by default. With a chat model and an embedding model loaded in LM
@@ -220,11 +220,13 @@ fn adds() { assert_eq!(add(2, 2), 4); }
 ```
 
 Section paths are relative to the node's directory and go through the same checks as any
-path (no `..`, no hidden names, no app directories). Every path is checked and resolved
-before anything is written, and in **Create only** mode one existing file stops the whole
+path (no `..`, no hidden names, no app directories, including after following symlinks).
+Every path is checked and resolved before anything is written, and in **Create only**
+mode one existing file stops the whole
 write. Text before the first header is ignored, each section's own code fence is stripped,
-the same path twice is an error, and one answer may write at most 500 files. The output
-lists what was written.
+aliases to the same file and file/directory conflicts are errors, and one answer may write
+at most 500 files. Create only also refuses a file created by another writer after the
+initial check. The output lists what was written.
 
 ## Running nodes
 
@@ -251,7 +253,9 @@ that names nothing, or a name two inputs share, is an error before anything is s
 name that does not validate is ignored, and the node stays reachable by id. The log says
 what went where: `n3: placed inputs: {{schema}} from n0 · {{question}} from n1 · n2
 appended`. Names are part of an agent's cache key, so naming an input is an edit;
-graphs without names keep their cached entries.
+graphs without names or placeholders keep their cached entries. Templates also include
+the upstream node ids in the key, so rewiring an input cannot reuse an answer with a
+different or missing placeholder binding.
 
 **Run all and the run history.** **Run all** picks every node with content that feeds no
 other node with content (the end nodes, in id order) and runs them in one pass: a node two
@@ -332,12 +336,13 @@ ONLY` for MySQL.
 
 Child processes get a clean environment (`PATH`, `HOME`, `TMPDIR`, `LANG`, `LC_ALL`, `TERM`
 only, plus the one secret a database tool needs), stdin for their input, and are killed at
-the timeout (the script's own, five minutes for database tools and HTTP).
+the timeout (the script's own, five minutes for database tools and HTTP). Timeout and
+cancellation remain active after the direct child exits if its descendants still hold
+the input or output pipes open.
 
 ## Security
 
-The configs only describe runs, but a future executor will act on them, so the rules are
-enforced now, at edit time, and are meant to be re-checked at run time.
+Configs are checked while editing and again by the executor before running.
 
 - **Names become file stems.** Anything typed as a name is reduced to letters, digits,
   `-`, `_` and spaces, so a graph, kind, agent, prompt or database name can never leave
@@ -350,10 +355,16 @@ enforced now, at edit time, and are meant to be re-checked at run time.
   anything.
 - **No secrets on disk.** Agents and server databases store the *name* of an environment
   variable, never a key or URL. Names must look like `[A-Za-z_][A-Za-z0-9_]*`.
-- **SQL is checked before it reaches an engine.** Exactly one statement; MySQL `/*!`
-  executable comments rejected; quoted identifiers scanned like bare ones (so
-  `"pg_read_file"(...)` is caught); block comments end at the first `*/`, the conservative
-  reading. Read-only queries must start with SELECT, WITH, EXPLAIN, SHOW, DESCRIBE or VALUES
+- **SQL is checked before it reaches an engine.** Exactly one statement, starting with a
+  supported verb for the selected engine. Writable nodes allow read verbs and
+  INSERT/UPDATE/DELETE/REPLACE/MERGE/CREATE/ALTER/DROP/TRUNCATE where supported; unlisted
+  verbs such as SET, DO and CALL are refused. `VACUUM`, `PRAGMA`, IMPORT and EXPORT are
+  refused in both modes.
+  MySQL/MariaDB executable comments and nested comments are rejected; `--` must be
+  followed by whitespace. A backslash immediately before a string's quote is ambiguous
+  across engines and refused: use doubled quotes (`'it''s'`) instead. Quoted identifiers
+  are scanned like bare ones (so `"pg_read_file"(...)` is caught). Read-only queries must
+  start with SELECT, WITH, EXPLAIN, SHOW, DESCRIBE or VALUES
   and may not contain writing or session keywords anywhere, including inside CTEs. Every
   query, read-only or not, is refused if it names something that reaches outside the
   database: ATTACH, LOAD, COPY, GRANT, `INTO OUTFILE`, `pg_read_file`, `load_extension`,
@@ -365,8 +376,10 @@ enforced now, at edit time, and are meant to be re-checked at run time.
   at edit time and again at run time, so a run can never create a script, an agent, a
   prompt, a database preset, a kind, a graph, a cache entry or a run record.
 - **Write-file paths are the user's.** The path is a setting on the node; nothing on the
-  wire can choose it. It is resolved with symlinks followed and must stay under the working
-  directory, missing directories included.
+  wire can choose it unless Split sections is enabled, in which case section paths are
+  relative to the configured directory. Paths are resolved with symlinks followed and
+  must stay under the working directory, missing directories included. The resolved
+  destination must also pass the hidden-name and managed-directory restrictions.
 - **Saving is strict, drafting is not.** The graph file keeps whatever you typed, flagged
   in the inspector. The library refuses to save an invalid agent or database, and the
   canvas shows the first problem.

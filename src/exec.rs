@@ -14,9 +14,9 @@
 //!   and handed only to the request or child process that needs them, never to argv, logs
 //!   or disk;
 //! - agent results are written with [`library::write_agent_output`];
-//! - write-file nodes only touch paths that pass [`validate::writable_path`], resolved
-//!   with [`validate::resolve_new_inside`], so they stay in the working directory and out
-//!   of the app's own folders.
+//! - write-file nodes only touch paths checked by [`validate::resolve_writable_inside`],
+//!   including the destination after following symlinks, so they stay in the working
+//!   directory and out of the app's own folders.
 //!
 //! Text flows along the wires: a node's upstream outputs are joined and become a script's
 //! stdin, an agent's user message or a write-file node's content. Database nodes take data
@@ -720,14 +720,21 @@ impl Runner<'_> {
             .map(|(_, done)| done.key.to_le_bytes().to_vec())
             .collect();
         let cache_key = match data {
-            NodeData::Agent(_) => {
-                // Which input is which matters once names are in play. They only enter
-                // the key when one is set, so graphs without names keep their entries.
+            NodeData::Agent(config) => {
+                // Templates can address ids as well as names. Include the binding map
+                // whenever a template is used, so rewiring equal bytes cannot reuse an
+                // answer to a different (or now invalid) prompt. Plain graphs keep
+                // their existing cache keys.
                 let names: Vec<String> = upstream
                     .iter()
                     .map(|from| self.input_name(from).unwrap_or_default())
                     .collect();
-                let extra = if names.iter().all(String::is_empty) {
+                let has_templates = !validate::placeholders(&config.prompt).is_empty()
+                    || !validate::placeholders(&config.message).is_empty();
+                let extra = if has_templates {
+                    serde_json::to_vec(&("input-bindings-v1", &upstream, &names))
+                        .map_err(|e| e.to_string())?
+                } else if names.iter().all(String::is_empty) {
                     Vec::new()
                 } else {
                     names.join("\n").into_bytes()
@@ -819,8 +826,7 @@ impl Runner<'_> {
         bytes: Vec<u8>,
         textual: bool,
     ) -> Result<Output, String> {
-        let rel = validate::writable_path(&config.path)?;
-        let path = validate::resolve_new_inside(&self.dirs.root, &rel)?;
+        let path = validate::resolve_writable_inside(&self.dirs.root, &config.path)?;
         let bytes = if textual && config.unfence {
             let mut text = validate::unfenced(&String::from_utf8_lossy(&bytes));
             if text.is_empty() {
@@ -844,18 +850,7 @@ impl Runner<'_> {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("create {}: {e}", parent.display()))?;
         }
-        match config.mode {
-            WriteMode::Append if exists => {
-                let mut file = std::fs::OpenOptions::new()
-                    .append(true)
-                    .open(&path)
-                    .map_err(|e| format!("open {}: {e}", path.display()))?;
-                file.write_all(&bytes)
-                    .map_err(|e| format!("write {}: {e}", path.display()))?;
-            }
-            _ => std::fs::write(&path, &bytes)
-                .map_err(|e| format!("write {}: {e}", path.display()))?,
-        }
+        write_file_bytes(&path, &bytes, config.mode)?;
         self.log(format!(
             "{} {} ({})",
             match (config.mode, exists) {
@@ -902,9 +897,15 @@ impl Runner<'_> {
             // The whole path from the working directory is judged, not only the section:
             // `=== scripts/x.sh ===` under `out/` is `out/scripts/x.sh` and harmless, while
             // a bundle rooted at `.` may not plant an app directory.
-            validate::writable_path(&shown)?;
-            let rel_path = validate::path_inside(".", &shown)?;
-            let real = validate::resolve_new_inside(&self.dirs.root, &rel_path)?;
+            let real = validate::resolve_writable_inside(&self.dirs.root, &shown)?;
+            if let Some((other, ..)) = plan
+                .iter()
+                .find(|(_, path, ..)| real.starts_with(path) || path.starts_with(&real))
+            {
+                return Err(format!(
+                    "{shown} conflicts with {other} after resolving paths; nothing was written"
+                ));
+            }
             let exists = real.exists();
             if exists && config.mode == WriteMode::Create {
                 return Err(format!(
@@ -937,18 +938,7 @@ impl Runner<'_> {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("create {}: {e}", parent.display()))?;
             }
-            match config.mode {
-                WriteMode::Append if *exists => {
-                    let mut file = std::fs::OpenOptions::new()
-                        .append(true)
-                        .open(real)
-                        .map_err(|e| format!("open {}: {e}", real.display()))?;
-                    file.write_all(bytes)
-                        .map_err(|e| format!("write {}: {e}", real.display()))?;
-                }
-                _ => std::fs::write(real, bytes)
-                    .map_err(|e| format!("write {}: {e}", real.display()))?,
-            }
+            write_file_bytes(real, bytes, config.mode)?;
             let verb = match (config.mode, exists) {
                 (WriteMode::Append, true) => "appended to",
                 (_, true) => "replaced",
@@ -1079,7 +1069,7 @@ impl Runner<'_> {
             }
             config.query.clone()
         };
-        validate::sql(&query, config.read_only)?;
+        validate::sql_for_engine(&query, config.read_only, config.engine)?;
         let config = &DatabaseConfig {
             query,
             ..config.clone()
@@ -1234,6 +1224,28 @@ fn split_sections(text: &str) -> Vec<(String, String)> {
         }
     }
     sections
+}
+
+/// Let the open operation enforce Create/Append even if another writer creates the
+/// file after preflight. In particular, Create must never truncate an existing file.
+fn write_file_bytes(path: &Path, bytes: &[u8], mode: WriteMode) -> Result<(), String> {
+    let mut options = std::fs::OpenOptions::new();
+    match mode {
+        WriteMode::Create => {
+            options.write(true).create_new(true);
+        }
+        WriteMode::Overwrite => {
+            options.write(true).create(true).truncate(true);
+        }
+        WriteMode::Append => {
+            options.append(true).create(true);
+        }
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    file.write_all(bytes)
+        .map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 /// What Run all starts from: every node with content that feeds no other node with
@@ -1872,13 +1884,19 @@ fn run_process(
 
     let start = Instant::now();
     let mut timed_out = false;
-    let mut cancelled = false;
+    let mut cancelled;
+    let mut exited = None;
     let status = loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|e| format!("waiting for `{program}`: {e}"))?
-        {
-            break status;
+        if exited.is_none() {
+            match child.try_wait() {
+                Ok(status) => exited = status,
+                Err(e) => {
+                    kill_group(child.id());
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("waiting for `{program}`: {e}"));
+                }
+            }
         }
         cancelled = cancel.load(Ordering::Relaxed);
         if cancelled || start.elapsed() >= timeout {
@@ -1888,6 +1906,15 @@ fn run_process(
             break child
                 .wait()
                 .map_err(|e| format!("waiting for `{program}`: {e}"))?;
+        }
+        // A finished parent does not imply EOF: grandchildren may still own its pipe
+        // ends. Keep the deadline and cancellation active until all I/O is finished.
+        if let Some(status) = exited
+            && writer.is_finished()
+            && stdout.is_finished()
+            && stderr.is_finished()
+        {
+            break status;
         }
         thread::sleep(POLL);
     };
@@ -3029,6 +3056,9 @@ mod tests {
                 node("n6", data("wired.txt", DataFormat::Text)),
                 db("n7", "", true),
                 db("n8", "SELECT 1 \\q", true),
+                db("n9", &format!("SELECT '\\';\n.shell {plant}\n-- '"), true),
+                db("n10", &format!("SELECT '\\';\n.shell {plant}\n-- '"), false),
+                db("n11", &format!("VACUUM INTO '{planted}'"), false),
             ],
             &[("n6", "n7")],
         );
@@ -3040,7 +3070,7 @@ mod tests {
         .unwrap();
         let go = |id: &str| run(&doc, id, Dirs::under(&root), &http, &no_env);
 
-        for id in ["n0", "n1", "n2", "n3", "n4", "n8"] {
+        for id in ["n0", "n1", "n2", "n3", "n4", "n8", "n9", "n10", "n11"] {
             let report = go(id);
             let err = report.result.unwrap_err();
             assert!(
@@ -3058,6 +3088,14 @@ mod tests {
         let report = go("n7");
         let err = report.result.unwrap_err();
         assert!(err.contains('.'), "{err}");
+        assert!(!report.log.iter().any(|l| l.starts_with("$ sqlite3")));
+        fs::write(
+            root.join("data/wired.txt"),
+            format!("SELECT '\\';\n.shell {plant}\n-- '"),
+        )
+        .unwrap();
+        let report = go("n7");
+        assert!(report.result.unwrap_err().contains("ambiguous"));
         assert!(!report.log.iter().any(|l| l.starts_with("$ sqlite3")));
         // The plain query still runs, so the check did not simply break the node.
         let out = go("n5").result.expect("plain select still runs");
@@ -3950,6 +3988,39 @@ mod tests {
     }
 
     #[test]
+    fn cached_agents_revalidate_input_ids_used_in_templates() {
+        let root = scratch("id-cache");
+        fs::write(root.join("data/a.txt"), "same contents").unwrap();
+        let http = FakeHttp::new(200, r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+        let mut config = fake_agent();
+        config.prompt = "Summarize {{n0}}".into();
+        let mut doc = graph(
+            vec![
+                node("n0", data("a.txt", DataFormat::Text)),
+                node("n2", Some(NodeData::Agent(config))),
+            ],
+            &[("n0", "n2")],
+        );
+        let (control, _) = recording_control();
+        let go =
+            |doc: &GraphDoc| run_with(doc, "n2", Dirs::under(&root), &http, &with_key, &control);
+        go(&doc).result.unwrap();
+        assert_eq!(go(&doc).reused, ["n2"]);
+        // The bytes did not change, but the named input no longer exists. A cached
+        // reply must not bypass template validation, including after reopening a graph.
+        doc.nodes[0].id = "n1".into();
+        doc.edges[0].from = "n1".into();
+        let report = go(&doc);
+        assert!(
+            report.result.is_err(),
+            "an invalid template reused a cached answer"
+        );
+        assert!(report.reused.is_empty());
+        assert_eq!(http.seen.lock().unwrap().len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn run_all_covers_every_sink_once_and_outlives_a_failure() {
         let root = scratch("run-all");
         fs::write(root.join("data/a.txt"), "v1").unwrap();
@@ -4650,6 +4721,166 @@ mod tests {
         );
         fs::remove_dir_all(&root).unwrap();
         fs::remove_dir_all(&elsewhere).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_nodes_refuse_symlinks_into_protected_paths() {
+        use std::os::unix::fs::symlink;
+
+        let root = scratch("protected-links");
+        fs::write(root.join("data/in.txt"), "payload").unwrap();
+        fs::create_dir_all(root.join(".private")).unwrap();
+        symlink(root.join("scripts"), root.join("alias")).unwrap();
+        symlink(root.join(".private"), root.join("visible")).unwrap();
+        fs::write(root.join("scripts/existing.sh"), "original").unwrap();
+        symlink(root.join("scripts/existing.sh"), root.join("existing.txt")).unwrap();
+        fs::create_dir_all(root.join("ordinary")).unwrap();
+        symlink(root.join("ordinary"), root.join("prompts")).unwrap();
+        let http = FakeHttp::new(200, "{}");
+        for path in [
+            "alias/new.sh",
+            "visible/new.txt",
+            "existing.txt",
+            "ordinary/new.md",
+        ] {
+            for bundle in [false, true] {
+                for mode in [WriteMode::Create, WriteMode::Overwrite, WriteMode::Append] {
+                    fs::write(
+                        root.join("data/in.txt"),
+                        if bundle {
+                            format!("=== {path} ===\npayload")
+                        } else {
+                            "payload".into()
+                        },
+                    )
+                    .unwrap();
+                    let doc = graph(
+                        vec![
+                            node("n0", data("in.txt", DataFormat::Text)),
+                            node(
+                                "n1",
+                                Some(NodeData::File(FileConfig {
+                                    path: if bundle { ".".into() } else { path.into() },
+                                    mode,
+                                    bundle,
+                                    unfence: false,
+                                })),
+                            ),
+                        ],
+                        &[("n0", "n1")],
+                    );
+                    let report = run(&doc, "n1", Dirs::under(&root), &http, &no_env);
+                    assert!(
+                        report.result.is_err(),
+                        "wrote through {path}, bundle={bundle}, mode={mode:?}"
+                    );
+                }
+            }
+        }
+        assert!(!root.join("scripts/new.sh").exists());
+        assert!(!root.join(".private/new.txt").exists());
+        assert_eq!(
+            fs::read_to_string(root.join("scripts/existing.sh")).unwrap(),
+            "original"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundles_refuse_conflicting_resolved_destinations_before_writing() {
+        let root = scratch("bundle-conflicts");
+        fs::create_dir_all(root.join("out")).unwrap();
+        std::os::unix::fs::symlink(root.join("out"), root.join("alias")).unwrap();
+        let http = FakeHttp::new(200, "{}");
+        let doc = graph(
+            vec![
+                node("n0", data("answer.txt", DataFormat::Text)),
+                node(
+                    "n1",
+                    Some(NodeData::File(FileConfig {
+                        path: ".".into(),
+                        mode: WriteMode::Create,
+                        bundle: true,
+                        unfence: false,
+                    })),
+                ),
+            ],
+            &[("n0", "n1")],
+        );
+        for paths in [
+            ("out/file", "alias/file"),
+            ("out/file", "out/file/child"),
+            ("out/file/child", "out/file"),
+        ] {
+            fs::write(
+                root.join("data/answer.txt"),
+                format!("=== {} ===\nfirst\n=== {} ===\nsecond\n", paths.0, paths.1),
+            )
+            .unwrap();
+            let report = run(&doc, "n1", Dirs::under(&root), &http, &no_env);
+            assert!(report.result.unwrap_err().contains("conflicts"));
+            assert!(fs::read_dir(root.join("out")).unwrap().next().is_none());
+        }
+        // Opening in Create mode enforces exclusivity even if the file appeared after
+        // preflight. Append also remains append if it appeared during that interval.
+        let target = root.join("out/file");
+        fs::write(&target, b"original").unwrap();
+        assert!(write_file_bytes(&target, b"replacement", WriteMode::Create).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"original");
+        write_file_bytes(&target, b" appended", WriteMode::Append).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"original appended");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn process_timeout_covers_pipes_inherited_by_grandchildren() {
+        let root = scratch("inherited-pipes");
+        let start = Instant::now();
+        let result = run_process(
+            "sh",
+            &["-c".into(), "sleep 2 & exit 0".into()],
+            &root,
+            &[],
+            &[],
+            Duration::from_millis(150),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let elapsed = start.elapsed();
+        fs::remove_dir_all(root).unwrap();
+        assert!(
+            result.timed_out,
+            "the parent exited but its descendant kept the pipes open for {elapsed:?}"
+        );
+        assert!(elapsed < Duration::from_secs(1), "timeout took {elapsed:?}");
+    }
+
+    #[test]
+    fn cancellation_covers_pipes_inherited_by_grandchildren() {
+        let root = scratch("cancel-inherited-pipes");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let canceller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let start = Instant::now();
+        let result = run_process(
+            "sh",
+            &["-c".into(), "sleep 2 & exit 0".into()],
+            &root,
+            &[],
+            &[],
+            Duration::from_secs(10),
+            &cancel,
+        );
+        let elapsed = start.elapsed();
+        canceller.join().unwrap();
+        assert!(matches!(result, Err(ref e) if e == CANCELLED));
+        assert!(elapsed < Duration::from_secs(1), "cancel took {elapsed:?}");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
