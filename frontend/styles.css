@@ -470,7 +470,40 @@ button.primary:hover:not(:disabled) {
   min-height: 0;
   overflow: hidden;
 }
-.inspector-column > .inspector {
+.workspace-panel-tabs {
+  display: flex;
+  flex-shrink: 0;
+  gap: 4px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.workspace-panel-tabs button {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 8px;
+  font-size: 11px;
+  background: transparent;
+  border-color: transparent;
+  color: var(--muted);
+}
+.workspace-panel-tabs button[aria-selected="true"] {
+  background: #ffffff09;
+  border-color: var(--border);
+  color: var(--text);
+}
+.workspace-panel-body {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+}
+.workspace-panel-body[hidden] {
+  display: none;
+}
+.workspace-panel-body > .inspector {
   min-height: 0;
   flex: 1;
 }

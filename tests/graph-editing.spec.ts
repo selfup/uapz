@@ -1,5 +1,12 @@
 import type { Locator, Page } from "@playwright/test";
-import { test, expect, parent, callsFor } from "./support/workspace";
+import {
+  test,
+  expect,
+  parent,
+  callsFor,
+  queueReply,
+  releaseReply,
+} from "./support/workspace";
 
 async function dragBetween(page: Page, source: Locator, target: Locator) {
   await expect(source).toBeVisible();
@@ -186,4 +193,87 @@ test("dragging a node saves its new graph coordinates and restores them on reope
       return { x: position?.x, y: position?.y };
     })
     .toEqual({ x: movedPosition!.x, y: movedPosition!.y });
+});
+
+test("runtime refreshes keep a held node drag stable and save its final position", async ({
+  page,
+}) => {
+  await page.getByRole("button", { name: "Run workflow", exact: true }).click();
+  await page.getByRole("button", { name: "Start run", exact: true }).click();
+  await expect(
+    page.getByRole("region", { name: "Review file changes" }),
+  ).toBeVisible();
+  const node = page.locator('[data-id="n0"]');
+  await expect(node.getByLabel("ran", { exact: true })).toBeVisible();
+  const initial = (await node.boundingBox())!;
+  const pointer = { x: initial.x + 90, y: initial.y + 45 };
+  await queueReply(page, { method: "runtime_state", gate: "drag-first-poll" });
+  await page.mouse.move(pointer.x, pointer.y);
+  await page.mouse.down();
+  await page.mouse.move(pointer.x + 73, pointer.y + 51, { steps: 12 });
+  const held = (await node.boundingBox())!;
+  expect(held.x - initial.x).toBeGreaterThan(50);
+  expect(held.y - initial.y).toBeGreaterThan(30);
+
+  for (const [gate, mark] of [
+    ["drag-first-poll", "running"],
+    ["drag-second-poll", "ran"],
+  ]) {
+    if (gate === "drag-second-poll")
+      await queueReply(page, { method: "runtime_state", gate });
+    await page.evaluate((mark) => {
+      (window as any).__testState.runtime.marks.n0 = mark;
+    }, mark);
+    await releaseReply(page, gate);
+    // The changed status proves the refreshed props reached the canvas while
+    // the drag remained active, rather than merely waiting for another poll.
+    await expect(node.getByLabel(mark, { exact: true })).toBeVisible();
+    const refreshed = (await node.boundingBox())!;
+    expect(refreshed.x).toBeCloseTo(held.x, 1);
+    expect(refreshed.y).toBeCloseTo(held.y, 1);
+    await expect(node).toHaveClass(/dragging/);
+  }
+
+  await page.mouse.move(pointer.x + 93, pointer.y + 76, { steps: 6 });
+  const continued = (await node.boundingBox())!;
+  expect(continued.x - held.x).toBeCloseTo(20, 1);
+  expect(continued.y - held.y).toBeCloseTo(25, 1);
+  await page.mouse.up();
+  await expect(node).not.toHaveClass(/dragging/);
+  const final = (await node.boundingBox())!;
+  expect(final.x).toBeCloseTo(continued.x, 1);
+  expect(final.y).toBeCloseTo(continued.y, 1);
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  const saved = (await callsFor(page, "save_graph")).at(-1)!.args
+    .doc as typeof parent;
+  const moved = saved.nodes.find((item) => item.id === "n0")!;
+  const scale = parent.view.zoom ?? 1;
+  expect(moved.x).toBeCloseTo(
+    parent.nodes[0].x + (final.x - initial.x) / scale,
+    1,
+  );
+  expect(moved.y).toBeCloseTo(
+    parent.nodes[0].y + (final.y - initial.y) / scale,
+    1,
+  );
+  expect(saved.edges).toEqual(parent.edges);
+  expect(saved.outputs).toEqual(parent.outputs);
+  await page.getByRole("button", { name: "Apply changes", exact: true }).click();
+  await expect(
+    page.getByRole("region", { name: "Review file changes" }),
+  ).toHaveCount(0);
+  const loadedBefore = (await callsFor(page, "load_graph")).length;
+  await page
+    .locator(".library")
+    .getByRole("button", { name: "Demo", exact: true })
+    .click();
+  await expect
+    .poll(async () => (await callsFor(page, "load_graph")).length)
+    .toBeGreaterThan(loadedBefore);
+  await expect
+    .poll(async () => {
+      const position = await node.boundingBox();
+      return { x: position?.x, y: position?.y };
+    })
+    .toEqual({ x: final.x, y: final.y });
 });

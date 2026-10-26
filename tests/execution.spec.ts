@@ -70,6 +70,9 @@ for (const decision of ["Reject", "Cancel run"] as const) {
         ? { run_id: "live-1", review_id: "review-1", decision: "reject" }
         : { run_id: "live-1" },
     );
+    await page
+      .getByRole("tab", { name: "Node inspector", exact: true })
+      .click();
     await page.getByRole("tab", { name: "History", exact: true }).click();
     await expect(page.locator(".ins-run")).toHaveCount(1);
   });

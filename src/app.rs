@@ -4,13 +4,14 @@
 //! host selects the workspace as its working directory once, before constructing
 //! this service. Execution, cache and history always use the captured explicit root.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex, MutexGuard,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
@@ -30,6 +31,50 @@ use crate::{
 
 const MAX_LIVE_TEXT: usize = 256 * 1024;
 const MAX_LIVE_LOG: usize = 512 * 1024;
+const MAX_FEED_EVENTS: usize = 2048;
+const MAX_FEED_BYTES: usize = 2 * 1024 * 1024;
+const MAX_LIVE_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Serialize)]
+struct FeedEvent {
+    seq: u64,
+    #[serde(flatten)]
+    body: FeedBody,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum FeedBody {
+    Log {
+        text: String,
+        #[serde(skip_serializing_if = "is_false")]
+        truncated: bool,
+    },
+    Node {
+        id: String,
+        state: &'static str,
+    },
+    Text {
+        id: String,
+        text: String,
+        #[serde(skip_serializing_if = "is_false")]
+        truncated: bool,
+    },
+    Output {
+        id: String,
+        result: Box<history::NodeRun>,
+    },
+}
+
+struct StoredEvent {
+    event: FeedEvent,
+    bytes: usize,
+}
+
+struct LiveOutput {
+    result: history::NodeRun,
+    bytes: usize,
+}
 
 fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
     value
@@ -75,6 +120,13 @@ struct Session {
     review_seq: u64,
     run: Option<history::Run>,
     error: Option<String>,
+    events: VecDeque<StoredEvent>,
+    event_bytes: usize,
+    next_seq: u64,
+    events_dropped: u64,
+    outputs: BTreeMap<String, LiveOutput>,
+    output_order: VecDeque<String>,
+    output_bytes: usize,
 }
 
 impl Drop for Session {
@@ -84,6 +136,106 @@ impl Drop for Session {
 }
 
 impl Session {
+    fn event(&mut self, body: FeedBody) {
+        let event = FeedEvent {
+            seq: self.next_seq,
+            body,
+        };
+        self.next_seq += 1;
+        let bytes = serde_json::to_vec(&event).map_or(MAX_FEED_BYTES + 1, |bytes| bytes.len());
+        if bytes > MAX_FEED_BYTES {
+            // A single oversized item must not evict the useful retained feed.
+            self.events_dropped += 1;
+            return;
+        }
+        self.event_bytes += bytes;
+        self.events.push_back(StoredEvent { event, bytes });
+        self.prune_events();
+    }
+
+    fn prune_events(&mut self) {
+        while self.events.len() > MAX_FEED_EVENTS || self.event_bytes > MAX_FEED_BYTES {
+            let Some(event) = self.events.pop_front() else {
+                break;
+            };
+            self.event_bytes -= event.bytes;
+            self.events_dropped += 1;
+        }
+    }
+
+    fn text_event(&mut self, id: &str, text: &str) {
+        if let Some(last) = self.events.back_mut()
+            && let FeedBody::Text {
+                id: stream_id,
+                text: stream,
+                truncated,
+            } = &mut last.event.body
+            && stream_id == id
+        {
+            stream.push_str(text);
+            *truncated |= stream.len() > MAX_LIVE_TEXT;
+            *stream = tail(stream, MAX_LIVE_TEXT);
+            self.event_bytes -= last.bytes;
+            last.bytes =
+                serde_json::to_vec(&last.event).map_or(MAX_FEED_BYTES + 1, |bytes| bytes.len());
+            self.event_bytes += last.bytes;
+            self.prune_events();
+        } else {
+            self.event(FeedBody::Text {
+                id: id.into(),
+                text: tail(text, MAX_LIVE_TEXT),
+                truncated: text.len() > MAX_LIVE_TEXT,
+            });
+        }
+    }
+
+    fn completed_output(&mut self, id: String, mut result: Box<history::NodeRun>) {
+        // Configuration remains in the captured graph and final run. Keeping it
+        // out of live output events avoids repeating large prompts in every poll.
+        result.data = None;
+        let bytes =
+            serde_json::to_vec(&result).map_or(MAX_LIVE_OUTPUT_BYTES + 1, |bytes| bytes.len());
+        if let Some(old) = self.outputs.remove(&id) {
+            self.output_bytes -= old.bytes;
+            self.output_order.retain(|old| old != &id);
+        }
+        self.output_bytes += bytes;
+        self.outputs.insert(
+            id.clone(),
+            LiveOutput {
+                result: (*result).clone(),
+                bytes,
+            },
+        );
+        self.output_order.push_back(id.clone());
+        while self.outputs.len() > MAX_FEED_EVENTS || self.output_bytes > MAX_LIVE_OUTPUT_BYTES {
+            let Some(old) = self.output_order.pop_front() else {
+                break;
+            };
+            if let Some(output) = self.outputs.remove(&old) {
+                self.output_bytes -= output.bytes;
+            }
+        }
+        // Completed output replaces streamed partial text, including earlier
+        // chunks separated by logs. Replacement is not retention loss.
+        self.events.retain(|event| {
+            if matches!(&event.event.body, FeedBody::Text {id:stream_id,..} if stream_id == &id) {
+                self.event_bytes -= event.bytes;
+                false
+            } else {
+                true
+            }
+        });
+        if self
+            .stream
+            .as_ref()
+            .is_some_and(|(stream_id, _)| stream_id == &id)
+        {
+            self.stream = None;
+        }
+        self.event(FeedBody::Output { id, result });
+    }
+
     fn cancel(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
         if let Some((_, pending)) = self.review.take() {
@@ -100,17 +252,23 @@ impl Session {
                 self.workflows.insert(id, (*graph).clone());
             }
             Progress::Node { id, state } => {
-                self.marks.insert(
-                    id,
-                    match state {
-                        exec::NodeState::Running => "running",
-                        exec::NodeState::Done => "ran",
-                        exec::NodeState::Reused => "reused",
-                        exec::NodeState::Failed => "failed",
-                    },
-                );
+                let state = match state {
+                    exec::NodeState::Running => "running",
+                    exec::NodeState::Done => "ran",
+                    exec::NodeState::Reused => "reused",
+                    exec::NodeState::Failed => "failed",
+                };
+                self.event(FeedBody::Node {
+                    id: id.clone(),
+                    state,
+                });
+                self.marks.insert(id, state);
             }
             Progress::Log(line) => {
+                self.event(FeedBody::Log {
+                    text: tail(&line, MAX_LIVE_TEXT),
+                    truncated: line.len() > MAX_LIVE_TEXT,
+                });
                 let line = tail(&line, MAX_LIVE_TEXT);
                 self.log_bytes += line.len();
                 self.log.push(line);
@@ -119,6 +277,7 @@ impl Session {
                 }
             }
             Progress::Text { id, text } => {
+                self.text_event(&id, &text);
                 let stream = self
                     .stream
                     .get_or_insert_with(|| (id.clone(), String::new()));
@@ -128,6 +287,7 @@ impl Session {
                 stream.1.push_str(&text);
                 stream.1 = tail(&stream.1, MAX_LIVE_TEXT);
             }
+            Progress::Output { id, result } => self.completed_output(id, result),
         }
     }
 
@@ -142,7 +302,8 @@ impl Session {
             "cancelling":self.running && self.cancel.load(Ordering::Relaxed),
             "graph":self.graph,"targets":self.targets,"marks":self.marks,"log":self.log,
             "stream":self.stream.as_ref().map(|(id,text)| json!({"id":id,"text":text})),
-            "workflows":self.workflows,"review":pending,"run":self.run,"error":self.error})
+            "workflows":self.workflows,"review":pending,"run":self.run,"error":self.error,
+            "events":self.events.iter().map(|stored|&stored.event).collect::<Vec<_>>(),"events_dropped":self.events_dropped})
     }
 }
 
@@ -419,36 +580,83 @@ impl AppService {
 
     fn output(&self, args: &Value) -> Result<Value, String> {
         use base64::Engine as _;
-        let id = string(args, "run_id")?;
-        let graph = string(args, "graph")?;
-        safe_name(graph)?;
-        let live = lock(&self.current)
-            .as_ref()
-            .and_then(|s| lock(s).run.clone())
-            .filter(|r| r.id == id && r.graph == graph);
-        let run = live
-            .or_else(|| {
-                history::list(&self.root, graph)
-                    .into_iter()
-                    .find(|r| r.id == id)
-            })
-            .ok_or("the run is no longer stored")?;
-        let mut run = &run;
-        if let Some(path) = args.get("call_path").and_then(Value::as_str) {
-            for id in path.split('/').filter(|id| !id.is_empty()) {
-                run = &run.calls.get(id).ok_or("this workflow did not run")?.run;
-            }
+        let max_bytes: Option<usize> = args
+            .get("max_bytes")
+            .map(|_| field(args, "max_bytes"))
+            .transpose()?;
+        if max_bytes.is_some_and(|limit| limit == 0 || limit > exec::MAX_OUTPUT_BYTES) {
+            return Err(format!(
+                "max_bytes must be an integer between 1 and {}",
+                exec::MAX_OUTPUT_BYTES
+            ));
         }
-        let node = run
-            .nodes
-            .get(string(args, "node")?)
-            .ok_or("this node has no result in the run")?;
-        let node = if let Some(output) = args.get("output").and_then(Value::as_str) {
+        let id = string(args, "run_id")?;
+        let graph = history_graph(string(args, "graph")?)?;
+        let node = string(args, "node")?;
+        validate::text("node", node, validate::MAX_PATH_LEN)?;
+        let path: Option<String> = optional(args, "call_path")?;
+        if let Some(path) = &path {
+            validate::text("workflow path", path, validate::MAX_PATH_LEN)?;
+        }
+        let handle = path
+            .filter(|path| !path.is_empty())
+            .map_or_else(|| node.to_string(), |path| format!("{path}/{node}"));
+        let parts: Vec<_> = handle.split('/').collect();
+        if parts.len() > calls::MAX_DEPTH + 1
+            || parts.iter().any(|part| !validate::is_node_id(part))
+        {
+            return Err("choose a node id and a valid workflow path".into());
+        }
+        let live = lock(&self.current).clone();
+        let (node, live_run) = live
+            .as_ref()
+            .map(|session| {
+                let session = lock(session);
+                if history::graph_name(&session.graph.name) != graph {
+                    return (None, None);
+                }
+                let matching =
+                    session.id == id || session.run.as_ref().is_some_and(|run| run.id == id);
+                if !matching {
+                    return (None, None);
+                }
+                (
+                    session
+                        .outputs
+                        .get(&handle)
+                        .map(|output| output.result.clone()),
+                    session.run.clone(),
+                )
+            })
+            .unwrap_or_default();
+        let node = match node {
+            Some(node) => node,
+            None => {
+                let run = live_run
+                    .or_else(|| {
+                        history::list(&self.root, &graph)
+                            .into_iter()
+                            .find(|run| run.id == id)
+                    })
+                    .ok_or("the run or completed live output is no longer stored")?;
+                let mut run = &run;
+                for id in &parts[..parts.len() - 1] {
+                    run = &run.calls.get(*id).ok_or("this workflow did not run")?.run;
+                }
+                run.nodes
+                    .get(parts[parts.len() - 1])
+                    .cloned()
+                    .ok_or("this node has no result in the run")?
+            }
+        };
+        let output: Option<String> = optional(args, "output")?;
+        let node = if let Some(output) = &output {
+            validate::output_name(output)?;
             node.named_outputs
                 .get(output)
                 .ok_or("this output is not available")?
         } else {
-            node
+            &node
         };
         let cached = node
             .content_key()
@@ -459,12 +667,15 @@ impl AppService {
                 .clone()
                 .unwrap_or_else(|| "this output is no longer stored".into())
         })?;
-        Ok(
-            json!({"label":out.label,"saved":out.saved,"text":out.as_text(),
+        let bytes = out.bytes.len();
+        let limited = max_bytes.is_some_and(|limit| bytes > limit);
+        let text = out
+            .as_text()
+            .map(|text| max_bytes.map_or(text, |limit| head(text, limit)));
+        Ok(json!({"label":out.label,"saved":out.saved,"text":text,
             "media_type":(!out.text).then(||media_type(&out.bytes)),
-            "base64":if out.text {None} else {Some(base64::engine::general_purpose::STANDARD.encode(&out.bytes))},
-            "complete":complete}),
-        )
+            "base64":if out.text || limited {None} else {Some(base64::engine::general_purpose::STANDARD.encode(&out.bytes))},
+            "complete":complete && !limited,"limited":limited,"bytes":bytes}))
     }
 
     fn session(&self, id: &str) -> Result<Arc<Mutex<Session>>, String> {
@@ -511,6 +722,13 @@ impl AppService {
             review_seq: 0,
             run: None,
             error: None,
+            events: VecDeque::new(),
+            event_bytes: 0,
+            next_seq: 1,
+            events_dropped: 0,
+            outputs: BTreeMap::new(),
+            output_order: VecDeque::new(),
+            output_bytes: 0,
         }));
         let progress_session = session.clone();
         let review_session = session.clone();
@@ -619,6 +837,9 @@ impl AppService {
 fn value(value: impl serde::Serialize) -> Result<Value, String> {
     serde_json::to_value(value).map_err(|e| e.to_string())
 }
+fn is_false(value: &bool) -> bool {
+    !value
+}
 fn field<T: DeserializeOwned>(args: &Value, name: &str) -> Result<T, String> {
     serde_json::from_value(
         args.get(name)
@@ -686,6 +907,13 @@ fn tail(text: &str, max: usize) -> String {
         start += 1;
     }
     text[start..].to_string()
+}
+fn head(text: &str, max: usize) -> &str {
+    let mut end = text.len().min(max);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 fn fields_value(fields: &[workflow::Field]) -> Value {
     json!(
@@ -1430,6 +1658,450 @@ mod tests {
         );
         workspace.service.request("clear_cache", json!({})).unwrap();
         assert!(workspace.service.request("output", args).is_err());
+    }
+
+    #[test]
+    fn optional_output_byte_limits_preserve_utf8_boundaries_and_default_full_text() {
+        let workspace = Workspace::new();
+        let text = format!("A😀Bé{}", "😀".repeat(history::PREVIEW_CHARS));
+        let mut graph = input_doc();
+        graph.nodes[0].data = Some(NodeData::Input(workflow::InputConfig {
+            default: text.clone(),
+            ..Default::default()
+        }));
+        let started = workspace
+            .service
+            .request("start_run", json!({"doc":graph}))
+            .unwrap();
+        workspace.until(|state| state["running"] == false);
+        let args = json!({"graph":"service-input","run_id":started["run_id"],"node":"n0"});
+        let output = workspace.service.request("output", args.clone()).unwrap();
+        assert_eq!(output["text"], text);
+        assert_eq!(output["complete"], true);
+        assert_eq!(output["limited"], false);
+        assert_eq!(output["bytes"], text.len());
+        for (limit, expected) in [
+            (1, "A"),
+            (2, "A"),
+            (4, "A"),
+            (5, "A😀"),
+            (6, "A😀B"),
+            (7, "A😀B"),
+            (8, "A😀Bé"),
+        ] {
+            let mut args = args.clone();
+            args["max_bytes"] = json!(limit);
+            let output = workspace.service.request("output", args).unwrap();
+            assert_eq!(output["text"], expected);
+            assert_eq!(output["complete"], false);
+            assert_eq!(output["limited"], true);
+            assert_eq!(output["bytes"], text.len());
+            assert!(output["text"].as_str().unwrap().len() <= limit);
+        }
+        for limit in [text.len(), text.len() + 1, exec::MAX_OUTPUT_BYTES] {
+            let mut args = args.clone();
+            args["max_bytes"] = json!(limit);
+            let output = workspace.service.request("output", args).unwrap();
+            assert_eq!(output["text"], text);
+            assert_eq!(output["complete"], true);
+            assert_eq!(output["limited"], false);
+        }
+        for invalid in [
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!("256"),
+            json!(true),
+            json!([]),
+            json!({}),
+            Value::Null,
+            json!(exec::MAX_OUTPUT_BYTES + 1),
+        ] {
+            let mut args = args.clone();
+            args["max_bytes"] = invalid;
+            assert!(
+                workspace
+                    .service
+                    .request("output", args)
+                    .unwrap_err()
+                    .contains("max_bytes")
+            );
+        }
+    }
+
+    #[test]
+    fn optional_binary_byte_limits_omit_oversized_payloads_and_allow_exact_boundaries() {
+        use base64::Engine as _;
+        let workspace = Workspace::new();
+        let bytes = b"\x89PNG\r\n\x1a\nimage payload";
+        std::fs::write(workspace.root.join("data/limited.png"), bytes).unwrap();
+        let graph = GraphDoc {
+            name: "binary-limit".into(),
+            version: doc::VERSION,
+            nodes: vec![node(
+                "n0",
+                None,
+                NodeData::Data(crate::node_data::DataConfig {
+                    path: "limited.png".into(),
+                    format: DataFormat::Image,
+                }),
+            )],
+            ..Default::default()
+        };
+        workspace
+            .service
+            .request("start_run", json!({"doc":graph}))
+            .unwrap();
+        let state = workspace.until(|state| state["running"] == false);
+        let args = json!({"graph":"binary-limit","run_id":state["run"]["id"],"node":"n0"});
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        for limit in [None, Some(bytes.len()), Some(bytes.len() + 1)] {
+            let mut args = args.clone();
+            if let Some(limit) = limit {
+                args["max_bytes"] = json!(limit);
+            }
+            let output = workspace.service.request("output", args).unwrap();
+            assert_eq!(output["base64"], encoded);
+            assert_eq!(output["media_type"], "image/png");
+            assert_eq!(output["bytes"], bytes.len());
+            assert_eq!(output["limited"], false);
+            assert_eq!(output["complete"], true);
+        }
+        for limit in [1, bytes.len() - 1] {
+            let mut args = args.clone();
+            args["max_bytes"] = json!(limit);
+            let output = workspace.service.request("output", args).unwrap();
+            assert!(output["base64"].is_null());
+            assert!(output["text"].is_null());
+            assert_eq!(output["media_type"], "image/png");
+            assert_eq!(output["bytes"], bytes.len());
+            assert_eq!(output["limited"], true);
+            assert_eq!(output["complete"], false);
+        }
+    }
+
+    #[test]
+    fn feed_preserves_order_coalesces_text_and_replaces_completed_streams() {
+        let workspace = Workspace::new();
+        workspace
+            .service
+            .request("start_run", json!({"doc":input_doc()}))
+            .unwrap();
+        workspace.until(|state| state["running"] == false);
+        let current = lock(&workspace.service.current).clone().unwrap();
+        let mut session = lock(&current);
+        session.events.clear();
+        session.event_bytes = 0;
+        session.events_dropped = 0;
+        session.next_seq = 1;
+        session.progress(Progress::Node {
+            id: "n0".into(),
+            state: exec::NodeState::Running,
+        });
+        session.progress(Progress::Log("starting".into()));
+        session.progress(Progress::Text {
+            id: "n0".into(),
+            text: "one".into(),
+        });
+        session.progress(Progress::Text {
+            id: "n0".into(),
+            text: " two".into(),
+        });
+        session.progress(Progress::Log("between chunks".into()));
+        session.progress(Progress::Text {
+            id: "n0".into(),
+            text: " three".into(),
+        });
+        let events = session.value()["events"].as_array().unwrap().clone();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["seq"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5]
+        );
+        assert_eq!(events[2]["text"], "one two");
+        assert_eq!(events[4]["text"], " three");
+        let result = session.run.as_ref().unwrap().nodes["n0"].clone();
+        session.progress(Progress::Node {
+            id: "n0".into(),
+            state: exec::NodeState::Done,
+        });
+        session.progress(Progress::Output {
+            id: "n0".into(),
+            result: Box::new(result),
+        });
+        let state = session.value();
+        let events = state["events"].as_array().unwrap();
+        assert!(!events.iter().any(|event| event["kind"] == "text"));
+        assert_eq!(events.last().unwrap()["seq"], 7);
+        assert_eq!(events.last().unwrap()["kind"], "output");
+        assert!(events.last().unwrap()["result"].get("data").is_none());
+        assert_eq!(state["events_dropped"], 0);
+        assert!(state["stream"].is_null());
+    }
+
+    #[test]
+    fn feed_retention_is_bounded_and_flags_utf8_truncation_and_real_evictions() {
+        let workspace = Workspace::new();
+        workspace
+            .service
+            .request("start_run", json!({"doc":input_doc()}))
+            .unwrap();
+        workspace.until(|state| state["running"] == false);
+        let current = lock(&workspace.service.current).clone().unwrap();
+        let mut session = lock(&current);
+        session.events.clear();
+        session.event_bytes = 0;
+        session.events_dropped = 0;
+        session.next_seq = 1;
+        for _ in 0..MAX_FEED_EVENTS + 7 {
+            session.progress(Progress::Log("entry".into()));
+        }
+        assert_eq!(session.events.len(), MAX_FEED_EVENTS);
+        assert_eq!(session.events_dropped, 7);
+        assert_eq!(session.events.front().unwrap().event.seq, 8);
+        session.progress(Progress::Text {
+            id: "n0".into(),
+            text: "😀".repeat(MAX_LIVE_TEXT),
+        });
+        let seq = session.events.back().unwrap().event.seq;
+        session.progress(Progress::Text {
+            id: "n0".into(),
+            text: "end".into(),
+        });
+        let event = serde_json::to_value(&session.events.back().unwrap().event).unwrap();
+        assert_eq!(event["seq"], seq);
+        assert_eq!(event["truncated"], true);
+        assert!(event["text"].as_str().unwrap().len() <= MAX_LIVE_TEXT);
+        assert!(event["text"].as_str().unwrap().ends_with("end"));
+        for _ in 0..20 {
+            session.progress(Progress::Log("😀".repeat(MAX_LIVE_TEXT)));
+        }
+        assert!(session.event_bytes <= MAX_FEED_BYTES);
+        assert!(session.events_dropped > 7);
+        assert!(
+            session
+                .events
+                .iter()
+                .zip(session.events.iter().skip(1))
+                .all(|(a, b)| a.event.seq < b.event.seq)
+        );
+        assert_eq!(
+            session.value()["events"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["truncated"],
+            true
+        );
+        let mut result = session.run.as_ref().unwrap().nodes["n0"].clone();
+        result.preview = "😀".repeat(history::PREVIEW_CHARS);
+        result.named_outputs = (0..64)
+            .map(|i| (format!("port{i}"), result.clone()))
+            .collect();
+        for i in 0..8 {
+            session.progress(Progress::Output {
+                id: format!("n{i}"),
+                result: Box::new(result.clone()),
+            });
+        }
+        assert!(session.event_bytes <= MAX_FEED_BYTES);
+        assert!(session.output_bytes <= MAX_LIVE_OUTPUT_BYTES);
+        assert!(session.outputs.len() < 8);
+        let retained = session.events.len();
+        let retained_bytes = session.event_bytes;
+        let dropped = session.events_dropped;
+        session.event(FeedBody::Log {
+            text: "x".repeat(MAX_FEED_BYTES + 1),
+            truncated: false,
+        });
+        assert_eq!(session.events.len(), retained);
+        assert_eq!(session.event_bytes, retained_bytes);
+        assert_eq!(session.events_dropped, dropped + 1);
+    }
+
+    #[test]
+    fn nonstreamed_and_reused_outputs_appear_in_feed_in_execution_order() {
+        let workspace = Workspace::new();
+        std::fs::write(
+            workspace.root.join("scripts/feed.sh"),
+            "printf 'script output'\n",
+        )
+        .unwrap();
+        let graph = GraphDoc {
+            name: "feed-script".into(),
+            version: doc::VERSION,
+            nodes: vec![node(
+                "n0",
+                None,
+                NodeData::Script(ScriptConfig {
+                    runtime: Runtime::Shell,
+                    path: "feed.sh".into(),
+                    args: Vec::new(),
+                    timeout_secs: 5,
+                }),
+            )],
+            ..Default::default()
+        };
+        for expected in ["ran", "reused"] {
+            let started = workspace
+                .service
+                .request("start_run", json!({"doc":graph}))
+                .unwrap();
+            let state = workspace.until(|state| state["running"] == false);
+            let events = state["events"].as_array().unwrap();
+            let output = events
+                .iter()
+                .position(|event| event["kind"] == "output")
+                .unwrap();
+            let done = events
+                .iter()
+                .position(|event| event["kind"] == "node" && event["state"] == expected)
+                .unwrap();
+            assert!(done < output);
+            assert_eq!(events[output]["result"]["state"], expected);
+            assert_eq!(events[output]["result"]["preview"], "script output");
+            assert!(!events.iter().any(|event| event["kind"] == "text"));
+            let full = workspace
+                .service
+                .request(
+                    "output",
+                    json!({"graph":"feed-script","run_id":started["run_id"],"node":"n0"}),
+                )
+                .unwrap();
+            assert_eq!(full["text"], "script output");
+            assert_eq!(state["run"]["nodes"]["n0"]["state"], expected);
+        }
+    }
+
+    #[test]
+    fn nested_named_outputs_are_available_live_before_a_review_finishes() {
+        let workspace = Workspace::new();
+        let long = "live output ".repeat(history::PREVIEW_CHARS);
+        let leaf = GraphDoc {
+            name: "leaf".into(),
+            version: doc::VERSION,
+            nodes: vec![node(
+                "n0",
+                Some("value"),
+                NodeData::Input(workflow::InputConfig {
+                    default: long.clone(),
+                    ..Default::default()
+                }),
+            )],
+            outputs: BTreeMap::from([("text".into(), "n0".into())]),
+            ..Default::default()
+        };
+        let middle = GraphDoc {
+            name: "middle".into(),
+            version: doc::VERSION,
+            nodes: vec![node(
+                "n0",
+                None,
+                NodeData::Workflow(calls::Config {
+                    graph: "leaf".into(),
+                    ..Default::default()
+                }),
+            )],
+            outputs: BTreeMap::from([("forward".into(), "n0.text".into())]),
+            ..Default::default()
+        };
+        std::fs::create_dir(workspace.root.join("graphs")).unwrap();
+        for graph in [&leaf, &middle] {
+            std::fs::write(
+                workspace
+                    .root
+                    .join("graphs")
+                    .join(format!("{}.json", graph.name)),
+                serde_json::to_vec(graph).unwrap(),
+            )
+            .unwrap();
+        }
+        let graph = GraphDoc {
+            name: "feed-workflow".into(),
+            version: doc::VERSION,
+            nodes: vec![
+                node(
+                    "n0",
+                    None,
+                    NodeData::Workflow(calls::Config {
+                        graph: "middle".into(),
+                        ..Default::default()
+                    }),
+                ),
+                node(
+                    "n1",
+                    None,
+                    NodeData::File(FileConfig {
+                        path: "feed.txt".into(),
+                        review: true,
+                        ..Default::default()
+                    }),
+                ),
+            ],
+            edges: vec![EdgeDoc {
+                from: "n0".into(),
+                to: "n1".into(),
+                output: Some("forward".into()),
+            }],
+            ..Default::default()
+        };
+        let started = workspace
+            .service
+            .request("start_run", json!({"doc":graph}))
+            .unwrap();
+        let state = workspace.until(|state| state["review"].is_object());
+        let events = state["events"].as_array().unwrap();
+        let outputs = events
+            .iter()
+            .filter(|event| event["kind"] == "output")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outputs
+                .iter()
+                .map(|event| event["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["n0/n0/n0", "n0/n0", "n0"]
+        );
+        assert_eq!(
+            outputs[1]["result"]["named_outputs"]["text"]["complete"],
+            false
+        );
+        assert_eq!(
+            outputs[2]["result"]["named_outputs"]["forward"]["complete"],
+            false
+        );
+        for location in [
+            json!({"node":"n0","call_path":"n0/n0"}),
+            json!({"node":"n0/n0/n0"}),
+            json!({"node":"n0","output":"forward"}),
+            json!({"node":"n0","call_path":"n0","output":"text"}),
+        ] {
+            let mut args = location;
+            args["graph"] = json!("feed-workflow");
+            args["run_id"] = started["run_id"].clone();
+            let output = workspace.service.request("output", args).unwrap();
+            assert_eq!(output["text"], long);
+            assert_eq!(output["complete"], true);
+        }
+        assert!(!workspace.root.join("feed.txt").exists());
+        workspace.service.request("review",json!({"run_id":started["run_id"],"review_id":state["review"]["id"],"decision":"apply"})).unwrap();
+        let done = workspace.until(|state| state["running"] == false);
+        assert!(
+            done["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["kind"] == "output" && event["id"] == "n1")
+        );
+        assert_eq!(
+            done["run"]["calls"]["n0"]["run"]["calls"]["n0"]["run"]["nodes"]["n0"]["preview"],
+            long.chars()
+                .take(history::PREVIEW_CHARS)
+                .collect::<String>()
+        );
+        assert_eq!(history::list(&workspace.root, "feed-workflow").len(), 1);
     }
 
     #[test]

@@ -213,6 +213,12 @@ pub enum Progress {
     Text { id: String, text: String },
     /// A node changed state, so a canvas can show the run moving.
     Node { id: String, state: NodeState },
+    /// A completed or reused output, including published ports. Its bounded
+    /// preview and any retained cache bytes are ready before this is delivered.
+    Output {
+        id: String,
+        result: Box<history::NodeRun>,
+    },
 }
 
 /// Where a node is in the run. A node that is never reached (an upstream failure, a
@@ -1094,6 +1100,22 @@ impl Runner<'_> {
         }
     }
 
+    fn publish_output(&self, id: &str, data: &NodeData, output: &Output, state: history::State) {
+        if let Some(progress) = &self.control.progress {
+            let result = history::record_node(
+                Some(data.clone()),
+                output,
+                state,
+                self.named_outputs.get(id),
+                self.control.cache.as_deref(),
+            );
+            progress(Progress::Output {
+                id: id.to_string(),
+                result: Box::new(result),
+            });
+        }
+    }
+
     fn node(&self, id: &str) -> Result<&NodeDoc, String> {
         self.graph
             .nodes
@@ -1303,14 +1325,21 @@ impl Runner<'_> {
             None => key,
         });
         let cache_id = format!("{}{id}", self.scope.namespace);
-        if let Some(key) = cache_key
-            && !self.control.fresh
-            && let Some(cache) = &self.control.cache
-            && let Some(output) = lock(cache).lookup(&cache_id, key)
-        {
+        let cached = if self.control.fresh {
+            None
+        } else {
+            cache_key.and_then(|key| {
+                self.control
+                    .cache
+                    .as_ref()
+                    .and_then(|cache| lock(cache).lookup(&cache_id, key))
+            })
+        };
+        if let Some(output) = cached {
             self.log(format!("{id}: reused the cached {}", output.label));
             self.reused.push(id.to_string());
             self.state(id, NodeState::Reused);
+            self.publish_output(id, data, &output, history::State::Reused);
             return Ok(Done {
                 key: content_key(data.node_type(), &output),
                 output: Arc::new(output),
@@ -1345,6 +1374,7 @@ impl Runner<'_> {
             }
             let done = result?;
             self.state(id, NodeState::Done);
+            self.publish_output(id, data, &done.output, history::State::Ran);
             return Ok(done);
         }
         let outputs: Vec<Arc<Output>> = inputs.into_iter().map(|(_, done)| done.output).collect();
@@ -1411,6 +1441,7 @@ impl Runner<'_> {
             lock(cache).store(&cache_id, key, output.clone());
         }
         self.state(id, NodeState::Done);
+        self.publish_output(id, data, &output, history::State::Ran);
         let key = if let NodeData::Input(_) = data {
             let name = node.name.as_deref().unwrap_or_default().trim();
             let value = self
@@ -1500,6 +1531,10 @@ impl Runner<'_> {
                     Progress::Workflow { id, graph } => Progress::Workflow {
                         id: format!("{prefix}/{id}"),
                         graph,
+                    },
+                    Progress::Output { id, result } => Progress::Output {
+                        id: format!("{prefix}/{id}"),
+                        result,
                     },
                 })
             }));

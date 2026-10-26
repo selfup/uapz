@@ -73,6 +73,22 @@
       await pause();
     }
     assert(state.review && state.running, "Run did not pause for review");
+    assert(
+      state.events.some(
+        (event) => event.kind === "output" && event.id === "n0",
+      ),
+      "Completed input is missing from the live run feed",
+    );
+    const liveOutput = await request("output", {
+      graph: graph.name,
+      run_id,
+      node: "n0",
+      max_bytes: 256 * 1024,
+    });
+    assert(
+      liveOutput.text === "Native Tauri execution" && liveOutput.complete,
+      "Live output hydration failed",
+    );
     await request("review", {
       run_id,
       review_id: state.review.id,

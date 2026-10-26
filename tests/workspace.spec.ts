@@ -119,6 +119,7 @@ test("running child navigation uses snapshots, preserves reviews and exposes nam
     page.getByRole("region", { name: "Review file changes" }),
   ).toHaveCount(0);
   await page.locator('[data-id="n1"]').click();
+  await page.getByRole("tab", { name: "Node inspector", exact: true }).click();
   await page.getByRole("tab", { name: "Results", exact: true }).click();
   await expect(
     page.locator(".inspector").getByText("Body text", { exact: true }),
