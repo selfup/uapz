@@ -259,17 +259,23 @@ function CanvasInner(props: CanvasProps) {
   );
   const [nodes, setNodes] = useState<CardNode[]>(cards);
   useEffect(() => {
-    // Measurements belong to React Flow, not the persisted graph. Dropping them
-    // during selection or status updates hides nodes until the next measurement,
-    // allowing a double-click's second click to fall through to the pane.
+    // React Flow owns measurements and in-progress drag positions. The graph's
+    // positions are committed on drag stop, so status/selection refreshes must
+    // not restore those older positions while the pointer is still down.
     setNodes((current) => {
-      const measured = new Map(current.map((node) => [node.id, node.measured]));
-      return cards.map((node) => ({
-        ...node,
-        measured: measured.get(node.id),
-      }));
+      const previous = new Map(current.map((node) => [node.id, node]));
+      return cards.map((node) => {
+        const local = previous.get(node.id);
+        return {
+          ...node,
+          measured: local?.measured,
+          ...(!readOnly && local?.dragging
+            ? { position: local.position, dragging: true }
+            : {}),
+        };
+      });
     });
-  }, [cards]);
+  }, [cards, readOnly]);
   useEffect(() => {
     setViewport(viewportOf(graph));
   }, [graph.view.pan_x, graph.view.pan_y, graph.view.zoom]);

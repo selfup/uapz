@@ -198,6 +198,8 @@ export interface Review {
   files: FileReview[];
 }
 export interface RuntimeState {
+  events?: import("./runFeed").RunEvent[];
+  events_dropped?: number;
   run_id: string;
   running: boolean;
   cancelling: boolean;

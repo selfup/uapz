@@ -44,6 +44,7 @@ async function completedRun(page: Page) {
   }, run);
   await expect(page.getByRole("status")).toHaveText("Completed in 0.1s");
   await page.locator('[data-id="n0"]').click();
+  await page.getByRole("tab", { name: "Node inspector", exact: true }).click();
   await page.getByRole("tab", { name: "Results", exact: true }).click();
   return run;
 }
@@ -52,6 +53,7 @@ test("full-output failures preserve the preview and allow a retry", async ({
   page,
 }) => {
   const run = await completedRun(page);
+  const previousOutputCalls = (await callsFor(page, "output")).length;
   await queueReply(page, {
     method: "output",
     error: "Output cache is temporarily unavailable",
@@ -82,7 +84,7 @@ test("full-output failures preserve the preview and allow a retry", async ({
   await expect(
     page.getByText("Preview truncated.", { exact: true }),
   ).toHaveCount(0);
-  const calls = await callsFor(page, "output");
+  const calls = (await callsFor(page, "output")).slice(previousOutputCalls);
   expect(calls).toHaveLength(2);
   expect(calls.map((call) => call.args)).toEqual(
     Array(2).fill({ graph: "Demo", run_id: run.id, node: "n0" }),

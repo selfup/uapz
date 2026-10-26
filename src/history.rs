@@ -164,6 +164,58 @@ pub fn graph_name(name: &str) -> String {
     validate::file_stem(name)
 }
 
+/// Capture one completed output using the same cache keys and preview policy for
+/// live progress and persisted runs. No output bytes are embedded in the record.
+pub(crate) fn record_node(
+    data: Option<NodeData>,
+    output: &Output,
+    state: State,
+    named_outputs: Option<&BTreeMap<String, Output>>,
+    cache: Option<&Mutex<Cache>>,
+) -> NodeRun {
+    let key = data
+        .as_ref()
+        .map(|data| exec::content_key(data.node_type(), output));
+    let kept = match (key, cache) {
+        (Some(key), Some(cache)) => exec::lock(cache).keep(key, output),
+        _ => false,
+    };
+    let mut node = NodeRun::empty(state, data);
+    node.label = Some(output.label.clone());
+    node.saved = output.saved.clone();
+    node.key = kept.then(|| format!("{:032x}", key.unwrap_or_default()));
+    if let Some(text) = output.as_text() {
+        node.preview = text.chars().take(PREVIEW_CHARS).collect();
+        node.complete = text.chars().count() <= PREVIEW_CHARS;
+    }
+    node.named_outputs = named_outputs
+        .into_iter()
+        .flatten()
+        .map(|(name, output)| {
+            let saved = serde_json::to_vec(&output.saved).unwrap_or_default();
+            let key = exec::key_of(&[
+                b"workflow-history-port-v1",
+                name.as_bytes(),
+                &[u8::from(output.text)],
+                output.label.as_bytes(),
+                &saved,
+                &output.bytes,
+            ]);
+            let kept = cache.is_some_and(|cache| exec::lock(cache).keep(key, output));
+            let mut port = NodeRun::empty(state, None);
+            port.label = Some(output.label.clone());
+            port.saved = output.saved.clone();
+            port.key = kept.then(|| format!("{key:032x}"));
+            if let Some(text) = output.as_text() {
+                port.preview = text.chars().take(PREVIEW_CHARS).collect();
+                port.complete = text.chars().count() <= PREVIEW_CHARS;
+            }
+            (name.clone(), port)
+        })
+        .collect();
+    node
+}
+
 /// Build the record of a finished run. Every output is also handed to the cache under its
 /// content key, so the run can be reopened in full later.
 pub fn record(
@@ -180,21 +232,6 @@ pub fn record(
     };
     let mut nodes = BTreeMap::new();
     for (id, output) in &report.outputs {
-        let data = data_of(id);
-        let key = data
-            .as_ref()
-            .map(|d| exec::content_key(d.node_type(), output));
-        let kept = match (key, cache) {
-            (Some(key), Some(cache)) => exec::lock(cache).keep(key, output),
-            _ => false,
-        };
-        let (preview, complete) = match output.as_text() {
-            Some(text) => (
-                text.chars().take(PREVIEW_CHARS).collect::<String>(),
-                text.chars().count() <= PREVIEW_CHARS,
-            ),
-            None => (String::new(), false),
-        };
         let state = if report.reused.contains(id) {
             State::Reused
         } else {
@@ -202,43 +239,13 @@ pub fn record(
         };
         nodes.insert(
             id.clone(),
-            NodeRun {
-                named_outputs: report
-                    .named_outputs
-                    .get(id)
-                    .into_iter()
-                    .flatten()
-                    .map(|(name, output)| {
-                        let saved = serde_json::to_vec(&output.saved).unwrap_or_default();
-                        let key = exec::key_of(&[
-                            b"workflow-history-port-v1",
-                            name.as_bytes(),
-                            &[u8::from(output.text)],
-                            output.label.as_bytes(),
-                            &saved,
-                            &output.bytes,
-                        ]);
-                        let kept = cache.is_some_and(|cache| exec::lock(cache).keep(key, output));
-                        let mut port = NodeRun::empty(state, None);
-                        port.label = Some(output.label.clone());
-                        port.saved = output.saved.clone();
-                        port.key = kept.then(|| format!("{key:032x}"));
-                        if let Some(text) = output.as_text() {
-                            port.preview = text.chars().take(PREVIEW_CHARS).collect();
-                            port.complete = text.chars().count() <= PREVIEW_CHARS;
-                        }
-                        (name.clone(), port)
-                    })
-                    .collect(),
+            record_node(
+                data_of(id),
+                output,
                 state,
-                data,
-                label: Some(output.label.clone()),
-                saved: output.saved.clone(),
-                key: kept.then(|| format!("{:032x}", key.unwrap_or_default())),
-                preview,
-                complete,
-                error: None,
-            },
+                report.named_outputs.get(id),
+                cache,
+            ),
         );
     }
     let outcome = match &report.result {

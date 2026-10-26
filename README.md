@@ -9,8 +9,9 @@ Graphs save as a Markdown file with a Mermaid diagram plus a JSON sidecar, and r
 agents, prompts and databases save into their own directories so they show up in the
 sidebar.
 
-Nodes run from the inspector. A node runs after everything wired into it, text flows along
-the wires, agent answers stream into the panel as they are generated, and every agent
+Run the whole workflow from the header or a selected node from the inspector. A node
+runs after everything wired into it, text flows along the wires, agent answers stream
+into the workflow's Run output panel as they are generated, and every agent
 result is saved under that agent with a timestamp. Outputs are cached between runs, so
 running a downstream node again does not re-call the agents above it unless something they
 depend on changed.
@@ -70,7 +71,8 @@ chains, timeouts, the cache, cancellation, write-file nodes), streamed replies i
 provider's shape and the request shape for every provider. Frontend unit tests cover
 graph edits, snapshot selection, output comparisons and the IPC wrapper. Browser tests
 cover named-port wiring, labels and colors, keyboard edits, read-only children, saved
-positions, run and review recovery, and delayed save, navigation and output responses:
+positions during live status updates, run and review recovery, workflow-wide output,
+automatic scrolling and scrollback, and delayed save, navigation and output responses:
 
 ```sh
 cargo fmt --all --check
@@ -163,6 +165,16 @@ the footer, including while inspecting a child workflow.
 
 **Inspector**
 
+- The right panel separates **Node inspector** from **Run output**. Starting a run
+  opens Run output automatically. It collects progress, streamed answers and completed
+  results from every node, including cached results, named outputs and child workflows.
+  Selecting nodes or navigating children during execution keeps this feed open.
+  Scroll up to pause automatic following; **Follow output** returns to the latest activity.
+  Failed steps retain their partial streamed answers in the current feed.
+- Large outputs initially load up to 256 KiB; **Load full output** retrieves the rest.
+  The live feed retains up to 2,048 events and 2 MiB, with notices for omitted entries.
+  Completed outputs remain accessible through run history and the cache, subject to
+  their existing retention limits.
 - Select a node and its content appears as a form. Every edit writes straight back into
   the node; nothing is saved to disk until you save the graph or a preset.
 - **Configure**, **Results** and **History** separate editing from execution. Configure

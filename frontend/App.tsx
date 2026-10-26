@@ -23,6 +23,7 @@ import {
 } from "lucide-react";
 import Canvas from "./Canvas";
 import Inspector from "./Inspector";
+import RunPanel from "./RunPanel";
 import { request } from "./api";
 import {
   defaultNodeData,
@@ -105,6 +106,7 @@ export default function App() {
     issues: Issue[];
   } | null>(null);
   const [form, setForm] = useState<RunForm | null>(null);
+  const [panel, setPanel] = useState<"inspector" | "run">("inspector");
   const [query, setQuery] = useState("");
   const [notice, setNotice] = useState("Ready");
   const [error, setError] = useState<string | null>(null);
@@ -130,6 +132,8 @@ export default function App() {
   const documentEpoch = useRef(0);
   const graphRef = useRef(graph);
   graphRef.current = graph;
+  const historicalRef = useRef(historical);
+  historicalRef.current = historical;
   const saveInFlight = useRef(false);
   const rootNavigation = useRef(0);
   const childNavigation = useRef(0);
@@ -234,6 +238,7 @@ export default function App() {
           if (state?.running && documentEpoch.current === 0) {
             setGraph(normalizeGraph(state.graph));
             setAttachedRun(state.run_id);
+            setPanel("run");
             setDirty(true);
           }
         }
@@ -244,29 +249,35 @@ export default function App() {
           state.run_id === attachedRun
         ) {
           lastCompleted.current = state.run_id;
-          if (state.run_id === attachedRun) {
+          // Review responses can expose finished state before this poll sees
+          // it. Keep a history run explicitly selected in that interval while
+          // still recording the newly completed results and refreshing history.
+          const showCompletion = !historicalRef.current;
+          if (showCompletion) {
             setShownRun(state.run);
             setHistorical(false);
-            const run = state.run;
-            setRemembered((current) => ({
-              nodes: { ...current.nodes, ...run.nodes },
-              origins: {
-                ...current.origins,
-                ...Object.fromEntries(
-                  Object.keys(run.nodes).map((id) => [id, run]),
-                ),
-              },
-            }));
-            void refreshHistory(graph.name);
           }
-          setNotice(
-            state.run.outcome.kind === "ok"
-              ? `Completed in ${(state.run.elapsed_ms / 1000).toFixed(1)}s`
-              : state.run.outcome.kind === "cancelled"
-                ? "Run cancelled"
-                : "Run failed",
-          );
-          if (state.error) setError(state.error);
+          const run = state.run;
+          setRemembered((current) => ({
+            nodes: { ...current.nodes, ...run.nodes },
+            origins: {
+              ...current.origins,
+              ...Object.fromEntries(
+                Object.keys(run.nodes).map((id) => [id, run]),
+              ),
+            },
+          }));
+          void refreshHistory(graph.name);
+          if (showCompletion) {
+            setNotice(
+              state.run.outcome.kind === "ok"
+                ? `Completed in ${(state.run.elapsed_ms / 1000).toFixed(1)}s`
+                : state.run.outcome.kind === "cancelled"
+                  ? "Run cancelled"
+                  : "Run failed",
+            );
+            if (state.error) setError(state.error);
+          }
         }
       } catch (error) {
         if (!disposed) setError(messageOf(error));
@@ -342,6 +353,7 @@ export default function App() {
     setDirty(true);
   }
   function selectNode(id: string | null) {
+    if (id && !occupied) setPanel("inspector");
     if (readOnly)
       setChildren((items) =>
         items.map((item, index) =>
@@ -380,6 +392,7 @@ export default function App() {
     if (data && !kind) node.color = nodeColor(node);
     updateGraph({ ...graph, nodes: [...graph.nodes, node] });
     setSelected(id);
+    setPanel("inspector");
   }
   function confirmAction(message: string) {
     return new Promise<boolean>((resolve) =>
@@ -407,6 +420,7 @@ export default function App() {
     setAttachedRun(null);
     setDirty(false);
     setNotice("New workflow");
+    setPanel("inspector");
   }
   async function openGraph(name: string) {
     if (occupied) return;
@@ -431,6 +445,7 @@ export default function App() {
     setAttachedRun(null);
     setDirty(false);
     setNotice(`Opened ${name}`);
+    setPanel("inspector");
   }
   async function save() {
     if (readOnly || saveInFlight.current) return;
@@ -513,6 +528,8 @@ export default function App() {
       setAttachedRun(started.run_id);
       setForm(null);
       setShownRun(null);
+      setHistorical(false);
+      setPanel("run");
       setNotice("Workflow is running");
       setRuntime(await request<RuntimeState>("runtime_state"));
     } catch (error) {
@@ -539,6 +556,7 @@ export default function App() {
       graph: structuredClone(graph),
       fresh,
     };
+    setPanel("run");
     if (prepared.fields.length) {
       setForm(form);
       setNotice("Fill in the run inputs");
@@ -1185,6 +1203,47 @@ export default function App() {
           onPointerDown={(event) => resize("right", event)}
         />
         <aside className="inspector-column">
+          <div
+            className="workspace-panel-tabs"
+            role="tablist"
+            aria-label="Workspace panel"
+          >
+            {(["inspector", "run"] as const).map((mode, index) => (
+              <button
+                key={mode}
+                id={`workspace-tab-${mode}`}
+                role="tab"
+                aria-selected={panel === mode}
+                aria-controls={`workspace-panel-${mode}`}
+                tabIndex={panel === mode ? 0 : -1}
+                onClick={() => setPanel(mode)}
+                onKeyDown={(event) => {
+                  if (
+                    !["ArrowLeft", "ArrowRight", "Home", "End"].includes(
+                      event.key,
+                    )
+                  )
+                    return;
+                  event.preventDefault();
+                  const next =
+                    event.key === "Home"
+                      ? "inspector"
+                      : event.key === "End"
+                        ? "run"
+                        : index === 0
+                          ? "run"
+                          : "inspector";
+                  setPanel(next);
+                  document.getElementById(`workspace-tab-${next}`)?.focus();
+                }}
+              >
+                {mode === "inspector" ? "Node inspector" : "Run output"}
+                {mode === "run" && running && runMatches && (
+                  <span className="status-dot active" />
+                )}
+              </button>
+            ))}
+          </div>
           {!readOnly && form && (
             <section className="run-form" aria-label="Run inputs">
               <div className="section-title">
@@ -1277,97 +1336,120 @@ export default function App() {
               onCancel={() => void action(cancelRun)}
             />
           )}
-          <Inspector
-            graph={activeGraph}
-            node={activeNode}
-            readOnly={readOnly}
-            onChange={updateNode}
-            onGraphChange={updateGraph}
-            workflowGraphs={workflowGraphs}
-            library={library || undefined}
-            issues={
-              !readOnly && validation?.key === validationKey
-                ? validation.issues
-                : undefined
-            }
-            results={
-              readOnly || historical ? childRun?.nodes : remembered.nodes
-            }
-            activeRun={childRun}
-            history={readOnly ? (childRun ? [childRun] : []) : history}
-            running={running && runMatches}
-            log={liveLog}
-            stream={liveStream}
-            onRun={(fresh) =>
-              void action(() => prepareRun(fresh, selected || undefined))
-            }
-            onDelete={() => {
-              if (selected && !readOnly) {
-                updateGraph(deleteNodes(graph, [selected]));
-                setSelected(null);
+          <div
+            className="workspace-panel-body"
+            role="tabpanel"
+            id="workspace-panel-run"
+            aria-labelledby="workspace-tab-run"
+            hidden={panel !== "run"}
+          >
+            <RunPanel
+              graph={graph}
+              runtime={runMatches && !historical ? runtime : null}
+              run={currentRun}
+            />
+          </div>
+          <div
+            className="workspace-panel-body"
+            role="tabpanel"
+            id="workspace-panel-inspector"
+            aria-labelledby="workspace-tab-inspector"
+            hidden={panel !== "inspector"}
+          >
+            <Inspector
+              graph={activeGraph}
+              node={activeNode}
+              readOnly={readOnly}
+              onChange={updateNode}
+              onGraphChange={updateGraph}
+              workflowGraphs={workflowGraphs}
+              library={library || undefined}
+              issues={
+                !readOnly && validation?.key === validationKey
+                  ? validation.issues
+                  : undefined
               }
-            }}
-            onOpenHistory={(id) => {
-              if (occupied || readOnly) return;
-              const run = history.find((run) => run.id === id);
-              if (run) {
-                setShownRun(run);
-                setHistorical(true);
-                setNotice(`Showing run ${run.id}`);
+              results={
+                readOnly || historical ? childRun?.nodes : remembered.nodes
               }
-            }}
-            onOpenWorkflow={(id) => void action(() => openChild(id))}
-            onLibraryChanged={() =>
-              void action(async () => {
-                await refreshLibrary();
-              })
-            }
-            outputContext={
-              outputRun
-                ? {
-                    graph: outputRun.graph,
-                    runId: outputRun.id,
-                    ...(childPath ? { callPath: childPath } : {}),
+              activeRun={childRun}
+              history={readOnly ? (childRun ? [childRun] : []) : history}
+              running={running && runMatches}
+              log={liveLog}
+              stream={liveStream}
+              onRun={(fresh) =>
+                void action(() => prepareRun(fresh, selected || undefined))
+              }
+              onDelete={() => {
+                if (selected && !readOnly) {
+                  updateGraph(deleteNodes(graph, [selected]));
+                  setSelected(null);
+                }
+              }}
+              onOpenHistory={(id) => {
+                if (occupied || readOnly) return;
+                const run = history.find((run) => run.id === id);
+                if (run) {
+                  historicalRef.current = true;
+                  setShownRun(run);
+                  setHistorical(true);
+                  setPanel("run");
+                  setNotice(`Showing run ${run.id}`);
+                }
+              }}
+              onOpenWorkflow={(id) => void action(() => openChild(id))}
+              onLibraryChanged={() =>
+                void action(async () => {
+                  await refreshLibrary();
+                })
+              }
+              outputContext={
+                outputRun
+                  ? {
+                      graph: outputRun.graph,
+                      runId: outputRun.id,
+                      ...(childPath ? { callPath: childPath } : {}),
+                    }
+                  : undefined
+              }
+            />
+            {!readOnly && library && (
+              <div className="history-tools">
+                <button
+                  disabled={running}
+                  onClick={() =>
+                    void action(async () => {
+                      const count = await request<number>("clear_cache");
+                      setNotice(`Cleared ${count} cached outputs`);
+                    })
                   }
-                : undefined
-            }
-          />
-          {!readOnly && library && (
-            <div className="history-tools">
-              <button
-                disabled={running}
-                onClick={() =>
-                  void action(async () => {
-                    const count = await request<number>("clear_cache");
-                    setNotice(`Cleared ${count} cached outputs`);
-                  })
-                }
-              >
-                Clear cache
-              </button>
-              <button
-                disabled={running || !history.length}
-                onClick={() =>
-                  void action(async () => {
-                    if (
-                      !(await confirmAction(
-                        `Clear run history for ${graph.name}?`,
-                      ))
-                    )
-                      return;
-                    await request("clear_history", { graph: graph.name });
-                    setHistory([]);
-                    setShownRun(null);
-                    setAttachedRun(null);
-                    setRemembered({ nodes: {}, origins: {} });
-                    setNotice("History cleared");
-                  })
-                }
-              >
-                Clear history
-              </button>
-            </div>
-          )}
+                >
+                  Clear cache
+                </button>
+                <button
+                  disabled={running || !history.length}
+                  onClick={() =>
+                    void action(async () => {
+                      if (
+                        !(await confirmAction(
+                          `Clear run history for ${graph.name}?`,
+                        ))
+                      )
+                        return;
+                      await request("clear_history", { graph: graph.name });
+                      setHistory([]);
+                      setShownRun(null);
+                      setAttachedRun(null);
+                      setRemembered({ nodes: {}, origins: {} });
+                      setNotice("History cleared");
+                    })
+                  }
+                >
+                  Clear history
+                </button>
+              </div>
+            )}
+          </div>
         </aside>
       </main>
       {confirmation && (
