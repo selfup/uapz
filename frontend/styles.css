@@ -463,6 +463,8 @@ button.primary:hover:not(:disabled) {
 }
 .inspector-column {
   width: var(--inspector-width);
+  /* Keep the canvas and both dividers visible as the window or library resizes. */
+  max-width: max(300px, calc(100% - var(--library-width) - 248px));
   flex-shrink: 0;
   display: flex;
   flex-direction: column;

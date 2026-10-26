@@ -128,6 +128,7 @@ export default function App() {
   } | null>(null);
   const [leftWidth, setLeftWidth] = useState(246);
   const [rightWidth, setRightWidth] = useState(370);
+  const inspectorColumn = useRef<HTMLElement>(null);
   const lastCompleted = useRef<string | null>(null);
   const documentEpoch = useRef(0);
   const graphRef = useRef(graph);
@@ -744,13 +745,23 @@ export default function App() {
   function resize(side: "left" | "right", event: React.PointerEvent) {
     event.preventDefault();
     const start = event.clientX;
-    const width = side === "left" ? leftWidth : rightWidth;
+    // Start from the rendered width when a smaller window has constrained it.
+    const width =
+      side === "left"
+        ? leftWidth
+        : (inspectorColumn.current?.getBoundingClientRect().width ??
+          rightWidth);
+    const workspaceWidth =
+      event.currentTarget.parentElement?.clientWidth ?? window.innerWidth;
+    // Leave 240 px for the canvas and 8 px for the two panel dividers.
+    const maximum =
+      side === "left" ? 380 : Math.max(300, workspaceWidth - leftWidth - 248);
     const move = (e: PointerEvent) =>
       (side === "left" ? setLeftWidth : setRightWidth)(
         Math.max(
           side === "left" ? 190 : 300,
           Math.min(
-            side === "left" ? 380 : 600,
+            maximum,
             width + (side === "left" ? e.clientX - start : start - e.clientX),
           ),
         ),
@@ -1346,7 +1357,7 @@ export default function App() {
           aria-label="Resize inspector"
           onPointerDown={(event) => resize("right", event)}
         />
-        <aside className="inspector-column">
+        <aside className="inspector-column" ref={inspectorColumn}>
           <div
             className="workspace-panel-tabs"
             role="tablist"
