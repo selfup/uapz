@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { GraphDoc } from "./types";
+import type { EdgeDoc, GraphDoc, NodeDoc } from "./types";
 import {
   assignPublications,
   connectNodes,
@@ -10,13 +10,16 @@ import {
   nextNodeId,
   nodeColor,
   nodeLabel,
+  nodeSummary,
   publishOutput,
   sinkIds,
+  typedData,
   visibleEdgeHandle,
   workflowPorts,
 } from "./graph";
 
-const doc = (): GraphDoc => ({
+type FixtureDoc = GraphDoc & { nodes: [NodeDoc, NodeDoc]; edges: [EdgeDoc] };
+const doc = (): FixtureDoc => ({
   version: 1,
   name: "parent",
   view: { pan_x: 20, pan_y: -10, zoom: 2 },
@@ -42,6 +45,38 @@ const child = (outputs: Record<string, string>): GraphDoc => ({
 });
 
 describe("named workflow ports", () => {
+  it("ignores inherited workflow entries while retaining own prototype-named ports", () => {
+    const graph = doc();
+    const inherited = Object.create({ n2: child({ leaked: "n1" }) });
+    expect(workflowPorts(graph, graph.nodes[0], inherited)).toEqual([]);
+    const outputs = Object.fromEntries([
+      ["__proto__", "n1"],
+      ["constructor", "n1"],
+    ]);
+    expect(
+      workflowPorts(graph, graph.nodes[0], { n2: child(outputs) }),
+    ).toEqual([
+      { id: "__proto__", missing: false },
+      { id: "constructor", missing: false },
+    ]);
+    expect(
+      connectNodes(graph, "n2", "n7", "constructor", { n2: child(outputs) })
+        .edges[1]?.output,
+    ).toBe("constructor");
+  });
+
+  it("requires own workflow map entries even for prototype-like legacy node IDs", () => {
+    const graph = doc();
+    graph.nodes[0].id = "__proto__";
+    expect(workflowPorts(graph, graph.nodes[0], {})).toEqual([]);
+    const workflows = Object.fromEntries([
+      ["__proto__", child({ summary: "n1" })],
+    ]);
+    expect(workflowPorts(graph, graph.nodes[0], workflows)).toEqual([
+      { id: "summary", missing: false },
+    ]);
+  });
+
   it("anchors a legacy default wire to the sole available port without rewriting it", () => {
     const graph = doc();
     const before = JSON.stringify(graph);
@@ -99,6 +134,20 @@ describe("named workflow ports", () => {
 });
 
 describe("publications", () => {
+  it("does not mistake inherited publications for unchanged stale exports", () => {
+    const graph = doc();
+    graph.outputs = Object.create({
+      constructor: "missing",
+      hidden: "missing",
+    });
+    for (const name of ["constructor", "hidden"])
+      expect(() => assignPublications(graph, { [name]: "missing" })).toThrow();
+    graph.outputs = Object.fromEntries([["constructor", "missing"]]);
+    expect(
+      assignPublications(graph, { constructor: "missing" }).outputs,
+    ).toEqual({ constructor: "missing" });
+  });
+
   it("forwards named handles and replaces aliases for only that exact port", () => {
     const graph = doc();
     graph.outputs = {
@@ -155,6 +204,96 @@ describe("publications", () => {
     expect(Object.keys(changed.outputs!)).toContain("__proto__");
     expect(changed.outputs?.__proto__).toBe("n7");
     expect(changed.outputs?.constructor).toBe("n7");
+  });
+});
+
+describe("safe node IDs", () => {
+  const withIds = (ids: string[]): GraphDoc => ({
+    ...doc(),
+    nodes: ids.map((id) => ({ id, x: 0, y: 0 })),
+  });
+
+  it("ignores unsafe and overflowing numeric suffixes while preserving ordinary successors", () => {
+    const graph = withIds([
+      "n2",
+      "n0007",
+      "n9007199254740992",
+      `n${"9".repeat(400)}`,
+      "custom",
+    ]);
+    expect(nextNodeId(graph)).toBe("n8");
+    expect(graph.nodes.some((node) => node.id === nextNodeId(graph))).toBe(
+      false,
+    );
+  });
+
+  it("fills a bounded gap when the maximum safe ID already exists", () => {
+    const graph = withIds([
+      `n${Number.MAX_SAFE_INTEGER}`,
+      "n9007199254740992",
+      "n1",
+      "n2",
+      "n4",
+    ]);
+    expect(nextNodeId(graph)).toBe("n3");
+    expect(Number.isSafeInteger(Number(nextNodeId(graph).slice(1)))).toBe(true);
+    expect(nextNodeId(withIds([`n${Number.MAX_SAFE_INTEGER - 1}`]))).toBe(
+      `n${Number.MAX_SAFE_INTEGER}`,
+    );
+  });
+
+  it("allocates on a wide graph without spreading nodes into function arguments", () => {
+    expect(
+      nextNodeId(
+        withIds(Array.from({ length: 150_000 }, (_, index) => `n${index + 1}`)),
+      ),
+    ).toBe("n150001");
+  });
+});
+
+describe("runtime node data", () => {
+  const withData = (data: unknown): NodeDoc =>
+    ({ id: "n1", x: 0, y: 0, data }) as NodeDoc;
+
+  it("treats unknown, inherited and non-object discriminators as blank", () => {
+    for (const data of [
+      undefined,
+      null,
+      "agent",
+      0,
+      true,
+      [],
+      { type: "unknown" },
+      { type: "__proto__" },
+      { type: "constructor" },
+      Object.create({ type: "agent" }),
+    ]) {
+      const node = withData(data);
+      expect(typedData(node)).toBeUndefined();
+      expect(nodeLabel(node)).toBe("Blank node");
+      expect(nodeColor(node)).toBe("#9ca3af");
+      expect(typeof nodeSummary(node)).toBe("string");
+    }
+  });
+
+  it("renders partial known configurations without crashing before validation", () => {
+    for (const type of [
+      "agent",
+      "database",
+      "directory",
+      "file",
+      "input",
+      "data",
+      "script",
+      "workflow",
+    ]) {
+      expect(nodeSummary(withData({ type }))).toBeTruthy();
+    }
+    expect(
+      nodeSummary(
+        withData({ type: "agent", provider: "constructor", model: "m" }),
+      ),
+    ).toBe("Constructor · m");
   });
 });
 

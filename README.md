@@ -93,6 +93,13 @@ can fail individual requests or hold them until explicitly released, so response
 regressions do not depend on arbitrary delays. Unexpected browser errors and warnings
 fail the tests.
 
+Frontend requests use a typed method/argument/result contract and validate IPC
+responses before updating the workspace. Malformed graphs, history, runtime state
+and outputs produce an error without replacing the open document. TypeScript also
+checks unchecked array/record access, switch fallthrough and implicit overrides.
+Regression tests cover delayed run preparation, status replies and inspector actions
+so late responses cannot overwrite newer edits or restore completed reviews.
+
 The opt-in native smoke test starts the real Tauri webview and exercises IPC, graph
 save/load, run inputs, file review, execution, output loading and history. It is available
 in debug builds and requires an explicit disposable workspace because it creates a

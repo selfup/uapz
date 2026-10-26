@@ -114,6 +114,31 @@
       output.text.includes("Native Tauri execution"),
       "Output hydration failed",
     );
+    // Exercise the renderer's typed/validated IPC boundary with native data too.
+    document.querySelector('button[aria-label="Refresh library"]').click();
+    let graphButton;
+    for (let i = 0; i < 100; i++) {
+      graphButton = [...document.querySelectorAll(".library-item")].find(
+        (button) => button.textContent.trim() === graph.name,
+      );
+      if (graphButton) break;
+      await pause();
+    }
+    assert(graphButton, "Saved graph was not listed in the renderer");
+    graphButton.click();
+    for (let i = 0; i < 100; i++) {
+      if (document.querySelectorAll(".react-flow__node").length === 2) break;
+      await pause();
+    }
+    assert(
+      document.querySelectorAll(".react-flow__node").length === 2,
+      "Native graph did not pass renderer validation",
+    );
+    assert(
+      !document.querySelector(".error-banner"),
+      document.querySelector(".error-banner")?.textContent ||
+        "Renderer IPC error",
+    );
     await invoke("smoke_result", { error: null });
   } catch (error) {
     await invoke("smoke_result", { error: String(error?.stack || error) });

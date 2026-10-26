@@ -1,6 +1,18 @@
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { request } from "./api";
-import type { GraphDoc, NodeDoc, NodeData } from "./types";
+import type { FullOutput } from "./protocol";
+import { isNodeData } from "./types";
+import type {
+  Binding,
+  Field,
+  GraphDoc,
+  Issue,
+  Library,
+  NodeDoc,
+  NodeData,
+  NodeRun,
+  Run,
+} from "./types";
 import {
   isNamedWorkflow,
   nodeLabel,
@@ -12,109 +24,22 @@ import {
 import { compareNodeOutputs, sameNodeConfig } from "./inspectorState";
 import "./inspector.css";
 
-type Auth = { kind: "none" } | { kind: "env"; var: string };
-type Agent = {
-  type: "agent";
-  provider: string;
-  endpoint: string;
-  model_type: string;
-  model: string;
-  auth: Auth;
-  prompt: string;
-  message?: string;
-  context_size: number;
-  temperature: number;
-  output: string;
-};
-type Database = {
-  type: "database";
-  engine: string;
-  path: string;
-  url_env: string;
-  input: string;
-  input_table: string;
-  query: string;
-  read_only: boolean;
-};
-type Binding =
-  { kind: "value"; value: string } | { kind: "output"; node: string };
-type Input = {
-  type: "input";
-  kind: string;
-  default: string;
-  required: boolean;
-};
-type Workflow = {
-  type: "workflow";
-  graph: string;
-  output: string;
-  inputs: Record<string, Binding>;
-};
-type Script = {
-  type: "script";
-  runtime: string;
-  path: string;
-  args: string[];
-  timeout_secs: number;
-};
-type Data = { type: "data"; path: string; format: string };
-type Directory = {
-  type: "directory";
-  path: string;
-  include: string[];
-  exclude: string[];
-  gitignore: boolean;
-  contents: boolean;
-  max_files: number;
-  max_bytes: number;
-};
-type File = {
-  type: "file";
-  path: string;
-  mode: string;
-  unfence: boolean;
-  bundle: boolean;
-  review?: boolean;
-};
-type Config =
-  Agent | Database | Input | Workflow | Script | Data | Directory | File;
-type Field = { node: string; name: string; config: Omit<Input, "type"> };
-export type InspectorIssue = { field: string; message: string; node?: string };
-export type InspectorNodeResult = {
-  state: string;
-  data?: NodeData | null;
-  label?: string | null;
-  saved?: string | null;
-  preview?: string;
-  complete?: boolean;
-  error?: string | null;
-  key?: string | null;
-  named_outputs?: Record<string, InspectorNodeResult>;
-};
-export type InspectorRun = {
-  id: string;
-  graph: string;
-  targets: string[];
-  elapsed_ms: number;
-  outcome: { kind: string; error?: string };
-  nodes: Record<string, InspectorNodeResult>;
-  log: string[];
-  inputs?: Record<string, string>;
-  workflows?: Record<string, GraphDoc>;
-  calls?: Record<string, { graph: GraphDoc; run: InspectorRun }>;
-};
-export type InspectorLibrary = {
-  agents: { name: string; config: Omit<Agent, "type"> }[];
-  databases: { name: string; config: Omit<Database, "type"> }[];
-  prompts: string[];
-  graphs: string[];
-  scripts: string[];
-  data: string[];
-};
+type Config = NodeData;
+type Agent = Extract<NodeData, { type: "agent" }>;
+type Database = Extract<NodeData, { type: "database" }>;
+type Workflow = Extract<NodeData, { type: "workflow" }>;
+export type InspectorIssue = Issue;
+export type InspectorNodeResult = NodeRun;
+export type InspectorRun = Run;
+export type InspectorLibrary = Pick<
+  Library,
+  "agents" | "databases" | "prompts" | "graphs" | "scripts" | "data"
+>;
 export type InspectorProps = {
   graph: GraphDoc;
   node: NodeDoc | null;
   readOnly?: boolean;
+  scopeKey?: string | number;
   onChange: (node: NodeDoc) => void;
   onPublish?: (handle: string, name: string) => void;
   onGraphChange?: (graph: GraphDoc) => void;
@@ -135,14 +60,6 @@ export type InspectorProps = {
   onLibraryChanged?: () => void;
 };
 type OutputContext = { graph: string; runId: string; callPath?: string };
-type FullOutput = {
-  label: string;
-  text: string | null;
-  base64: string | null;
-  saved: string | null;
-  complete: boolean;
-  media_type?: string | null;
-};
 
 const EMPTY_LIBRARY: InspectorLibrary = {
   agents: [],
@@ -162,7 +79,7 @@ const LABELS: Record<Config["type"], string> = {
   directory: "Directory",
   file: "Write file",
 };
-const PROVIDERS = [
+const PROVIDERS: readonly (readonly [Agent["provider"], string])[] = [
   ["ollama", "Ollama"],
   ["lmstudio", "LM Studio"],
   ["llamacpp", "llama.cpp"],
@@ -174,7 +91,7 @@ const PROVIDERS = [
   ["custom", "Custom · OpenAI compatible"],
 ];
 const PROVIDER_DEFAULTS: Record<
-  string,
+  Agent["provider"],
   { endpoint: string; model: string; env: string }
 > = {
   ollama: { endpoint: "http://localhost:11434", model: "llama3.1", env: "" },
@@ -207,7 +124,7 @@ const PROVIDER_DEFAULTS: Record<
   },
   custom: { endpoint: "", model: "", env: "" },
 };
-const DEFAULTS: Record<Config["type"], Config> = {
+const DEFAULTS: { [K in Config["type"]]: Extract<Config, { type: K }> } = {
   agent: {
     type: "agent",
     provider: "ollama",
@@ -260,18 +177,27 @@ const DEFAULTS: Record<Config["type"], Config> = {
     review: false,
   },
 };
+const NODE_TYPES = [
+  "agent",
+  "database",
+  "input",
+  "workflow",
+  "script",
+  "data",
+  "directory",
+  "file",
+] as const;
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }
 function nodeConfig(node: NodeDoc | null): Config | null {
-  const data = node?.data as Config | null | undefined;
-  return data?.type && data.type in DEFAULTS ? data : null;
+  const data = node?.data;
+  return isNodeData(data) && data.type in DEFAULTS ? data : null;
 }
-function bareConfig(data: Config) {
-  const result = { ...data } as Record<string, unknown>;
-  delete result.type;
-  return result;
+function bareConfig<T extends Config>(data: T) {
+  const { type: _type, ...config } = data;
+  return config;
 }
 
 function FieldControl({
@@ -351,7 +277,7 @@ function Text({
     </FieldControl>
   );
 }
-function Select({
+function Select<T extends string>({
   label,
   value,
   onChange,
@@ -359,9 +285,9 @@ function Select({
   help,
 }: {
   label: string;
-  value: string;
-  onChange: (value: string) => void;
-  options: string[][];
+  value: NoInfer<T>;
+  onChange: (value: T) => void;
+  options: readonly (readonly [T, string])[];
   help?: string;
 }) {
   return (
@@ -370,7 +296,12 @@ function Select({
         <select
           id={id}
           value={value}
-          onChange={(event) => onChange(event.target.value)}
+          onChange={(event) => {
+            const selected = options.find(
+              ([option]) => option === event.currentTarget.value,
+            );
+            if (selected) onChange(selected[0]);
+          }}
         >
           {!options.some((option) => option[0] === value) && (
             <option value={value}>{value || "Choose…"}</option>
@@ -519,8 +450,7 @@ export default function Inspector(props: InspectorProps) {
     >
   >({});
   const [schema, setSchema] = useState<{
-    node: string;
-    graph: string;
+    revision: number;
     text: string;
   } | null>(null);
   const [child, setChild] = useState<{
@@ -532,15 +462,33 @@ export default function Inspector(props: InspectorProps) {
   const config = nodeConfig(node);
   const serialized = JSON.stringify(config);
   const selectedId = node?.id || "";
-  const draftKey = `${graph.name}:${selectedId}`;
+  const scope = JSON.stringify([
+    props.scopeKey ?? graph.name,
+    selectedId,
+    readOnly,
+  ]);
+  const draftKey = scope;
   const draft = drafts[draftKey] || {};
   const setDraft = (patch: Partial<typeof draft>) =>
     setDrafts((previous) => ({
       ...previous,
       [draftKey]: { ...previous[draftKey], ...patch },
     }));
-  const latest = useRef({ graph, node, readOnly, onChange });
-  latest.current = { graph, node, readOnly, onChange };
+  const revisionState = useRef({ scope, serialized, revision: 0 });
+  if (
+    revisionState.current.scope !== scope ||
+    revisionState.current.serialized !== serialized
+  )
+    revisionState.current = {
+      scope,
+      serialized,
+      revision: revisionState.current.revision + 1,
+    };
+  const revision = revisionState.current.revision;
+  const operation = useRef(0);
+  const latest = useRef({ graph, node, readOnly, onChange, revision });
+  latest.current = { graph, node, readOnly, onChange, revision };
+  const isCurrent = () => latest.current.revision === revision;
   const workflowName = config?.type === "workflow" ? config.graph : "";
   const capturedGraph = props.workflowGraphs?.[selectedId];
   const capturedFingerprint = JSON.stringify(capturedGraph);
@@ -552,7 +500,7 @@ export default function Inspector(props: InspectorProps) {
     }
     let active = true;
     const timeout = window.setTimeout(() => {
-      request<InspectorIssue[]>("validate_node", {
+      request("validate_node", {
         data: config,
         name: node?.name || "",
       })
@@ -570,7 +518,7 @@ export default function Inspector(props: InspectorProps) {
       active = false;
       window.clearTimeout(timeout);
     };
-  }, [serialized, node?.name, props.issues]);
+  }, [serialized, node?.name, props.issues, scope]);
 
   useEffect(() => {
     setChild(null);
@@ -585,13 +533,13 @@ export default function Inspector(props: InspectorProps) {
               "The child graph is unavailable in this inspection context.",
             ),
           )
-        : request<GraphDoc>("load_graph", { name: workflowName });
+        : request("load_graph", { name: workflowName });
     source
       .then(async (doc) => {
         const call = nodeConfig(node);
         const targets =
           call?.type === "workflow" && call.output ? [call.output] : undefined;
-        const fields = await request<Field[]>("workflow_fields", {
+        const fields = await request("workflow_fields", {
           doc,
           ...(targets ? { targets } : {}),
         });
@@ -609,60 +557,64 @@ export default function Inspector(props: InspectorProps) {
     selectedId,
     capturedFingerprint,
     readOnly,
+    scope,
   ]);
 
   useEffect(() => {
     setNotice(null);
-  }, [selectedId, graph.name]);
-  const update = (patch: Record<string, unknown>) => {
-    if (!node || !config || readOnly) return;
-    const data = { ...config, ...patch } as Config;
+    setBusy(false);
+    operation.current += 1;
+  }, [scope]);
+  const update = <T extends Config>(
+    original: T,
+    patch: Partial<Omit<NoInfer<T>, "type">>,
+  ) => {
+    if (!node || !config || readOnly || config.type !== original.type) return;
+    const data = { ...original, ...patch };
     const writable =
       data.type === "file" || (data.type === "database" && !data.read_only);
     onChange({
       ...node,
-      data: data as NodeData,
+      data,
       color: node.color || (writable ? "#ef4444" : COLORS[data.type]),
     });
   };
-  const updateAsync = (patch: Record<string, unknown>) => {
+  const updateAsync = <T extends Config>(
+    original: T,
+    patch: Partial<Omit<NoInfer<T>, "type">>,
+  ) => {
     const current = latest.current;
-    if (
-      current.readOnly ||
-      current.graph.name !== graph.name ||
-      !node ||
-      !config
-    )
-      return;
-    const target = current.graph.nodes.find(
-      (candidate) => candidate.id === node.id,
-    );
-    const targetConfig = nodeConfig(target || null);
-    if (!target || !targetConfig || targetConfig.type !== config.type) return;
-    const data = { ...targetConfig, ...patch } as Config;
+    if (current.readOnly || !isCurrent() || !current.node) return false;
+    const target = current.node;
+    const targetConfig = nodeConfig(target);
+    if (!targetConfig || targetConfig.type !== original.type) return false;
+    const data = { ...original, ...patch };
     const writable =
       data.type === "file" || (data.type === "database" && !data.read_only);
     current.onChange({
       ...target,
-      data: data as NodeData,
+      data,
       color: target.color || (writable ? "#ef4444" : COLORS[data.type]),
     });
+    return true;
   };
-  async function perform(action: () => Promise<unknown>, success?: string) {
+  async function perform(
+    action: (isActive: () => boolean) => Promise<unknown>,
+    success?: string,
+  ) {
+    const token = ++operation.current;
     setBusy(true);
     setNotice(null);
-    const stillSelected = () =>
-      latest.current.graph.name === graph.name &&
-      latest.current.node?.id === selectedId;
+    const stillSelected = () => operation.current === token && isCurrent();
     try {
-      await action();
+      await action(stillSelected);
       if (success && stillSelected())
         setNotice({ text: success, error: false });
     } catch (error) {
       if (stillSelected())
         setNotice({ text: errorMessage(error), error: true });
     } finally {
-      setBusy(false);
+      if (operation.current === token) setBusy(false);
     }
   }
   const issues = (props.issues || localIssues).filter(
@@ -675,6 +627,8 @@ export default function Inspector(props: InspectorProps) {
       run.id !== props.outputContext?.runId &&
       run.nodes[selectedId],
   );
+  const previousResult = previousRun?.nodes[selectedId];
+  const activeCall = activeRun?.calls?.[selectedId];
   const upstream = [
     ...new Map(
       graph.edges
@@ -704,14 +658,16 @@ export default function Inspector(props: InspectorProps) {
 
   function renderAgent(data: Agent) {
     const local = ["ollama", "lmstudio", "llamacpp"].includes(data.provider);
-    const modelOptions = [
+    const modelOptions: (readonly [Agent["model_type"], string])[] = [
       ["generative", "Generative"],
-      ...(data.provider === "anthropic" ? [] : [["embedding", "Embedding"]]),
+      ...(data.provider === "anthropic"
+        ? []
+        : [["embedding", "Embedding"] as const]),
       ...(["openai", "custom"].includes(data.provider)
-        ? [["image", "Image"]]
+        ? [["image", "Image"] as const]
         : []),
     ];
-    const outputOptions =
+    const outputOptions: (readonly [Agent["output"], string])[] =
       data.model_type === "embedding"
         ? [["embedding", "Embedding"]]
         : data.model_type === "image"
@@ -728,7 +684,7 @@ export default function Inspector(props: InspectorProps) {
           options={PROVIDERS}
           onChange={(provider) => {
             const defaults = PROVIDER_DEFAULTS[provider];
-            update({
+            update(data, {
               provider,
               model: defaults.model,
               endpoint: "",
@@ -744,7 +700,7 @@ export default function Inspector(props: InspectorProps) {
           label="Endpoint"
           value={data.endpoint}
           placeholder={PROVIDER_DEFAULTS[data.provider]?.endpoint}
-          onChange={(endpoint) => update({ endpoint })}
+          onChange={(endpoint) => update(data, { endpoint })}
           help="Leave empty for the provider’s default API endpoint."
           mono
         />
@@ -754,7 +710,7 @@ export default function Inspector(props: InspectorProps) {
             value={data.model_type}
             options={modelOptions}
             onChange={(model_type) =>
-              update({
+              update(data, {
                 model_type,
                 output: model_type === "generative" ? "text" : model_type,
               })
@@ -763,7 +719,7 @@ export default function Inspector(props: InspectorProps) {
           <Text
             label="Model"
             value={data.model}
-            onChange={(model) => update({ model })}
+            onChange={(model) => update(data, { model })}
           />
         </div>
         {!local && (
@@ -771,7 +727,7 @@ export default function Inspector(props: InspectorProps) {
             label="API key environment variable"
             value={data.auth.kind === "env" ? data.auth.var : ""}
             onChange={(variable) =>
-              update({
+              update(data, {
                 auth: variable
                   ? { kind: "env", var: variable }
                   : { kind: "none" },
@@ -787,7 +743,7 @@ export default function Inspector(props: InspectorProps) {
           value={data.prompt}
           multiline
           rows={7}
-          onChange={(prompt) => update({ prompt })}
+          onChange={(prompt) => update(data, { prompt })}
           help="Use {{name}} to place a named upstream node’s output."
         />
         {!readOnly && (
@@ -799,16 +755,16 @@ export default function Inspector(props: InspectorProps) {
                 value=""
                 options={[
                   ["", "Choose a saved prompt…"],
-                  ...library.prompts.map((name) => [name, name]),
+                  ...library.prompts.map((name) => [name, name] as const),
                 ]}
                 onChange={(name) => {
                   if (name)
-                    void perform(async () => {
-                      const prompt = await request<string>("load_prompt", {
+                    void perform(async (isActive) => {
+                      const prompt = await request("load_prompt", {
                         name,
                       });
-                      updateAsync({ prompt });
-                      setDraft({ prompt: name });
+                      if (isActive() && updateAsync(data, { prompt }))
+                        setDraft({ prompt: name });
                     }, "Prompt loaded");
                 }}
               />
@@ -826,7 +782,7 @@ export default function Inspector(props: InspectorProps) {
                   onClick={() =>
                     void perform(async () => {
                       await request("save_prompt", {
-                        name: draft.prompt,
+                        name: draft.prompt || "",
                         text: data.prompt,
                       });
                       onLibraryChanged?.();
@@ -844,7 +800,7 @@ export default function Inspector(props: InspectorProps) {
           value={data.message || ""}
           multiline
           rows={4}
-          onChange={(message) => update({ message })}
+          onChange={(message) => update(data, { message })}
           help="Empty sends all inputs together. Place {{name}} here to direct an input into the message; other inputs follow."
         />
         <div className="ins-two">
@@ -852,13 +808,13 @@ export default function Inspector(props: InspectorProps) {
             label="Context tokens"
             value={data.context_size}
             min={1}
-            onChange={(context_size) => update({ context_size })}
+            onChange={(context_size) => update(data, { context_size })}
           />
           <NumberField
             label="Temperature"
             value={data.temperature}
             step={0.1}
-            onChange={(temperature) => update({ temperature })}
+            onChange={(temperature) => update(data, { temperature })}
             help={
               data.provider === "anthropic"
                 ? "This provider does not receive sampling parameters."
@@ -870,7 +826,7 @@ export default function Inspector(props: InspectorProps) {
           label="Output format"
           value={data.output}
           options={outputOptions}
-          onChange={(output) => update({ output })}
+          onChange={(output) => update(data, { output })}
         />
         {upstream.length > 0 && (
           <section className="ins-inputs">
@@ -879,7 +835,9 @@ export default function Inspector(props: InspectorProps) {
               const references = (template: string) =>
                 [...template.matchAll(/\{\{\s*([^{}]+?)\s*\}\}/g)].some(
                   (match) =>
-                    [input.alias, input.handle].includes(match[1].trim()),
+                    [input.alias, input.handle].includes(
+                      match[1]?.trim() || "",
+                    ),
                 );
               const inPrompt = references(data.prompt);
               const inMessage = references(data.message || "");
@@ -924,14 +882,14 @@ export default function Inspector(props: InspectorProps) {
             ["postgres", "PostgreSQL"],
             ["mysql", "MySQL"],
           ]}
-          onChange={(engine) => update({ engine })}
+          onChange={(engine) => update(data, { engine })}
         />
         {["sqlite", "duckdb"].includes(data.engine) ? (
           <Text
             label="Database file"
             value={data.path}
             choices={library.data}
-            onChange={(path) => update({ path })}
+            onChange={(path) => update(data, { path })}
             help="Relative to data/."
             mono
           />
@@ -939,7 +897,7 @@ export default function Inspector(props: InspectorProps) {
           <Text
             label="Connection URL environment variable"
             value={data.url_env}
-            onChange={(url_env) => update({ url_env })}
+            onChange={(url_env) => update(data, { url_env })}
             help="The connection URL and its password stay in your shell."
             mono
           />
@@ -949,13 +907,13 @@ export default function Inspector(props: InspectorProps) {
             label="Input data"
             value={data.input}
             choices={library.data}
-            onChange={(input) => update({ input })}
+            onChange={(input) => update(data, { input })}
             help="Optional file from data/."
           />
           <Text
             label="Input table"
             value={data.input_table}
-            onChange={(input_table) => update({ input_table })}
+            onChange={(input_table) => update(data, { input_table })}
           />
         </div>
         <Text
@@ -964,13 +922,13 @@ export default function Inspector(props: InspectorProps) {
           mono
           rows={8}
           value={data.query}
-          onChange={(query) => update({ query })}
+          onChange={(query) => update(data, { query })}
           help="One statement. Leave empty to use SQL arriving on the wire."
         />
         <Toggle
           label="Read-only queries"
           value={data.read_only}
-          onChange={(read_only) => update({ read_only })}
+          onChange={(read_only) => update(data, { read_only })}
           help={
             data.read_only
               ? "Only SELECT-style statements can run."
@@ -985,17 +943,17 @@ export default function Inspector(props: InspectorProps) {
                 type="button"
                 disabled={busy}
                 onClick={() =>
-                  void perform(async () => {
-                    const text = await request<string>("describe_schema", {
+                  void perform(async (isActive) => {
+                    const text = await request("describe_schema", {
                       config: bareConfig(data),
                     });
-                    setSchema({ node: selectedId, graph: graph.name, text });
+                    if (isActive()) setSchema({ revision, text });
                   })
                 }
               >
                 Inspect schema
               </button>
-              {schema?.node === selectedId && schema.graph === graph.name && (
+              {schema?.revision === revision && (
                 <pre className="ins-output">
                   {schema.text || "No tables found."}
                 </pre>
@@ -1005,7 +963,7 @@ export default function Inspector(props: InspectorProps) {
                 value={draft.agent || library.agents[0]?.name || ""}
                 options={library.agents
                   .filter((agent) => agent.config.model_type === "generative")
-                  .map((agent) => [agent.name, agent.name])}
+                  .map((agent) => [agent.name, agent.name] as const)}
                 onChange={(agent) => setDraft({ agent })}
               />
               <Text
@@ -1030,7 +988,7 @@ export default function Inspector(props: InspectorProps) {
                   )
                 }
                 onClick={() =>
-                  void perform(async () => {
+                  void perform(async (isActive) => {
                     const agent =
                       library.agents.find(
                         (item) =>
@@ -1042,12 +1000,12 @@ export default function Inspector(props: InspectorProps) {
                       );
                     if (!agent)
                       throw new Error("Choose a generative agent preset.");
-                    const query = await request<string>("write_sql", {
+                    const query = await request("write_sql", {
                       agent: agent.config,
                       config: bareConfig(data),
-                      question: draft.sql,
+                      question: draft.sql || "",
                     });
-                    updateAsync({ query });
+                    if (isActive()) updateAsync(data, { query });
                   }, "Query ready to review")
                 }
               >
@@ -1075,21 +1033,23 @@ export default function Inspector(props: InspectorProps) {
             ["", "Choose a saved graph…"],
             ...library.graphs
               .filter((name) => name !== graph.name)
-              .map((name) => [name, name]),
+              .map((name) => [name, name] as const),
           ]}
-          onChange={(name) => update({ graph: name, output: "", inputs: {} })}
+          onChange={(name) =>
+            update(data, { graph: name, output: "", inputs: {} })
+          }
         />
         <Select
           label="Outputs"
           value={data.output}
           options={[
             ["", "Published outputs"],
-            ...(child?.graph.nodes || []).map((item) => [
-              item.id,
-              `Node result · ${item.name || item.id}`,
-            ]),
+            ...(child?.graph.nodes || []).map(
+              (item) =>
+                [item.id, `Node result · ${item.name || item.id}`] as const,
+            ),
           ]}
-          onChange={(output) => update({ output })}
+          onChange={(output) => update(data, { output })}
           help="Published outputs create labeled ports. Selecting a node produces one output."
         />
         {data.output === "" && Object.keys(outputs).length > 0 && (
@@ -1125,7 +1085,7 @@ export default function Inspector(props: InspectorProps) {
                 const inputs = { ...data.inputs };
                 if (binding) inputs[field.name] = binding;
                 else delete inputs[field.name];
-                update({ inputs });
+                update(data, { inputs });
               };
               return (
                 <div className="ins-mapping" key={field.name}>
@@ -1135,10 +1095,10 @@ export default function Inspector(props: InspectorProps) {
                     options={[
                       ["default", "Use default"],
                       ["value", "Literal value"],
-                      ...upstream.map((input) => [
-                        input.handle,
-                        `Output · ${input.label}`,
-                      ]),
+                      ...upstream.map(
+                        (input) =>
+                          [input.handle, `Output · ${input.label}`] as const,
+                      ),
                     ]}
                     onChange={(value) =>
                       setBinding(
@@ -1198,19 +1158,19 @@ export default function Inspector(props: InspectorProps) {
                 ["json", "JSON"],
                 ["file", "File from data/"],
               ]}
-              onChange={(kind) => update({ kind })}
+              onChange={(kind) => update(data, { kind })}
             />
             <Text
               label="Default value"
               multiline
               value={data.default}
-              onChange={(value) => update({ default: value })}
+              onChange={(value) => update(data, { default: value })}
               help="Used when the run does not supply a value. File paths are relative to data/."
             />
             <Toggle
               label="A value is required"
               value={data.required}
-              onChange={(required) => update({ required })}
+              onChange={(required) => update(data, { required })}
             />
             <p className="ins-help">
               The node’s name becomes its field name in the run form. Wire it to
@@ -1229,27 +1189,27 @@ export default function Inspector(props: InspectorProps) {
                 ["shell", "Shell"],
                 ["node", "Node.js"],
               ]}
-              onChange={(runtime) => update({ runtime })}
+              onChange={(runtime) => update(data, { runtime })}
             />
             <Text
               label="Script file"
               value={data.path}
               choices={library.scripts}
-              onChange={(path) => update({ path })}
+              onChange={(path) => update(data, { path })}
               help="Relative to scripts/."
               mono
             />
             <Lines
               label="Arguments"
               value={data.args}
-              onChange={(args) => update({ args })}
+              onChange={(args) => update(data, { args })}
               help="One argument per line. Spaces inside a line stay in that argument."
             />
             <NumberField
               label="Timeout in seconds"
               value={data.timeout_secs}
               min={1}
-              onChange={(timeout_secs) => update({ timeout_secs })}
+              onChange={(timeout_secs) => update(data, { timeout_secs })}
             />
           </>
         );
@@ -1260,7 +1220,7 @@ export default function Inspector(props: InspectorProps) {
               label="File"
               value={data.path}
               choices={library.data}
-              onChange={(path) => update({ path })}
+              onChange={(path) => update(data, { path })}
               help="Relative to data/."
               mono
             />
@@ -1278,7 +1238,7 @@ export default function Inspector(props: InspectorProps) {
                 ["parquet", "Parquet"],
                 ["binary", "Binary"],
               ]}
-              onChange={(format) => update({ format })}
+              onChange={(format) => update(data, { format })}
             />
           </>
         );
@@ -1288,43 +1248,43 @@ export default function Inspector(props: InspectorProps) {
             <Text
               label="Directory"
               value={data.path}
-              onChange={(path) => update({ path })}
+              onChange={(path) => update(data, { path })}
               help="Relative to the workspace; . reads the workspace itself. Hidden entries and symlinks are skipped."
               mono
             />
             <Lines
               label="Include patterns"
               value={data.include}
-              onChange={(include) => update({ include })}
+              onChange={(include) => update(data, { include })}
               help="One glob per line, for example src/**/*.rs. Empty includes every file."
             />
             <Lines
               label="Exclude patterns"
               value={data.exclude}
-              onChange={(exclude) => update({ exclude })}
+              onChange={(exclude) => update(data, { exclude })}
             />
             <Toggle
               label="Respect .gitignore files"
               value={data.gitignore}
-              onChange={(gitignore) => update({ gitignore })}
+              onChange={(gitignore) => update(data, { gitignore })}
             />
             <Toggle
               label="Include file contents"
               value={data.contents}
-              onChange={(contents) => update({ contents })}
+              onChange={(contents) => update(data, { contents })}
             />
             <div className="ins-two">
               <NumberField
                 label="Maximum files"
                 value={data.max_files}
                 min={1}
-                onChange={(max_files) => update({ max_files })}
+                onChange={(max_files) => update(data, { max_files })}
               />
               <NumberField
                 label="Content budget · bytes"
                 value={data.max_bytes}
                 min={1}
-                onChange={(max_bytes) => update({ max_bytes })}
+                onChange={(max_bytes) => update(data, { max_bytes })}
               />
             </div>
             <p className="ins-help">
@@ -1339,7 +1299,7 @@ export default function Inspector(props: InspectorProps) {
             <Text
               label={data.bundle ? "Output directory" : "Output file"}
               value={data.path}
-              onChange={(path) => update({ path })}
+              onChange={(path) => update(data, { path })}
               help="Relative to the workspace. Missing directories are created. App storage folders are reserved."
               mono
             />
@@ -1351,24 +1311,24 @@ export default function Inspector(props: InspectorProps) {
                 ["overwrite", "Overwrite"],
                 ["append", "Append"],
               ]}
-              onChange={(mode) => update({ mode })}
+              onChange={(mode) => update(data, { mode })}
             />
             <Toggle
               label="Write a bundle of files"
               value={data.bundle}
-              onChange={(bundle) => update({ bundle })}
+              onChange={(bundle) => update(data, { bundle })}
               help="Split === path === sections into files under the output directory. All paths are checked before writing."
             />
             <Toggle
               label="Review changes before writing"
               value={Boolean(data.review)}
-              onChange={(review) => update({ review })}
+              onChange={(review) => update(data, { review })}
               help="Pause for a diff of every file. Apply the batch to continue or reject it."
             />
             <Toggle
               label="Strip an outer code fence"
               value={data.unfence}
-              onChange={(unfence) => update({ unfence })}
+              onChange={(unfence) => update(data, { unfence })}
               help="Also end the text with a newline."
             />
           </>
@@ -1412,11 +1372,14 @@ export default function Inspector(props: InspectorProps) {
                   : event.key === "End"
                     ? 2
                     : (index + (event.key === "ArrowRight" ? 1 : 2)) % 3;
-              setTab(tabs[next]);
-              document.getElementById(`ins-tab-${tabs[next]}`)?.focus();
+              const nextTab = tabs[next];
+              if (nextTab) {
+                setTab(nextTab);
+                document.getElementById(`ins-tab-${nextTab}`)?.focus();
+              }
             }}
           >
-            {item[0].toUpperCase() + item.slice(1)}
+            {item.charAt(0).toUpperCase() + item.slice(1)}
             {item === "results" && running && <span className="ins-live-dot" />}
           </button>
         ))}
@@ -1474,7 +1437,7 @@ export default function Inspector(props: InspectorProps) {
         {tab === "configure" &&
           (node ? (
             <>
-              <fieldset className="ins-form" disabled={readOnly}>
+              <fieldset key={scope} className="ins-form" disabled={readOnly}>
                 <Text
                   label="Name"
                   value={node.name || ""}
@@ -1495,26 +1458,22 @@ export default function Inspector(props: InspectorProps) {
                     <h3>Give this node a purpose</h3>
                     <p>Choose the kind of work it should do.</p>
                     <div className="ins-type-grid">
-                      {(Object.keys(DEFAULTS) as Config["type"][]).map(
-                        (type) => (
-                          <button
-                            type="button"
-                            key={type}
-                            onClick={() =>
-                              onChange({
-                                ...node,
-                                data: structuredClone(
-                                  DEFAULTS[type],
-                                ) as NodeData,
-                                color: node.color || COLORS[type],
-                              })
-                            }
-                          >
-                            <span style={{ background: COLORS[type] }} />
-                            {LABELS[type]}
-                          </button>
-                        ),
-                      )}
+                      {NODE_TYPES.map((type) => (
+                        <button
+                          type="button"
+                          key={type}
+                          onClick={() =>
+                            onChange({
+                              ...node,
+                              data: structuredClone(DEFAULTS[type]),
+                              color: node.color || COLORS[type],
+                            })
+                          }
+                        >
+                          <span style={{ background: COLORS[type] }} />
+                          {LABELS[type]}
+                        </button>
+                      ))}
                       <button
                         type="button"
                         onClick={() =>
@@ -1523,7 +1482,7 @@ export default function Inspector(props: InspectorProps) {
                             data: {
                               ...structuredClone(DEFAULTS.database),
                               read_only: false,
-                            } as NodeData,
+                            },
                             color: node.color || "#ef4444",
                           })
                         }
@@ -1579,22 +1538,31 @@ export default function Inspector(props: InspectorProps) {
                             ...(config.type === "agent"
                               ? library.agents
                               : library.databases
-                            ).map((item) => [item.name, item.name]),
+                            ).map((item) => [item.name, item.name] as const),
                           ]}
                           onChange={(name) => {
-                            const preset = (
+                            const agent =
                               config.type === "agent"
-                                ? library.agents
-                                : library.databases
-                            ).find((item) => item.name === name);
-                            if (preset) {
+                                ? library.agents.find(
+                                    (item) => item.name === name,
+                                  )
+                                : undefined;
+                            const database =
+                              config.type === "database"
+                                ? library.databases.find(
+                                    (item) => item.name === name,
+                                  )
+                                : undefined;
+                            const data: NodeData | undefined = agent
+                              ? { ...agent.config, type: "agent" }
+                              : database
+                                ? { ...database.config, type: "database" }
+                                : undefined;
+                            if (data) {
                               onChange({
                                 ...node,
-                                kind: preset.name,
-                                data: {
-                                  ...preset.config,
-                                  type: config.type,
-                                } as NodeData,
+                                kind: name,
+                                data,
                               });
                               setDraft({ preset: name });
                             }
@@ -1612,11 +1580,18 @@ export default function Inspector(props: InspectorProps) {
                           }
                           onClick={() =>
                             void perform(async () => {
-                              await request("save_preset", {
-                                type: config.type,
-                                name: draft.preset,
-                                config: bareConfig(config),
-                              });
+                              if (config.type === "agent")
+                                await request("save_preset", {
+                                  type: "agent",
+                                  name: draft.preset || "",
+                                  config: bareConfig(config),
+                                });
+                              else
+                                await request("save_preset", {
+                                  type: "database",
+                                  name: draft.preset || "",
+                                  config: bareConfig(config),
+                                });
                               onLibraryChanged?.();
                             }, "Preset saved")
                           }
@@ -1634,34 +1609,30 @@ export default function Inspector(props: InspectorProps) {
                         of step.
                       </p>
                       <div className="ins-type-grid">
-                        {(Object.keys(DEFAULTS) as Config["type"][]).map(
-                          (type) => (
-                            <button
-                              type="button"
-                              key={type}
-                              disabled={
-                                running ||
-                                (type === config.type &&
-                                  !(
-                                    config.type === "database" &&
-                                    !config.read_only
-                                  ))
-                              }
-                              onClick={() =>
-                                onChange({
-                                  ...node,
-                                  data: structuredClone(
-                                    DEFAULTS[type],
-                                  ) as NodeData,
-                                  color: node.color || COLORS[type],
-                                })
-                              }
-                            >
-                              <span style={{ background: COLORS[type] }} />
-                              {LABELS[type]}
-                            </button>
-                          ),
-                        )}
+                        {NODE_TYPES.map((type) => (
+                          <button
+                            type="button"
+                            key={type}
+                            disabled={
+                              running ||
+                              (type === config.type &&
+                                !(
+                                  config.type === "database" &&
+                                  !config.read_only
+                                ))
+                            }
+                            onClick={() =>
+                              onChange({
+                                ...node,
+                                data: structuredClone(DEFAULTS[type]),
+                                color: node.color || COLORS[type],
+                              })
+                            }
+                          >
+                            <span style={{ background: COLORS[type] }} />
+                            {LABELS[type]}
+                          </button>
+                        ))}
                         <button
                           type="button"
                           disabled={
@@ -1674,7 +1645,7 @@ export default function Inspector(props: InspectorProps) {
                               data: {
                                 ...structuredClone(DEFAULTS.database),
                                 read_only: false,
-                              } as NodeData,
+                              },
                               color: node.color || "#ef4444",
                             })
                           }
@@ -1721,10 +1692,7 @@ export default function Inspector(props: InspectorProps) {
             )}
             {node &&
               currentResult?.data &&
-              !sameNodeConfig(
-                currentResult.data,
-                config as NodeData | null,
-              ) && (
+              !sameNodeConfig(currentResult.data, config) && (
                 <p className="ins-notice">
                   This node has changed since this result was produced.
                 </p>
@@ -1758,10 +1726,10 @@ export default function Inspector(props: InspectorProps) {
                 <p>Run your graph to see outputs and activity here.</p>
               </div>
             )}
-            {currentResult && previousRun && node && (
+            {currentResult && previousRun && previousResult && node && (
               <PreviousOutput
                 current={currentResult}
-                previous={previousRun.nodes[node.id]}
+                previous={previousResult}
                 run={previousRun}
                 node={node.id}
               />
@@ -1772,13 +1740,12 @@ export default function Inspector(props: InspectorProps) {
                   <h3>Child workflow</h3>
                   <span className="ins-count">{config.graph}</span>
                 </div>
-                {activeRun?.calls?.[node.id] && (
+                {activeCall && (
                   <p className="ins-help">
-                    {Object.keys(activeRun.calls[node.id].run.nodes).length}{" "}
-                    steps ·{" "}
-                    {activeRun.calls[node.id].run.outcome.kind === "ok"
+                    {Object.keys(activeCall.run.nodes).length} steps ·{" "}
+                    {activeCall.run.outcome.kind === "ok"
                       ? "Completed"
-                      : activeRun.calls[node.id].run.outcome.kind}
+                      : activeCall.run.outcome.kind}
                   </p>
                 )}
                 <button
@@ -1820,77 +1787,83 @@ export default function Inspector(props: InspectorProps) {
                 </p>
               </div>
             )}
-            {history.map((run) => (
-              <details
-                className={`ins-run ${activeRun?.id === run.id ? "is-active" : ""}`}
-                key={run.id}
-              >
-                <summary>
-                  <span
-                    className={`ins-outcome ins-outcome-${run.outcome.kind}`}
-                  >
-                    {run.outcome.kind === "ok"
-                      ? "✓"
-                      : run.outcome.kind === "cancelled"
-                        ? "−"
-                        : "!"}
-                  </span>
-                  <span className="ins-run-heading">
-                    <strong>{runTime(run.id)}</strong>
-                    <small>
-                      {run.targets.length} target
-                      {run.targets.length === 1 ? "" : "s"} ·{" "}
-                      {(run.elapsed_ms / 1000).toFixed(1)}s ·{" "}
+            {history.map((run) => {
+              const historyResult = run.nodes[selectedId];
+              return (
+                <details
+                  className={`ins-run ${activeRun?.id === run.id ? "is-active" : ""}`}
+                  key={run.id}
+                >
+                  <summary>
+                    <span
+                      className={`ins-outcome ins-outcome-${run.outcome.kind}`}
+                    >
                       {run.outcome.kind === "ok"
-                        ? "Completed"
-                        : run.outcome.kind}
-                    </small>
-                  </span>
-                </summary>
-                <div className="ins-run-body">
-                  {run.outcome.error && (
-                    <p className="ins-error">{run.outcome.error}</p>
-                  )}
-                  {!readOnly && onOpenHistory && (
-                    <button type="button" onClick={() => onOpenHistory(run.id)}>
-                      Inspect this run
-                    </button>
-                  )}
-                  {run.inputs && Object.keys(run.inputs).length > 0 && (
-                    <details className="ins-details">
-                      <summary>Run inputs</summary>
-                      <dl>
-                        {Object.entries(run.inputs).map(([name, value]) => (
-                          <div key={name}>
-                            <dt>{name}</dt>
-                            <dd>{value}</dd>
-                          </div>
-                        ))}
-                      </dl>
-                    </details>
-                  )}
-                  {node && run.nodes[node.id] ? (
-                    <Output
-                      key={node.id}
-                      result={run.nodes[node.id]}
-                      title={`${node.name || node.id} output`}
-                      node={node.id}
-                      context={
-                        readOnly && props.outputContext
-                          ? props.outputContext
-                          : { graph: run.graph, runId: run.id }
-                      }
-                    />
-                  ) : (
-                    <p className="ins-help">
-                      {node
-                        ? "This node did not take part in this run."
-                        : "Select a node to see what it produced."}
-                    </p>
-                  )}
-                </div>
-              </details>
-            ))}
+                        ? "✓"
+                        : run.outcome.kind === "cancelled"
+                          ? "−"
+                          : "!"}
+                    </span>
+                    <span className="ins-run-heading">
+                      <strong>{runTime(run.id)}</strong>
+                      <small>
+                        {run.targets.length} target
+                        {run.targets.length === 1 ? "" : "s"} ·{" "}
+                        {(run.elapsed_ms / 1000).toFixed(1)}s ·{" "}
+                        {run.outcome.kind === "ok"
+                          ? "Completed"
+                          : run.outcome.kind}
+                      </small>
+                    </span>
+                  </summary>
+                  <div className="ins-run-body">
+                    {run.outcome.kind === "failed" && (
+                      <p className="ins-error">{run.outcome.error}</p>
+                    )}
+                    {!readOnly && onOpenHistory && (
+                      <button
+                        type="button"
+                        onClick={() => onOpenHistory(run.id)}
+                      >
+                        Inspect this run
+                      </button>
+                    )}
+                    {run.inputs && Object.keys(run.inputs).length > 0 && (
+                      <details className="ins-details">
+                        <summary>Run inputs</summary>
+                        <dl>
+                          {Object.entries(run.inputs).map(([name, value]) => (
+                            <div key={name}>
+                              <dt>{name}</dt>
+                              <dd>{value}</dd>
+                            </div>
+                          ))}
+                        </dl>
+                      </details>
+                    )}
+                    {node && historyResult ? (
+                      <Output
+                        key={node.id}
+                        result={historyResult}
+                        title={`${node.name || node.id} output`}
+                        node={node.id}
+                        context={
+                          readOnly && props.outputContext
+                            ? props.outputContext
+                            : { graph: run.graph, runId: run.id }
+                        }
+                      />
+                    ) : (
+                      <p className="ins-help">
+                        {node
+                          ? "This node did not take part in this run."
+                          : "Select a node to see what it produced."}
+                      </p>
+                    )}
+                  </div>
+                </details>
+              );
+            })}
           </div>
         )}
       </div>
@@ -1957,7 +1930,7 @@ function Publication({
           <Select
             label="Output port"
             value={handle}
-            options={ports.map((port) => [port.handle, port.label])}
+            options={ports.map((port) => [port.handle, port.label] as const)}
             onChange={setHandle}
           />
         )}
@@ -2124,7 +2097,7 @@ function Output({
     setBusy(true);
     setError("");
     try {
-      const data = await request<FullOutput>("output", {
+      const data = await request("output", {
         graph: context.graph,
         run_id: context.runId,
         node,

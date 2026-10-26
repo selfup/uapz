@@ -332,7 +332,10 @@ async function mockService(page: Page) {
                   n2: result,
                 },
                 log: ["Completed"],
-                outcome: { kind: args.decision === "apply" ? "ok" : "failed" },
+                outcome:
+                  args.decision === "apply"
+                    ? { kind: "ok" }
+                    : { kind: "failed", error: "File changes rejected" },
                 workflows: state.runtime.workflows,
                 calls: {},
               };

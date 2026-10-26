@@ -178,8 +178,8 @@ test("dragging a node saves its new graph coordinates and restores them on reope
   const saved = (await callsFor(page, "save_graph")).at(-1)!.args
     .doc as typeof parent;
   const moved = saved.nodes.find((item) => item.id === "n0")!;
-  expect(moved.x).toBeCloseTo(parent.nodes[0].x + displacement.x, 1);
-  expect(moved.y).toBeCloseTo(parent.nodes[0].y + displacement.y, 1);
+  expect(moved.x).toBeCloseTo(parent.nodes[0]!.x + displacement.x, 1);
+  expect(moved.y).toBeCloseTo(parent.nodes[0]!.y + displacement.y, 1);
   expect(saved.view).toEqual(parent.view);
   expect(saved.edges).toEqual(parent.edges);
   expect(saved.outputs).toEqual(parent.outputs);
@@ -218,7 +218,7 @@ test("runtime refreshes keep a held node drag stable and save its final position
   for (const [gate, mark] of [
     ["drag-first-poll", "running"],
     ["drag-second-poll", "ran"],
-  ]) {
+  ] as const) {
     if (gate === "drag-second-poll")
       await queueReply(page, { method: "runtime_state", gate });
     await page.evaluate((mark) => {
@@ -249,16 +249,18 @@ test("runtime refreshes keep a held node drag stable and save its final position
   const moved = saved.nodes.find((item) => item.id === "n0")!;
   const scale = parent.view.zoom ?? 1;
   expect(moved.x).toBeCloseTo(
-    parent.nodes[0].x + (final.x - initial.x) / scale,
+    parent.nodes[0]!.x + (final.x - initial.x) / scale,
     1,
   );
   expect(moved.y).toBeCloseTo(
-    parent.nodes[0].y + (final.y - initial.y) / scale,
+    parent.nodes[0]!.y + (final.y - initial.y) / scale,
     1,
   );
   expect(saved.edges).toEqual(parent.edges);
   expect(saved.outputs).toEqual(parent.outputs);
-  await page.getByRole("button", { name: "Apply changes", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Apply changes", exact: true })
+    .click();
   await expect(
     page.getByRole("region", { name: "Review file changes" }),
   ).toHaveCount(0);

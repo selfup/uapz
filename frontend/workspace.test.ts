@@ -10,6 +10,69 @@ import {
 import type { Run } from "./types";
 
 describe("child workflow navigation", () => {
+  it("only traverses own call entries, including prototype-named legacy IDs", () => {
+    const graph = emptyGraph();
+    const run: Run = {
+      id: "run",
+      graph: "graph",
+      targets: [],
+      elapsed_ms: 0,
+      outcome: { kind: "ok" },
+      nodes: {},
+      log: [],
+    };
+    const call = { graph, run };
+    const inherited = { ...run, calls: Object.create({ n1: call }) };
+    expect(callAt(inherited, "n1")).toBeUndefined();
+    for (const id of ["__proto__", "constructor", "toString"]) {
+      expect(callAt({ ...run, calls: {} }, id)).toBeUndefined();
+      expect(
+        callAt({ ...run, calls: Object.fromEntries([[id, call]]) }, id),
+      ).toBe(call);
+    }
+    const parent = { ...run, calls: { n1: { graph, run: inherited } } };
+    expect(callAt(parent, "n1/n1")).toBeUndefined();
+    expect(callAt(parent, "")).toBeUndefined();
+    expect(callAt(parent, "n1/")).toBeUndefined();
+  });
+
+  it("preserves prototype-named interfaces as own entries without changing their prototype", () => {
+    const captured = { ...emptyGraph(), name: "captured" };
+    const historical = { ...emptyGraph(), name: "historical" };
+    const childRun: Run = {
+      id: "run",
+      graph: "graph",
+      targets: [],
+      elapsed_ms: 0,
+      outcome: { kind: "ok" },
+      nodes: {},
+      log: [],
+    };
+    const run: Run = {
+      ...childRun,
+      calls: Object.fromEntries([
+        ["__proto__", { graph: historical, run: childRun }],
+        ["constructor", { graph: historical, run: childRun }],
+        ["toString", { graph: historical, run: childRun }],
+      ]),
+    };
+    const result = childInterfaces(
+      Object.fromEntries([["n1/__proto__", captured]]),
+      "n1",
+      run,
+    );
+    expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
+    expect(Object.keys(result)).toEqual([
+      "__proto__",
+      "constructor",
+      "toString",
+    ]);
+    expect(Object.hasOwn(result, "__proto__")).toBe(true);
+    expect(result.__proto__).toBe(captured);
+    expect(result.constructor).toBe(historical);
+    expect(result.toString).toBe(historical);
+  });
+
   it("keeps unstarted captures and qualifies paths without confusing siblings", () => {
     const child = { ...emptyGraph(), name: "child" };
     const leaf = { ...emptyGraph(), name: "leaf" };

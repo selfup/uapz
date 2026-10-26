@@ -25,7 +25,8 @@ export function callAt(
 ): { graph: GraphDoc; run: Run } | undefined {
   let call: { graph: GraphDoc; run: Run } | undefined;
   for (const id of path.split("/")) {
-    call = run?.calls?.[id];
+    if (!id || !run?.calls || !Object.hasOwn(run.calls, id)) return;
+    call = run.calls[id];
     if (!call) return;
     run = call.run;
   }
@@ -38,15 +39,15 @@ export function childInterfaces(
   run?: Run | null,
 ): Record<string, GraphDoc> {
   const prefix = path ? `${path}/` : "";
-  const result: Record<string, GraphDoc> = {};
+  const result = new Map<string, GraphDoc>();
   for (const [key, graph] of Object.entries(workflows)) {
     if (!key.startsWith(prefix)) continue;
     const id = key.slice(prefix.length);
-    if (id && !id.includes("/")) result[id] = graph;
+    if (id && !id.includes("/")) result.set(id, graph);
   }
   for (const [key, call] of Object.entries(run?.calls || {}))
-    result[key] ||= call.graph;
-  return result;
+    if (!result.has(key)) result.set(key, call.graph);
+  return Object.fromEntries(result);
 }
 export function localMarks(
   marks: Record<string, Mark>,

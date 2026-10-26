@@ -137,9 +137,10 @@ describe("workflow run feed", () => {
       ...emptyGraph(),
       nodes: [{ id: "n1", name: "Research", x: 0, y: 0 }],
     };
+    const capturedNode = { id: "n2", name: "Summarize", x: 0, y: 0 };
     const captured = {
       ...emptyGraph(),
-      nodes: [{ id: "n2", name: "Summarize", x: 0, y: 0 }],
+      nodes: [capturedNode],
     };
     const run = {
       ...history(),
@@ -147,7 +148,7 @@ describe("workflow run feed", () => {
         n1: {
           graph: {
             ...captured,
-            nodes: [{ ...captured.nodes[0], name: "Old name" }],
+            nodes: [{ ...capturedNode, name: "Old name" }],
           },
           run: history(),
         },
