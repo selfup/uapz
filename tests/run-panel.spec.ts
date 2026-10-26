@@ -331,8 +331,8 @@ test("large outputs load a bounded preview automatically and expand on request",
   await expect(feed).toContainText("All of the large output");
   const calls = await callsFor(page, "output");
   expect(calls).toHaveLength(2);
-  expect(calls[0].args.max_bytes).toBe(256 * 1024);
-  expect(calls[1].args).not.toHaveProperty("max_bytes");
+  expect(calls[0]?.args.max_bytes).toBe(256 * 1024);
+  expect(calls[1]?.args).not.toHaveProperty("max_bytes");
 });
 
 test("a failed node retains its partial streamed answer next to the failure", async ({

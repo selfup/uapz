@@ -2,20 +2,11 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { request } from "./api";
 import { feedNodeName, runFeed } from "./runFeed";
 import type { GraphDoc, NodeRun, Run, RuntimeState } from "./types";
+import type { FullOutput } from "./protocol";
 import "./runPanel.css";
 
 type Props = { graph: GraphDoc; runtime: RuntimeState | null; run: Run | null };
 type OutputContext = { graph: string; runId: string; id: string };
-type FullOutput = {
-  label: string;
-  text: string | null;
-  base64: string | null;
-  saved: string | null;
-  complete: boolean;
-  media_type?: string | null;
-  limited?: boolean;
-  bytes?: number;
-};
 const AUTOMATIC_OUTPUT_BYTES = 256 * 1024;
 
 export default function RunPanel(props: Props) {
@@ -315,7 +306,7 @@ function RunOutput({
     if (!needsFull) return;
     let active = true;
     const parts = context.id.split("/");
-    const node = parts.pop();
+    const node = parts.pop() || "";
     setFailure(null);
     // Strict Mode replays effects; both subscribers share one retrieval.
     if (
@@ -325,7 +316,7 @@ function RunOutput({
       retrieval.current = {
         identity: requestIdentity,
         attempt,
-        promise: request<FullOutput>("output", {
+        promise: request("output", {
           graph: context.graph,
           run_id: context.runId,
           node,

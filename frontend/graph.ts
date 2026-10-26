@@ -4,10 +4,6 @@ export type WorkflowGraphs = Record<string, GraphDoc>;
 export type Port = { id: string; missing: boolean };
 export type Point = { x: number; y: number };
 
-export function typedData(node: NodeDoc): NodeData | undefined {
-  return node.data && "type" in node.data ? (node.data as NodeData) : undefined;
-}
-
 const labels: Record<NodeType, string> = {
   input: "Run input",
   workflow: "Workflow",
@@ -18,6 +14,21 @@ const labels: Record<NodeType, string> = {
   directory: "Directory",
   file: "Write file",
 };
+
+export function typedData(node: NodeDoc): NodeData | undefined {
+  const data: unknown = node.data;
+  if (
+    !data ||
+    typeof data !== "object" ||
+    Array.isArray(data) ||
+    !Object.hasOwn(data, "type")
+  )
+    return undefined;
+  const type = (data as Record<string, unknown>).type;
+  return typeof type === "string" && Object.hasOwn(labels, type)
+    ? (data as NodeData)
+    : undefined;
+}
 
 export const NODE_COLORS: Record<NodeType, string> = {
   input: "#06b6d4",
@@ -53,8 +64,10 @@ export function nodeColor(node: NodeDoc): string {
   return "#9ca3af";
 }
 
-const fileName = (path: string) =>
-  path.trim().split("/").filter(Boolean).pop() || "no file";
+const text = (value: unknown): string =>
+  typeof value === "string" ? value : "";
+const fileName = (path: unknown) =>
+  text(path).trim().split("/").filter(Boolean).pop() || "no file";
 const displayNames: Record<string, string> = {
   json: "JSON",
   csv: "CSV",
@@ -77,8 +90,13 @@ const displayNames: Record<string, string> = {
   shell: "Shell",
   node: "Node.js",
 };
-const title = (value: string) =>
-  displayNames[value] || value.charAt(0).toUpperCase() + value.slice(1);
+const title = (value: unknown): string => {
+  const name = text(value);
+  const known = Object.hasOwn(displayNames, name)
+    ? displayNames[name]
+    : undefined;
+  return known ?? (name.charAt(0).toUpperCase() + name.slice(1) || "Unknown");
+};
 
 export function nodeSummary(node: NodeDoc): string {
   const data = typedData(node);
@@ -87,21 +105,23 @@ export function nodeSummary(node: NodeDoc): string {
     case "input":
       return `${data.kind === "file" ? "File from data/" : title(data.kind)} · ${data.required ? "required" : "optional"}`;
     case "workflow":
-      return data.graph
-        ? `${data.graph} → ${data.output || "published outputs"}`
+      return text(data.graph)
+        ? `${text(data.graph)} → ${text(data.output) || "published outputs"}`
         : "choose a saved graph";
     case "agent":
-      return `${title(data.provider)} · ${data.model.trim() || "no model"}`;
+      return `${title(data.provider)} · ${text(data.model).trim() || "no model"}`;
     case "database":
-      return `${title(data.engine)} · ${["sqlite", "duckdb"].includes(data.engine) ? fileName(data.path) : data.url_env.trim() || "no connection"}${data.read_only ? "" : " · write"}`;
+      return `${title(data.engine)} · ${["sqlite", "duckdb"].includes(data.engine) ? fileName(data.path) : text(data.url_env).trim() || "no connection"}${data.read_only ? "" : " · write"}`;
     case "script":
       return `${title(data.runtime)} · ${fileName(data.path)}`;
     case "data":
       return `${title(data.format)} · ${fileName(data.path)}`;
-    case "directory":
-      return `${data.path.trim() || "."}${data.include[0] ? ` · ${data.include[0]}` : ""} · ${data.contents ? "contents" : "listing"}`;
+    case "directory": {
+      const include = Array.isArray(data.include) ? text(data.include[0]) : "";
+      return `${text(data.path).trim() || "."}${include ? ` · ${include}` : ""} · ${data.contents ? "contents" : "listing"}`;
+    }
     case "file":
-      return `${data.bundle ? `${data.path.trim() || "."}/ · sections` : fileName(data.path)} · ${data.mode === "create" ? "create only" : data.mode}`;
+      return `${data.bundle ? `${text(data.path).trim() || "."}/ · sections` : fileName(data.path)} · ${data.mode === "create" ? "create only" : text(data.mode) || "unknown mode"}`;
   }
 }
 
@@ -164,16 +184,22 @@ export function defaultNodeData(type: NodeType): NodeData {
 }
 
 export function nextNodeId(graph: GraphDoc): string {
-  const ids = new Set(graph.nodes.map((node) => node.id));
-  let n =
-    Math.max(
-      0,
-      ...graph.nodes.map((node) =>
-        /^n\d+$/.test(node.id) ? Number(node.id.slice(1)) : 0,
-      ),
-    ) + 1;
-  while (ids.has(`n${n}`)) n++;
-  return `n${n}`;
+  const ids = new Set<string>();
+  let largest = 0;
+  for (const { id } of graph.nodes) {
+    ids.add(id);
+    if (!/^n\d+$/.test(id)) continue;
+    const value = Number(id.slice(1));
+    if (Number.isSafeInteger(value) && value > largest) largest = value;
+  }
+  if (largest < Number.MAX_SAFE_INTEGER) return `n${largest + 1}`;
+  // A maximum-sized legacy ID leaves no safe successor. A gap must exist among
+  // the first ids.size + 1 candidates, regardless of how large other IDs are.
+  for (let value = 1; value <= ids.size + 1; value++) {
+    const candidate = `n${value}`;
+    if (!ids.has(candidate)) return candidate;
+  }
+  throw new Error("No safe node ID is available.");
 }
 
 export function isNamedWorkflow(node: NodeDoc): boolean {
@@ -192,7 +218,10 @@ export function workflowPorts(
   workflowGraphs: WorkflowGraphs = {},
 ): Port[] {
   if (!isNamedWorkflow(node)) return [];
-  const available = Object.keys(workflowGraphs[node.id]?.outputs || {}).filter(
+  const workflow = Object.hasOwn(workflowGraphs, node.id)
+    ? workflowGraphs[node.id]
+    : undefined;
+  const available = Object.keys(workflow?.outputs || {}).filter(
     validOutputName,
   );
   const missing = graph.edges
@@ -211,7 +240,7 @@ export function workflowPorts(
 export function visibleEdgeHandle(edge: EdgeDoc, ports: Port[]): string | null {
   if (edge.output != null) return edge.output;
   const available = ports.filter((port) => !port.missing);
-  return available.length === 1 ? available[0].id : null;
+  return available.length === 1 ? (available[0]?.id ?? null) : null;
 }
 
 export function deleteNodes(
@@ -228,9 +257,11 @@ export function deleteNodes(
       (edge) => !deleted.has(edge.from) && !deleted.has(edge.to),
     ),
     outputs: Object.fromEntries(
-      Object.entries(graph.outputs || {}).filter(
-        ([, target]) => !deleted.has(target.split(".")[0]),
-      ),
+      Object.entries(graph.outputs || {}).filter(([, target]) => {
+        const dot = target.indexOf(".");
+        const owner = dot === -1 ? target : target.slice(0, dot);
+        return !deleted.has(owner);
+      }),
     ),
   };
 }
@@ -316,7 +347,13 @@ export function assignPublications(
     throw new Error("At most 64 published outputs are allowed.");
   for (const [name, handle] of Object.entries(outputs)) {
     const error = validatePublication(graph, name, handle, workflowGraphs);
-    if (error && graph.outputs?.[name] !== handle) throw new Error(error);
+    if (
+      error &&
+      (!graph.outputs ||
+        !Object.hasOwn(graph.outputs, name) ||
+        graph.outputs[name] !== handle)
+    )
+      throw new Error(error);
   }
   return { ...graph, outputs: { ...outputs } };
 }

@@ -35,8 +35,8 @@ test("a rejected start retains run inputs for a successful retry", async ({
   ).toBeVisible();
   const calls = await callsFor(page, "start_run");
   expect(calls).toHaveLength(2);
-  expect(calls[0].args.inputs).toEqual({ message: "Keep these values" });
-  expect(calls[1].args).toEqual(calls[0].args);
+  expect(calls[0]?.args.inputs).toEqual({ message: "Keep these values" });
+  expect(calls[1]?.args).toEqual(calls[0]?.args);
 });
 
 for (const decision of ["Reject", "Cancel run"] as const) {
@@ -65,7 +65,7 @@ for (const decision of ["Reject", "Cancel run"] as const) {
       decision === "Reject" ? "review" : "cancel_run",
     );
     expect(calls).toHaveLength(1);
-    expect(calls[0].args).toEqual(
+    expect(calls[0]?.args).toEqual(
       decision === "Reject"
         ? { run_id: "live-1", review_id: "review-1", decision: "reject" }
         : { run_id: "live-1" },

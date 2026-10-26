@@ -224,4 +224,16 @@ export interface RunForm extends PreparedRun {
   error?: string;
 }
 export const isNodeData = (value: NodeDoc["data"]): value is NodeData =>
-  !!value && typeof value.type === "string";
+  !!value &&
+  typeof value === "object" &&
+  Object.hasOwn(value, "type") &&
+  [
+    "input",
+    "workflow",
+    "agent",
+    "database",
+    "script",
+    "data",
+    "directory",
+    "file",
+  ].some((type) => type === value.type);

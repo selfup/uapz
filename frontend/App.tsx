@@ -51,7 +51,6 @@ import type {
   NodeDoc,
   NodeRun,
   NodeType,
-  PreparedRun,
   Run,
   RunForm,
   RuntimeState,
@@ -115,6 +114,7 @@ export default function App() {
     resolve: (accepted: boolean) => void;
   } | null>(null);
   const [busy, setBusy] = useState(false);
+  const [pendingRunId, setPendingRunId] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [kindEditor, setKindEditor] = useState(false);
   const [kindName, setKindName] = useState("");
@@ -132,9 +132,18 @@ export default function App() {
   const documentEpoch = useRef(0);
   const graphRef = useRef(graph);
   graphRef.current = graph;
+  const runtimeRef = useRef(runtime);
+  runtimeRef.current = runtime;
   const historicalRef = useRef(historical);
   historicalRef.current = historical;
   const saveInFlight = useRef(false);
+  const preparingRun = useRef(false);
+  const startingRun = useRef(false);
+  const pendingRun = useRef<string | null>(null);
+  const runtimeRequest = useRef(0);
+  const appliedRuntimeRequest = useRef(0);
+  const actionRequest = useRef(0);
+  const promptRequest = useRef(0);
   const rootNavigation = useRef(0);
   const childNavigation = useRef(0);
   const epoch = documentEpoch.current;
@@ -145,7 +154,7 @@ export default function App() {
   const activeNode =
     activeGraph.nodes.find((node) => node.id === activeSelected) || null;
   const readOnly = !!activeChild;
-  const running = !!runtime?.running;
+  const running = !!runtime?.running || pendingRunId !== null;
   const occupied = running || !!form || busy;
   const runMatches = !!runtime && runtime.run_id === attachedRun;
   const currentRun = shownRun || (runMatches ? runtime?.run : null) || null;
@@ -160,6 +169,12 @@ export default function App() {
       ? remembered.origins[activeSelected] || currentRun
       : currentRun;
   const childPath = activeChild?.path || "";
+  const promptSelection = useRef({
+    epoch,
+    childPath,
+    selected: activeSelected,
+  });
+  promptSelection.current = { epoch, childPath, selected: activeSelected };
   const validationKey = JSON.stringify({
     ...graph,
     view: { pan_x: 0, pan_y: 0, zoom: 1 },
@@ -195,24 +210,56 @@ export default function App() {
       : null;
 
   const refreshLibrary = useCallback(async () => {
-    const data = await request<Library>("bootstrap");
+    const data = await request("bootstrap");
     setLibrary(data);
     setRefreshVersion((version) => version + 1);
     return data;
   }, []);
   const refreshHistory = useCallback(async (name: string) => {
     const currentEpoch = documentEpoch.current;
-    const runs = await request<Run[]>("history", { graph: name });
+    const runs = await request("history", { graph: name });
     if (currentEpoch === documentEpoch.current) setHistory(runs);
   }, []);
   const action = useCallback(async (task: () => Promise<void>) => {
+    const requestId = ++actionRequest.current;
+    const requestEpoch = documentEpoch.current;
     setError(null);
     try {
       await task();
     } catch (error) {
-      setError(messageOf(error));
+      if (
+        requestId === actionRequest.current &&
+        requestEpoch === documentEpoch.current
+      )
+        setError(messageOf(error));
     }
   }, []);
+  const readRuntime = useCallback(
+    async (isCurrent: (state: RuntimeState | null) => boolean) => {
+      const requestId = ++runtimeRequest.current;
+      let state: RuntimeState | null;
+      try {
+        state = await request("runtime_state");
+      } catch (error) {
+        if (requestId < appliedRuntimeRequest.current)
+          return { state: null, applied: false };
+        throw error;
+      }
+      // Polls and command follow-up reads overlap. A response issued before
+      // the last applied read cannot restore an older review or running state.
+      if (requestId < appliedRuntimeRequest.current || !isCurrent(state))
+        return { state, applied: false };
+      appliedRuntimeRequest.current = requestId;
+      runtimeRef.current = state;
+      setRuntime(state);
+      if (state?.run_id === pendingRun.current) {
+        pendingRun.current = null;
+        setPendingRunId(null);
+      }
+      return { state, applied: true };
+    },
+    [],
+  );
 
   useEffect(() => {
     void refreshLibrary().catch((error) => setError(messageOf(error)));
@@ -230,9 +277,12 @@ export default function App() {
     const poll = async () => {
       let delay = 1000;
       try {
-        const state = await request<RuntimeState | null>("runtime_state");
+        const { state, applied } = await readRuntime(() => !disposed);
         if (disposed) return;
-        setRuntime(state);
+        if (!applied) {
+          timer = setTimeout(poll, 150);
+          return;
+        }
         if (initialSession.current) {
           initialSession.current = false;
           if (state?.running && documentEpoch.current === 0) {
@@ -289,13 +339,19 @@ export default function App() {
       disposed = true;
       clearTimeout(timer);
     };
-  }, [library?.workspace, graph.name, attachedRun, refreshHistory]);
+  }, [
+    library?.workspace,
+    graph.name,
+    attachedRun,
+    refreshHistory,
+    readRuntime,
+  ]);
 
   useEffect(() => {
     if (!library || readOnly) return;
     let disposed = false;
     const timer = setTimeout(() => {
-      void request<{ issues: Issue[] }>("validate_graph", {
+      void request("validate_graph", {
         doc: JSON.parse(validationKey),
       })
         .then((result) => {
@@ -324,7 +380,7 @@ export default function App() {
     void Promise.all(
       workflows.map(async ({ id, name }) => {
         try {
-          return [id, await request<GraphDoc>("load_graph", { name })] as const;
+          return [id, await request("load_graph", { name })] as const;
         } catch {
           return null;
         }
@@ -406,7 +462,13 @@ export default function App() {
     );
   }
   async function newGraph() {
-    if (occupied) return;
+    if (
+      occupied ||
+      preparingRun.current ||
+      startingRun.current ||
+      pendingRun.current
+    )
+      return;
     const navigation = ++rootNavigation.current;
     if (!(await discardDraft()) || navigation !== rootNavigation.current)
       return;
@@ -423,13 +485,19 @@ export default function App() {
     setPanel("inspector");
   }
   async function openGraph(name: string) {
-    if (occupied) return;
+    if (
+      occupied ||
+      preparingRun.current ||
+      startingRun.current ||
+      pendingRun.current
+    )
+      return;
     const navigation = ++rootNavigation.current;
     if (!(await discardDraft()) || navigation !== rootNavigation.current)
       return;
     let loaded: GraphDoc;
     try {
-      loaded = normalizeGraph(await request<GraphDoc>("load_graph", { name }));
+      loaded = normalizeGraph(await request("load_graph", { name }));
     } catch (error) {
       if (navigation !== rootNavigation.current) return;
       throw error;
@@ -495,7 +563,7 @@ export default function App() {
     try {
       doc = snapshot
         ? captured[path] || call?.graph
-        : await request<GraphDoc>("load_graph", { name: config.graph });
+        : await request("load_graph", { name: config.graph });
     } catch (error) {
       if (!stillCurrent()) return;
       throw error;
@@ -517,86 +585,159 @@ export default function App() {
     ]);
   }
   async function startRun(prepared: RunForm) {
+    if (
+      startingRun.current ||
+      pendingRun.current ||
+      runtimeRef.current?.running
+    )
+      return;
+    startingRun.current = true;
     setBusy(true);
     try {
-      const started = await request<{ run_id: string }>("start_run", {
-        doc: prepared.graph,
-        targets: prepared.targets,
-        inputs: prepared.inputs,
-        fresh: prepared.fresh,
-      });
+      let started: { run_id: string };
+      try {
+        started = await request("start_run", {
+          doc: prepared.graph,
+          targets: prepared.targets,
+          inputs: prepared.inputs,
+          fresh: prepared.fresh,
+        });
+      } catch (error) {
+        if (prepared.fields.length) {
+          setForm({ ...prepared, error: messageOf(error) });
+          return;
+        }
+        throw error;
+      }
+      // The service accepted this execution. A failed status read must not
+      // restore the submission form and allow the same run to start again.
+      pendingRun.current = started.run_id;
+      setPendingRunId(started.run_id);
       setAttachedRun(started.run_id);
       setForm(null);
       setShownRun(null);
       setHistorical(false);
       setPanel("run");
       setNotice("Workflow is running");
-      setRuntime(await request<RuntimeState>("runtime_state"));
-    } catch (error) {
-      if (prepared.fields.length)
-        setForm({ ...prepared, error: messageOf(error) });
-      else throw error;
+      await readRuntime((state) => state?.run_id === started.run_id);
     } finally {
+      startingRun.current = false;
       setBusy(false);
     }
   }
   async function prepareRun(fresh = false, node?: string) {
-    if (readOnly || occupied) return;
-    const prepared = await request<PreparedRun>("prepare_run", {
-      doc: graph,
-      ...(node ? { targets: [node] } : {}),
-    });
-    const inputs = { ...prepared.inputs };
-    for (const field of prepared.fields)
-      if (history[0]?.inputs?.[field.name] !== undefined)
-        inputs[field.name] = history[0].inputs[field.name];
-    const form: RunForm = {
-      ...prepared,
-      inputs,
-      graph: structuredClone(graph),
-      fresh,
-    };
-    setPanel("run");
-    if (prepared.fields.length) {
-      setForm(form);
-      setNotice("Fill in the run inputs");
-    } else await startRun(form);
+    if (
+      readOnly ||
+      occupied ||
+      preparingRun.current ||
+      startingRun.current ||
+      pendingRun.current
+    )
+      return;
+    preparingRun.current = true;
+    rootNavigation.current += 1;
+    setBusy(true);
+    const requestedGraph = graph;
+    const requestedEpoch = documentEpoch.current;
+    try {
+      const prepared = await request("prepare_run", {
+        doc: requestedGraph,
+        ...(node ? { targets: [node] } : {}),
+      });
+      if (requestedEpoch !== documentEpoch.current) return;
+      if (graphRef.current !== requestedGraph)
+        throw new Error(
+          "The workflow changed while preparing. Run it again to use the latest edits.",
+        );
+      const inputs = { ...prepared.inputs };
+      for (const field of prepared.fields) {
+        const previousInput = history[0]?.inputs?.[field.name];
+        if (previousInput !== undefined) inputs[field.name] = previousInput;
+      }
+      const form: RunForm = {
+        ...prepared,
+        inputs,
+        graph: structuredClone(requestedGraph),
+        fresh,
+      };
+      setPanel("run");
+      if (prepared.fields.length) {
+        setForm(form);
+        setNotice("Fill in the run inputs");
+      } else await startRun(form);
+    } finally {
+      preparingRun.current = false;
+      setBusy(false);
+    }
   }
   async function cancelRun() {
-    if (runtime?.running) {
-      await request("cancel_run", { run_id: runtime.run_id });
-      setNotice("Cancelling…");
+    const runId =
+      pendingRun.current || (runtime?.running ? runtime.run_id : null);
+    if (runId) {
+      await request("cancel_run", { run_id: runId });
+      if (
+        pendingRun.current === runId ||
+        (runtimeRef.current?.run_id === runId && runtimeRef.current.running)
+      )
+        setNotice("Cancelling…");
     }
   }
   async function reviewDecision(decision: "apply" | "reject") {
     if (!runtime?.review) return;
+    const runId = runtime.run_id;
     await request("review", {
       run_id: runtime.run_id,
       review_id: runtime.review.id,
       decision,
     });
-    setRuntime(await request<RuntimeState>("runtime_state"));
+    if (runtimeRef.current?.run_id !== runId) return;
+    await readRuntime(
+      (state) =>
+        state?.run_id === runId && runtimeRef.current?.run_id === runId,
+    );
   }
   async function usePrompt(name: string) {
     const config = activeNode && typedData(activeNode);
     if (readOnly || !activeNode || config?.type !== "agent")
       throw new Error("Select an Agent node to load a prompt.");
-    updateNode({
-      ...activeNode,
-      data: {
-        ...config,
-        prompt: await request<string>("load_prompt", { name }),
-      },
-    });
+    const requestId = ++promptRequest.current;
+    const selection = promptSelection.current;
+    const stillSelected = () =>
+      requestId === promptRequest.current &&
+      selection.epoch === documentEpoch.current &&
+      promptSelection.current.selected === activeNode.id &&
+      promptSelection.current.childPath === selection.childPath;
+    let prompt: string;
+    try {
+      prompt = await request("load_prompt", { name });
+    } catch (error) {
+      if (stillSelected()) throw error;
+      return;
+    }
+    if (!stillSelected()) return;
+    const current = graphRef.current.nodes.find(
+      (node) => node.id === activeNode.id,
+    );
+    const currentConfig = current && typedData(current);
+    if (
+      !current ||
+      currentConfig?.type !== "agent" ||
+      currentConfig.prompt !== config.prompt
+    )
+      return;
+    updateNode({ ...current, data: { ...currentConfig, prompt } });
     setNotice(`Loaded ${name}`);
   }
   async function removeLibrary(
-    method: string,
-    args: Record<string, unknown>,
+    method: "delete_kind" | "delete_prompt" | "delete_preset",
+    args: { name: string; type?: "agent" | "database" },
     name: string,
   ) {
     if (!(await confirmAction(`Delete ${name} from the library?`))) return;
-    await request(method, args);
+    if (method === "delete_preset") {
+      if (!args.type) throw new Error("Choose a preset type to delete.");
+      await request(method, { name: args.name, type: args.type });
+    } else await request(method, { name: args.name });
     await refreshLibrary();
     setNotice(`Deleted ${name}`);
   }
@@ -617,9 +758,11 @@ export default function App() {
     const stop = () => {
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", stop);
+      window.removeEventListener("pointercancel", stop);
     };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", stop);
+    window.addEventListener("pointercancel", stop);
   }
   const keyboard = useRef({
     save,
@@ -652,8 +795,9 @@ export default function App() {
       if (
         !event.shiftKey &&
         event.key.toLowerCase() === "n" &&
-        !(event.target as HTMLElement).closest(
-          'input,textarea,select,[contenteditable="true"]',
+        !(
+          event.target instanceof Element &&
+          event.target.closest('input,textarea,select,[contenteditable="true"]')
         )
       ) {
         event.preventDefault();
@@ -962,10 +1106,10 @@ export default function App() {
             <button
               className="danger-button"
               onClick={() => void action(cancelRun)}
-              disabled={runtime.cancelling}
+              disabled={runtime?.cancelling}
             >
               <Square size={12} />
-              {runtime.cancelling ? "Cancelling…" : "Cancel run"}
+              {runtime?.cancelling ? "Cancelling…" : "Cancel run"}
             </button>
           ) : (
             <button
@@ -1357,6 +1501,7 @@ export default function App() {
             hidden={panel !== "inspector"}
           >
             <Inspector
+              scopeKey={`${epoch}:${activeChild?.path || ""}:${historical ? currentRun?.id || "" : ""}`}
               graph={activeGraph}
               node={activeNode}
               readOnly={readOnly}
@@ -1419,7 +1564,7 @@ export default function App() {
                   disabled={running}
                   onClick={() =>
                     void action(async () => {
-                      const count = await request<number>("clear_cache");
+                      const count = await request("clear_cache");
                       setNotice(`Cleared ${count} cached outputs`);
                     })
                   }
