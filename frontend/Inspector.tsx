@@ -22,6 +22,8 @@ import {
   type WorkflowGraphs,
 } from "./graph";
 import { compareNodeOutputs, sameNodeConfig } from "./inspectorState";
+import ComboInput from "./ComboInput";
+import OutputActions from "./OutputActions";
 import "./inspector.css";
 
 type Config = NodeData;
@@ -252,26 +254,25 @@ function Text({
             rows={rows}
             spellCheck={!mono}
           />
+        ) : choices?.length ? (
+          <ComboInput
+            id={id}
+            value={value}
+            onChange={onChange}
+            choices={choices}
+            placeholder={placeholder}
+            mono={mono}
+          />
         ) : (
-          <>
-            <input
-              id={id}
-              className={mono ? "ins-mono" : ""}
-              value={value}
-              onChange={(event) => onChange(event.target.value)}
-              placeholder={placeholder}
-              list={choices?.length ? `${id}-choices` : undefined}
-              autoComplete="off"
-              spellCheck={!mono}
-            />
-            {choices?.length ? (
-              <datalist id={`${id}-choices`}>
-                {choices.map((choice) => (
-                  <option key={choice} value={choice} />
-                ))}
-              </datalist>
-            ) : null}
-          </>
+          <input
+            id={id}
+            className={mono ? "ins-mono" : ""}
+            value={value}
+            onChange={(event) => onChange(event.target.value)}
+            placeholder={placeholder}
+            autoComplete="off"
+            spellCheck={!mono}
+          />
         )
       }
     </FieldControl>
@@ -415,6 +416,45 @@ function Lines({
   );
 }
 
+/** Says whether an environment variable is set for this process, never its value. */
+function EnvStatus({ name }: { name: string }) {
+  const [state, setState] = useState<{ name: string; set: boolean } | null>(
+    null,
+  );
+  const trimmed = name.trim();
+  useEffect(() => {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(trimmed)) {
+      setState(null);
+      return;
+    }
+    let active = true;
+    const timer = window.setTimeout(() => {
+      request("env_var_set", { name: trimmed })
+        .then((set) => {
+          if (active) setState({ name: trimmed, set });
+        })
+        .catch(() => {
+          if (active) setState(null);
+        });
+    }, 250);
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [trimmed]);
+  if (!state || state.name !== trimmed) return null;
+  return (
+    <p
+      className={`ins-help ins-env ${state.set ? "is-set" : "is-unset"}`}
+      role="status"
+    >
+      {state.set
+        ? `${state.name} is set in uapz's environment.`
+        : `${state.name} is not set in uapz's environment. Start uapz from a shell that exports it, or export it in your login profile.`}
+    </p>
+  );
+}
+
 export default function Inspector(props: InspectorProps) {
   const {
     graph,
@@ -459,6 +499,10 @@ export default function Inspector(props: InspectorProps) {
     fields: Field[];
   } | null>(null);
   const [childError, setChildError] = useState("");
+  const [models, setModels] = useState<{
+    key: string;
+    names: string[];
+  } | null>(null);
   const config = nodeConfig(node);
   const serialized = JSON.stringify(config);
   const selectedId = node?.id || "";
@@ -658,6 +702,10 @@ export default function Inspector(props: InspectorProps) {
 
   function renderAgent(data: Agent) {
     const local = ["ollama", "lmstudio", "llamacpp"].includes(data.provider);
+    const modelKey = `${data.provider}|${data.endpoint.trim()}`;
+    const listed = models?.key === modelKey ? models : null;
+    const providerName =
+      PROVIDERS.find(([id]) => id === data.provider)?.[1] ?? data.provider;
     const modelOptions: (readonly [Agent["model_type"], string])[] = [
       ["generative", "Generative"],
       ...(data.provider === "anthropic"
@@ -719,24 +767,61 @@ export default function Inspector(props: InspectorProps) {
           <Text
             label="Model"
             value={data.model}
+            choices={listed?.names}
             onChange={(model) => update(data, { model })}
+            help={
+              listed &&
+              data.model.trim() &&
+              !listed.names.includes(data.model.trim())
+                ? `Not among the models ${providerName} listed.`
+                : undefined
+            }
           />
         </div>
+        {!readOnly && (
+          <div className="ins-button-row ins-models">
+            <button
+              type="button"
+              disabled={busy}
+              title="Ask the provider which model ids it offers"
+              onClick={() =>
+                void perform(async (isActive) => {
+                  const names = await request("list_models", {
+                    config: bareConfig(data),
+                  });
+                  if (isActive()) setModels({ key: modelKey, names });
+                }, "Models listed")
+              }
+            >
+              Fetch models
+            </button>
+            {listed && (
+              <span className="ins-help">
+                {listed.names.length} model
+                {listed.names.length === 1 ? "" : "s"} from {providerName};
+                choose one in the Model field.
+              </span>
+            )}
+          </div>
+        )}
         {!local && (
-          <Text
-            label="API key environment variable"
-            value={data.auth.kind === "env" ? data.auth.var : ""}
-            onChange={(variable) =>
-              update(data, {
-                auth: variable
-                  ? { kind: "env", var: variable }
-                  : { kind: "none" },
-              })
-            }
-            placeholder={PROVIDER_DEFAULTS[data.provider]?.env}
-            help="Only the variable name is saved. The key stays in your shell."
-            mono
-          />
+          <>
+            <Text
+              label="API key environment variable"
+              value={data.auth.kind === "env" ? data.auth.var : ""}
+              onChange={(variable) =>
+                update(data, {
+                  auth: variable
+                    ? { kind: "env", var: variable }
+                    : { kind: "none" },
+                })
+              }
+              placeholder={PROVIDER_DEFAULTS[data.provider]?.env}
+              help="Only the variable name is saved. The key stays in your shell."
+              mono
+            />
+            {data.auth.kind === "env" && <EnvStatus name={data.auth.var} />}
+          </>
         )}
         <Text
           label="System prompt"
@@ -894,13 +979,16 @@ export default function Inspector(props: InspectorProps) {
             mono
           />
         ) : (
-          <Text
-            label="Connection URL environment variable"
-            value={data.url_env}
-            onChange={(url_env) => update(data, { url_env })}
-            help="The connection URL and its password stay in your shell."
-            mono
-          />
+          <>
+            <Text
+              label="Connection URL environment variable"
+              value={data.url_env}
+              onChange={(url_env) => update(data, { url_env })}
+              help="The connection URL and its password stay in your shell."
+              mono
+            />
+            <EnvStatus name={data.url_env} />
+          </>
         )}
         <div className="ins-two">
           <Text
@@ -2087,10 +2175,12 @@ function Output({
   const full = loaded?.identity === identity ? loaded.data : null;
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [note, setNote] = useState<string | null>(null);
   useEffect(() => {
     setLoaded(null);
     setBusy(false);
     setError("");
+    setNote(null);
   }, [identity]);
   async function load() {
     if (!context || !node) return;
@@ -2183,6 +2273,12 @@ function Output({
               <code>{result.saved}</code>
             </p>
           )}
+          <OutputActions
+            text={typeof text === "string" && text ? text : null}
+            saved={result.saved || full?.saved || null}
+            note={note}
+            onNote={setNote}
+          />
         </>
       )}
       {Object.entries(result.named_outputs || {}).map(([name, output]) => (

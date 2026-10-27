@@ -1,4 +1,5 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { Method, Protocol } from "./protocol";
 import { decodeResponse } from "./responses";
 
@@ -16,4 +17,23 @@ export async function request<M extends Method>(
     args: parameters[0] || {},
   });
   return decodeResponse(method, value);
+}
+
+/** Subscribe to an event from the desktop shell. Outside it, nothing arrives. */
+export async function onHostEvent(
+  event: string,
+  handler: () => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  try {
+    return await listen(event, () => handler());
+  } catch {
+    return () => {};
+  }
+}
+
+/** Exit the desktop shell now; the renderer has already settled unsaved work. */
+export async function quitApp() {
+  if (!isTauri()) return;
+  await invoke("quit");
 }

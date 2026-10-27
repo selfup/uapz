@@ -4,58 +4,60 @@
   height: 100%;
   min-width: 0;
   min-height: 280px;
-  background: #17191d;
+  background: var(--bg-panel);
   outline: none;
 }
 .graph-canvas .react-flow {
-  --xy-edge-stroke-default: #707680;
-  --xy-edge-stroke-selected-default: #d3d8e1;
+  --xy-background-color-default: var(--bg);
+  --xy-background-pattern-dots-color-default: var(--dots);
+  --xy-edge-stroke-default: var(--text-faint);
+  --xy-edge-stroke-selected-default: var(--text);
   --xy-edge-stroke-width-default: 2;
-  --xy-controls-button-background-color-default: #24272d;
-  --xy-controls-button-background-color-hover-default: #333740;
-  --xy-controls-button-color-default: #d2d6df;
-  --xy-controls-button-border-color-default: #3b404a;
+  --xy-controls-button-background-color-default: var(--bg-raised);
+  --xy-controls-button-background-color-hover-default: var(--bg-hover);
+  --xy-controls-button-color-default: var(--text);
+  --xy-controls-button-border-color-default: var(--border);
 }
 .graph-canvas .react-flow__node-card {
   width: 224px;
   border: 0;
   background: transparent;
-  color: #e3e6eb;
+  color: var(--text);
   font-family: inherit;
 }
 .graph-card {
   position: relative;
   min-height: 104px;
-  border: 1px solid #41464e;
-  border-left: 3px solid var(--node-accent, #9ca3af);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--node-accent, var(--text-muted));
   border-radius: 8px;
-  background: #24272d;
+  background: var(--bg-raised);
   box-shadow: 0 3px 12px #0003;
   text-align: left;
 }
 .graph-card.is-selected {
-  border-color: #bcc5d3;
-  border-left-color: var(--node-accent, #9ca3af);
+  border-color: var(--text-soft);
+  border-left-color: var(--node-accent, var(--text-muted));
   box-shadow:
-    0 0 0 1px #bcc5d3,
-    0 4px 16px #0005;
+    0 0 0 1px var(--text-soft),
+    0 4px 16px var(--shadow);
 }
 .graph-card-kind {
   display: flex;
   align-items: center;
   gap: 7px;
   padding: 11px 13px 0;
-  color: #939ba8;
-  font-size: 10px;
+  color: var(--text-muted);
+  font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.08em;
 }
 .graph-card.writes .graph-card-kind {
-  color: #f47d7d;
+  color: var(--danger);
 }
 .graph-card-id {
   margin-left: auto;
-  color: #727b89;
+  color: var(--text-faint);
   text-transform: none;
   letter-spacing: 0;
 }
@@ -73,13 +75,13 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 11px;
-  color: #a1a8b4;
+  color: var(--text-muted);
   padding: 8px 13px 14px;
 }
 .graph-card-alias {
   margin: -4px 12px 10px;
-  color: #9cbdad;
-  font-size: 10px;
+  color: var(--alias);
+  font-size: 11px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -87,20 +89,20 @@
 .graph-canvas .card-port {
   width: 10px;
   height: 10px;
-  border: 2px solid #b4bdca;
-  background: #252a31;
+  border: 2px solid var(--text-soft);
+  background: var(--bg-raised);
   border-radius: 50%;
 }
 .graph-canvas .card-port:hover {
-  background: #d1dae7;
+  background: var(--text);
 }
 .graph-canvas .card-port.missing {
-  border-color: #c89156;
-  background: #34302b;
+  border-color: var(--warning);
+  background: var(--warning-bg);
   cursor: default;
 }
 .graph-card-ports {
-  border-top: 1px solid #3b4048;
+  border-top: 1px solid var(--border);
   padding: 3px 0;
 }
 .graph-port-row {
@@ -111,7 +113,7 @@
   gap: 6px;
   justify-content: flex-end;
   padding: 3px 13px;
-  color: #bac1cd;
+  color: var(--text-soft);
   font-size: 11px;
 }
 .graph-port-row > span {
@@ -120,78 +122,125 @@
   white-space: nowrap;
 }
 .graph-port-row.is-missing {
-  color: #d2a06d;
+  color: var(--warning);
 }
 .graph-port-alias {
-  color: #93ad9f;
+  color: var(--alias);
   max-width: 95px;
-  font-size: 9px;
+  font-size: 11px;
 }
 .graph-port-empty,
 .graph-card-warning {
   padding: 7px 13px;
-  font-size: 10px;
-  color: #9099a7;
+  font-size: 11px;
+  color: var(--text-muted);
 }
 .graph-card-warning {
-  color: #d2a06d;
+  color: var(--warning);
 }
 .run-dot {
   flex: 0 0 auto;
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: #727d90;
+  background: var(--text-faint);
 }
 .run-dot.running {
-  background: #e3b857;
+  background: var(--warning);
   box-shadow: 0 0 6px #e3b85777;
 }
 .run-dot.ran,
 .run-dot.completed,
 .run-dot.succeeded {
-  background: #60bb91;
+  background: var(--success);
 }
 .run-dot.reused,
 .run-dot.cached {
-  background: #79a9d7;
+  background: var(--info);
 }
 .run-dot.failed {
-  background: #ed6f75;
-}
-.graph-empty {
-  pointer-events: none;
-  position: absolute;
-  inset: 0;
-  display: flex;
-  gap: 10px;
-  align-items: center;
-  justify-content: center;
-  flex-direction: column;
-  color: #6e7887;
-  font-size: 13px;
-}
-.graph-empty strong {
-  font-weight: 500;
-  font-size: 20px;
-  color: #aab2bf;
+  background: var(--danger);
 }
 .graph-help {
   position: absolute;
   right: 12px;
   bottom: 12px;
   max-width: calc(100% - 80px);
-  font-size: 10px;
-  color: #858e9d;
-  background: #17191de8;
+  font-size: 11px;
+  color: var(--text-faint);
+  background: var(--overlay);
   border-radius: 4px;
   padding: 6px 8px;
   pointer-events: none;
 }
 .graph-canvas .react-flow__controls {
-  box-shadow: 0 1px 6px #0005;
+  box-shadow: 0 1px 6px var(--shadow);
 }
 .graph-canvas .react-flow__edge.selected .react-flow__edge-path {
-  stroke: #d3d8e1;
+  stroke: var(--text);
   stroke-width: 3;
+}
+.graph-canvas .react-flow__attribution {
+  background: var(--overlay);
+  border-radius: 4px;
+  padding: 2px 6px;
+  margin: 6px;
+}
+.graph-canvas .react-flow__attribution a {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+.card-problem {
+  display: inline-grid;
+  place-items: center;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: var(--warning);
+  color: var(--on-warning);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0;
+  cursor: help;
+}
+.canvas-menu {
+  position: absolute;
+  z-index: 20;
+  display: grid;
+  gap: 2px;
+  padding: 5px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 12px 40px #000a;
+}
+.canvas-menu button {
+  justify-content: space-between;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  padding: 7px 9px;
+  font-size: 12px;
+  border-radius: 5px;
+  text-align: left;
+}
+.canvas-menu button:hover:not(:disabled),
+.canvas-menu button:focus-visible {
+  background: var(--bg-hover);
+}
+.canvas-menu button.danger {
+  color: var(--danger-text);
+}
+.canvas-menu kbd {
+  font: inherit;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+.graph-canvas .react-flow__selection {
+  background: #8589dc1a;
+  border: 1px solid var(--accent-strong);
+}
+.graph-canvas .react-flow__nodesselection-rect {
+  background: transparent;
+  border: 1px dashed #8589dc99;
 }

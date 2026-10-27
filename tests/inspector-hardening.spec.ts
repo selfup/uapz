@@ -208,8 +208,8 @@ test("schema results and failures stay attached to the inspected database config
     .getByRole("button", { name: "Extract", exact: true })
     .click();
   await page
-    .getByRole("dialog", { name: "Confirm change" })
-    .getByRole("button", { name: "Continue", exact: true })
+    .getByRole("dialog", { name: "Unsaved changes" })
+    .getByRole("button", { name: "Discard changes", exact: true })
     .click();
   await expect(page.getByLabel("Name", { exact: true })).toHaveValue(
     "Original source",

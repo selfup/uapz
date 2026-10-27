@@ -1,11 +1,18 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { request } from "./api";
+import OutputActions from "./OutputActions";
 import { feedNodeName, runFeed } from "./runFeed";
 import type { GraphDoc, NodeRun, Run, RuntimeState } from "./types";
 import type { FullOutput } from "./protocol";
 import "./runPanel.css";
 
-type Props = { graph: GraphDoc; runtime: RuntimeState | null; run: Run | null };
+type Props = {
+  graph: GraphDoc;
+  runtime: RuntimeState | null;
+  run: Run | null;
+  /** Called with a node path such as `n1` or `n1/n4` to show it on the canvas. */
+  onSelectNode?: (path: string) => void;
+};
 type OutputContext = { graph: string; runId: string; id: string };
 const AUTOMATIC_OUTPUT_BYTES = 256 * 1024;
 
@@ -14,7 +21,12 @@ export default function RunPanel(props: Props) {
   return <RunFeedPanel key={identity} {...props} />;
 }
 
-function RunFeedPanel({ graph, runtime, run: selectedRun }: Props) {
+function RunFeedPanel({
+  graph,
+  runtime,
+  run: selectedRun,
+  onSelectNode,
+}: Props) {
   const run = runtime?.run || selectedRun;
   const root = runtime?.graph || graph;
   const entries = runFeed(runtime, run);
@@ -204,7 +216,20 @@ function RunFeedPanel({ graph, runtime, run: selectedRun }: Props) {
                     data-node-path={entry.id}
                   >
                     <header>
-                      <h3>{feedNodeName(root, entry.id, workflows, run)}</h3>
+                      <h3>
+                        {onSelectNode ? (
+                          <button
+                            type="button"
+                            className="run-entry-link"
+                            title="Show this node on the canvas"
+                            onClick={() => onSelectNode(entry.id)}
+                          >
+                            {feedNodeName(root, entry.id, workflows, run)}
+                          </button>
+                        ) : (
+                          feedNodeName(root, entry.id, workflows, run)
+                        )}
+                      </h3>
                       <span>
                         {entry.kind === "node"
                           ? entry.state
@@ -279,6 +304,9 @@ function RunOutput({
     identity: string;
     error: string;
   } | null>(null);
+  const [note, setNote] = useState<{ identity: string; text: string } | null>(
+    null,
+  );
   const retrieval = useRef<{
     identity: string;
     attempt: number;
@@ -438,6 +466,12 @@ function RunOutput({
               Saved to <code>{full?.saved || result.saved}</code>
             </p>
           )}
+          <OutputActions
+            text={typeof text === "string" && text !== "" ? text : null}
+            saved={full?.saved || result.saved || null}
+            note={note?.identity === identity ? note.text : null}
+            onNote={(text) => setNote({ identity, text })}
+          />
         </>
       )}
       {Object.entries(result.named_outputs || {}).map(([name, output]) => (

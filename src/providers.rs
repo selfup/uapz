@@ -71,6 +71,12 @@ pub struct Reply {
 pub trait Http: Send + Sync {
     fn post_json(&self, request: &Request) -> Result<Reply, String>;
 
+    /// One JSON GET for listings such as the available models. The default refuses;
+    /// fakes that only answer generation requests need no listing support.
+    fn get_json(&self, request: &Request) -> Result<Reply, String> {
+        Err(format!("{} cannot be listed with this client", request.url))
+    }
+
     /// The same POST with the body handed over in pieces as it arrives, each with the
     /// status, for streamed replies. `sink` returns false to stop reading; the status is
     /// returned either way. The default delivers the whole body at once.
@@ -105,6 +111,25 @@ impl UreqHttp {
 }
 
 impl Http for UreqHttp {
+    fn get_json(&self, request: &Request) -> Result<Reply, String> {
+        let mut req = self.agent.get(&request.url);
+        for (key, value) in &request.headers {
+            req = req.header(key.as_str(), value.as_str());
+        }
+        let mut response = req
+            .call()
+            .map_err(|e| format!("request to {} failed: {e}", request.url))?;
+        let status = response.status().as_u16();
+        reject_redirect(status)?;
+        let body = response
+            .body_mut()
+            .with_config()
+            .limit(MAX_REPLY_BYTES)
+            .read_to_string()
+            .map_err(|e| format!("reading the reply from {} failed: {e}", request.url))?;
+        Ok(Reply { status, body })
+    }
+
     fn post_json(&self, request: &Request) -> Result<Reply, String> {
         let mut req = self.agent.post(&request.url);
         for (key, value) in &request.headers {
@@ -823,6 +848,101 @@ fn excerpt(text: &str) -> String {
 /// Whether this provider sends the configured temperature at all.
 pub fn sends_temperature(provider: Provider) -> bool {
     provider.api() != Api::Anthropic
+}
+
+// ----- model listings -----
+
+/// At most this many ids are offered from one listing.
+const MAX_LISTED_MODELS: usize = 2000;
+
+/// Where a provider lists its models: a GET under the same endpoint and key rules as
+/// generation requests. The body is unused.
+pub fn models_request(config: &AgentConfig, key: Option<&str>) -> Result<Request, String> {
+    let endpoint = crate::validate::endpoint_url(config.endpoint_url())?;
+    let base = endpoint.as_str().trim_end_matches('/').to_string();
+    let mut headers: Vec<(String, String)> = Vec::new();
+    let url = match config.provider.api() {
+        Api::OpenAi => {
+            if let Some(key) = key {
+                headers.push(("authorization".into(), format!("Bearer {key}")));
+            }
+            format!("{base}/models")
+        }
+        Api::Ollama => format!("{base}/api/tags"),
+        Api::Anthropic => {
+            let key = key.ok_or("Anthropic needs an API key")?;
+            headers.push(("x-api-key".into(), key.to_string()));
+            headers.push(("anthropic-version".into(), ANTHROPIC_VERSION.into()));
+            format!("{base}/models?limit=1000")
+        }
+        Api::Google => {
+            let key = key.ok_or("Google needs an API key")?;
+            headers.push(("x-goog-api-key".into(), key.to_string()));
+            format!("{base}/models?pageSize=1000")
+        }
+    };
+    Ok(Request {
+        url,
+        headers,
+        body: Value::Null,
+    })
+}
+
+/// Model ids from a listing reply, sorted and deduplicated. Ids that could never be
+/// used in a request are dropped rather than offered.
+pub fn parse_models(config: &AgentConfig, reply: &Reply) -> Result<Vec<String>, String> {
+    let provider = config.provider.label();
+    let value: Value = match serde_json::from_str(&reply.body) {
+        Ok(value) => value,
+        Err(_) if reply.status >= 400 => {
+            return Err(format!(
+                "{provider} returned HTTP {}: {}",
+                reply.status,
+                excerpt(&reply.body)
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "{provider} sent a reply that is not JSON ({e}): {}",
+                excerpt(&reply.body)
+            ));
+        }
+    };
+    if reply.status >= 400 {
+        let message = error_message(&value).unwrap_or_else(|| excerpt(&reply.body));
+        return Err(format!(
+            "{provider} returned HTTP {}: {message}",
+            reply.status
+        ));
+    }
+    let (list, field) = match config.provider.api() {
+        Api::Ollama | Api::Google => (value.get("models"), "name"),
+        Api::OpenAi | Api::Anthropic => (value.get("data"), "id"),
+    };
+    let Some(items) = list.and_then(Value::as_array) else {
+        return Err(format!("{provider} listed no models in its reply"));
+    };
+    let mut names: Vec<String> = items
+        .iter()
+        .filter_map(|item| item.get(field).and_then(Value::as_str))
+        .map(|name| name.strip_prefix("models/").unwrap_or(name).to_string())
+        .filter(|name| crate::validate::model_id(name).is_ok())
+        .take(MAX_LISTED_MODELS)
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    Ok(names)
+}
+
+/// Ask the provider which models it offers.
+pub fn list_models(
+    http: &dyn Http,
+    config: &AgentConfig,
+    key: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let request = models_request(config, key)?;
+    let reply = http.get_json(&request)?;
+    parse_models(config, &reply)
 }
 
 #[cfg(test)]
@@ -1772,5 +1892,89 @@ pub(crate) mod tests {
         let seen = http.seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].url, "https://api.mistral.ai/v1/chat/completions");
+    }
+}
+
+#[cfg(test)]
+mod model_listing_tests {
+    use super::*;
+    use crate::node_data::Provider;
+
+    fn config(provider: Provider) -> AgentConfig {
+        AgentConfig {
+            provider,
+            ..AgentConfig::default()
+        }
+    }
+
+    #[test]
+    fn listing_urls_follow_each_api() {
+        let ollama = models_request(&config(Provider::Ollama), None).unwrap();
+        assert_eq!(ollama.url, "http://localhost:11434/api/tags");
+        assert!(ollama.headers.is_empty());
+        let lm = models_request(&config(Provider::LmStudio), None).unwrap();
+        assert_eq!(lm.url, "http://localhost:1234/v1/models");
+        let openai = models_request(&config(Provider::OpenAi), Some("sk")).unwrap();
+        assert_eq!(openai.url, "https://api.openai.com/v1/models");
+        assert_eq!(
+            openai.headers,
+            vec![("authorization".to_string(), "Bearer sk".to_string())]
+        );
+        assert!(
+            models_request(&config(Provider::Anthropic), None)
+                .unwrap_err()
+                .contains("API key")
+        );
+        let google = models_request(&config(Provider::Google), Some("g")).unwrap();
+        assert!(google.url.ends_with("/models?pageSize=1000"));
+        assert_eq!(google.headers[0].0, "x-goog-api-key");
+    }
+
+    #[test]
+    fn listings_are_parsed_sorted_and_filtered() {
+        let reply = |body: &str| Reply {
+            status: 200,
+            body: body.into(),
+        };
+        assert_eq!(
+            parse_models(
+                &config(Provider::Ollama),
+                &reply(
+                    r#"{"models":[{"name":"llama3.1:latest"},{"name":"gemma"},{"name":"gemma"}]}"#
+                )
+            )
+            .unwrap(),
+            vec!["gemma", "llama3.1:latest"]
+        );
+        assert_eq!(
+            parse_models(
+                &config(Provider::LmStudio),
+                &reply(r#"{"data":[{"id":"mistralai/ministral-3-3b"},{"id":"../bad"}]}"#)
+            )
+            .unwrap(),
+            vec!["mistralai/ministral-3-3b"]
+        );
+        assert_eq!(
+            parse_models(
+                &config(Provider::Google),
+                &reply(r#"{"models":[{"name":"models/gemini-2.5-pro"}]}"#)
+            )
+            .unwrap(),
+            vec!["gemini-2.5-pro"]
+        );
+        let error = parse_models(
+            &config(Provider::OpenAi),
+            &Reply {
+                status: 401,
+                body: r#"{"error":{"message":"bad key"}}"#.into(),
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("401") && error.contains("bad key"));
+        assert!(
+            parse_models(&config(Provider::OpenAi), &reply("{}"))
+                .unwrap_err()
+                .contains("no models")
+        );
     }
 }

@@ -84,5 +84,15 @@ export interface Protocol {
     { config: DatabaseConfig; agent: AgentConfig; question: string },
     string
   >;
+  list_models: Call<{ config: AgentConfig }, string[]>;
+  env_var_set: Call<{ name: string }, boolean>;
+  delete_graph: Call<{ name: string }, null>;
+  rename_graph: Call<{ from: string; to: string }, { name: string }>;
+  duplicate_graph: Call<{ from: string; to: string }, { name: string }>;
+  reveal: Call<{ path: string }, null>;
+  install_examples: Call<
+    undefined,
+    { installed: string[]; skipped: string[] }
+  >;
 }
 export type Method = keyof Protocol;

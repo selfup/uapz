@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { EdgeDoc, GraphDoc, NodeDoc } from "./types";
 import {
+  CARD_SIZE,
   assignPublications,
+  cloneNodes,
   connectNodes,
+  dataFormatFor,
+  freePosition,
   defaultNodeData,
   deleteNodes,
   flowToGraphPoint,
@@ -12,8 +16,10 @@ import {
   nodeLabel,
   nodeSummary,
   publishOutput,
+  scriptRuntimeFor,
   sinkIds,
   typedData,
+  uniqueName,
   visibleEdgeHandle,
   workflowPorts,
 } from "./graph";
@@ -387,5 +393,84 @@ describe("graph mutations", () => {
       x: 5,
       y: 17,
     });
+  });
+});
+
+describe("node placement and library file helpers", () => {
+  it("keeps a new card out of occupied space by stepping diagonally", () => {
+    const graph = doc();
+    const first = graph.nodes[0];
+    const placed = freePosition(graph, { x: first.x, y: first.y });
+    expect(placed).not.toEqual({ x: first.x, y: first.y });
+    expect(placed.x - first.x).toBe(placed.y - first.y);
+    expect(
+      graph.nodes.some(
+        (node) =>
+          Math.abs(node.x - placed.x) < CARD_SIZE.width &&
+          Math.abs(node.y - placed.y) < CARD_SIZE.height,
+      ),
+    ).toBe(false);
+    expect(freePosition(graph, { x: 2000.4, y: 2000.6 })).toEqual({
+      x: 2000,
+      y: 2001,
+    });
+  });
+
+  it("infers script runtimes and data formats from file names", () => {
+    expect(scriptRuntimeFor("tool.py")).toBe("python");
+    expect(scriptRuntimeFor("tool.mjs")).toBe("node");
+    expect(scriptRuntimeFor("tool.sh")).toBe("shell");
+    expect(dataFormatFor("rows.CSV")).toBe("csv");
+    expect(dataFormatFor("rows.jsonl")).toBe("json");
+    expect(dataFormatFor("notes.md")).toBe("markdown");
+    expect(dataFormatFor("photo.webp")).toBe("image");
+    expect(dataFormatFor("archive.zip")).toBe("binary");
+  });
+});
+
+describe("copying nodes", () => {
+  it("assigns fresh ids, unique names and keeps only the wires among the copies", () => {
+    const graph = doc();
+    const [first, second] = graph.nodes;
+    first.name = "source";
+    const { graph: next, ids } = cloneNodes(graph, graph.nodes, graph.edges);
+    expect(ids).toEqual(["n8", "n9"]);
+    expect(next.nodes).toHaveLength(4);
+    const copies = next.nodes.filter((node) => ids.includes(node.id));
+    expect(copies[0]).toMatchObject({
+      name: "source-copy",
+      x: first.x + 40,
+      y: first.y + 40,
+    });
+    expect(copies[1]?.name).toBeUndefined();
+    expect(copies[1]?.x).toBe(second.x + 40);
+    expect(next.edges).toHaveLength(2);
+    expect(next.edges[1]).toMatchObject({ from: "n8", to: "n9" });
+    expect(next.edges[1]?.output).toBe(graph.edges[0].output ?? undefined);
+    const again = cloneNodes(next, copies, []);
+    expect(again.graph.nodes.map((node) => node.name).filter(Boolean)).toEqual([
+      "source",
+      "source-copy",
+      "source-copy-2",
+    ]);
+  });
+
+  it("moves a group so its top-left corner lands on a target point", () => {
+    const graph = doc();
+    const { graph: next, ids } = cloneNodes(graph, graph.nodes, [], {
+      at: { x: 500, y: 600 },
+    });
+    const copies = next.nodes.filter((node) => ids.includes(node.id));
+    expect(Math.min(...copies.map((node) => node.x))).toBe(500);
+    expect(Math.min(...copies.map((node) => node.y))).toBe(600);
+    expect(cloneNodes(graph, [], []).graph).toBe(graph);
+  });
+
+  it("derives names that avoid every taken name", () => {
+    const taken = new Set(["a", "a-copy", "a-copy-2"]);
+    expect(uniqueName("a", taken)).toBe("a-copy-3");
+    expect(uniqueName("a-copy", taken)).toBe("a-copy-3");
+    expect(uniqueName("b", taken)).toBe("b");
+    expect(uniqueName("  ", taken)).toBe("");
   });
 });

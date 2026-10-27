@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::{path::PathBuf, sync::Arc};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use uapz::app::AppService;
 
 struct SmokeMode(bool);
@@ -28,6 +28,12 @@ fn smoke_result(
         }
     }
     Ok(())
+}
+
+#[tauri::command]
+fn quit(app: tauri::AppHandle) {
+    // A programmatic exit carries a code, so the exit handler lets it through.
+    app.exit(0);
 }
 
 #[tauri::command]
@@ -88,7 +94,17 @@ fn main() {
                 window.app_handle().exit(1);
             }
         })
-        .invoke_handler(tauri::generate_handler![request, smoke_result])
+        .on_window_event(move |window, event| {
+            // The renderer owns the unsaved-changes prompt: it answers the event by
+            // calling `quit`, or leaves the window open.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event
+                && !smoke
+            {
+                api.prevent_close();
+                let _ = window.emit("close-requested", ());
+            }
+        })
+        .invoke_handler(tauri::generate_handler![request, smoke_result, quit])
         .build(tauri::generate_context!())
         .expect("failed to run uapz");
     if smoke {
@@ -99,8 +115,14 @@ fn main() {
             handle.exit(1);
         });
     }
-    app.run(|app, event| {
-        if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
+    app.run(move |app, event| {
+        if let tauri::RunEvent::ExitRequested { code, api, .. } = &event {
+            if code.is_none() && !smoke {
+                // Quit from the menu or dock: let the renderer confirm unsaved work.
+                api.prevent_exit();
+                let _ = app.emit("close-requested", ());
+                return;
+            }
             let service = app.state::<Arc<AppService>>();
             service.cancel_active();
             // Give cancellable process workers time to terminate their subprocesses.

@@ -21,10 +21,10 @@ use crate::{
     exec::{self, Cache, Control, Progress},
     history, library,
     node_data::{
-        AgentConfig, DataFormat, DatabaseConfig, DbEngine, ModelType, NodeData, NodeType,
+        AgentConfig, Auth, DataFormat, DatabaseConfig, DbEngine, ModelType, NodeData, NodeType,
         OutputType, Provider, Runtime, WriteMode,
     },
-    providers::UreqHttp,
+    providers::{self, UreqHttp},
     review, storage, validate,
     workflow::{self, InputType},
 };
@@ -34,6 +34,8 @@ const MAX_LIVE_LOG: usize = 512 * 1024;
 const MAX_FEED_EVENTS: usize = 2048;
 const MAX_FEED_BYTES: usize = 2 * 1024 * 1024;
 const MAX_LIVE_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+/// Model listings are short requests; the executor timeout is for generation.
+const LISTING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 #[derive(Serialize)]
 struct FeedEvent {
@@ -565,6 +567,60 @@ impl AppService {
                     &exec::process_env,
                 )?)
             }
+            "list_models" => {
+                let config: AgentConfig = field(&args, "config")?;
+                let key = match &config.auth {
+                    Auth::Env { var } => Some(
+                        exec::process_env(var)
+                            .filter(|value| !value.trim().is_empty())
+                            .ok_or_else(|| format!("environment variable {var} is not set"))?,
+                    ),
+                    Auth::None => None,
+                };
+                value(providers::list_models(
+                    &UreqHttp::new(LISTING_TIMEOUT),
+                    &config,
+                    key.as_deref(),
+                )?)
+            }
+            "env_var_set" => {
+                let name = string(&args, "name")?;
+                validate::env_var(name)?;
+                // Only presence is reported; the value never crosses this boundary.
+                Ok(Value::Bool(
+                    exec::process_env(name.trim()).is_some_and(|value| !value.trim().is_empty()),
+                ))
+            }
+            "delete_graph" => {
+                let _current = self.idle()?;
+                let name = string(&args, "name")?;
+                doc::delete(name)?;
+                history::clear(&self.root, &history_graph(name)?);
+                Ok(Value::Null)
+            }
+            "rename_graph" => {
+                let _current = self.idle()?;
+                let from = string(&args, "from")?;
+                let to = doc::sanitize_name(string(&args, "to")?);
+                doc::rename(from, &to)?;
+                history::rename(&self.root, &history_graph(from)?, &history_graph(&to)?)?;
+                Ok(json!({"name": to}))
+            }
+            "duplicate_graph" => {
+                let from = string(&args, "from")?;
+                let to = doc::sanitize_name(string(&args, "to")?);
+                doc::duplicate(from, &to)?;
+                Ok(json!({"name": to}))
+            }
+            "reveal" => {
+                let path = validate::resolve_inside(&self.root, string(&args, "path")?)?;
+                reveal(&path)?;
+                Ok(Value::Null)
+            }
+            "install_examples" => {
+                let (installed, skipped) = crate::examples::install(&self.root)?;
+                Ok(json!({"installed": installed, "skipped": skipped}))
+            }
             _ => Err(format!("unknown application request: {method}")),
         }
     }
@@ -832,6 +888,32 @@ impl AppService {
                 "write_modes":WriteMode::ALL.map(|v|json!({"value":v,"label":v.label()})),
                 "input_types":InputType::ALL.map(|v|json!({"value":v,"label":v.label()}))}})
     }
+}
+
+/// Show a workspace file in the platform's file manager. Callers resolve the path
+/// inside the workspace first, so nothing the renderer names can leave it.
+fn reveal(path: &std::path::Path) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+    let mut command = if cfg!(target_os = "macos") {
+        let mut command = Command::new("open");
+        command.arg("-R").arg(path);
+        command
+    } else if cfg!(target_os = "windows") {
+        let mut command = Command::new("explorer");
+        command.arg(format!("/select,{}", path.display()));
+        command
+    } else {
+        let mut command = Command::new("xdg-open");
+        command.arg(path.parent().unwrap_or(path));
+        command
+    };
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("could not open the file manager: {e}"))?;
+    Ok(())
 }
 
 fn value(value: impl serde::Serialize) -> Result<Value, String> {

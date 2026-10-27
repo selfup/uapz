@@ -480,6 +480,27 @@ pub fn clear(root: &Path, graph: &str) -> usize {
         .count()
 }
 
+/// Move a graph's run records under a new graph name, merging into any records the
+/// new name already has. A graph without history is not an error.
+pub fn rename(root: &Path, from: &str, to: &str) -> Result<usize, String> {
+    let Ok(source) = graph_dir(root, from, false) else {
+        return Ok(0);
+    };
+    let target = graph_dir(root, to, true)?;
+    if source == target {
+        return Ok(0);
+    }
+    let files = record_files(&source);
+    for path in &files {
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        fs::rename(path, target.join(name)).map_err(|e| format!("move {}: {e}", path.display()))?;
+    }
+    let _ = fs::remove_dir(&source);
+    Ok(files.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

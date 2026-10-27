@@ -3,6 +3,7 @@
 pub mod app;
 pub mod calls;
 pub mod doc;
+pub mod examples;
 pub mod exec;
 pub mod history;
 pub mod library;

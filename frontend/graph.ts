@@ -1,4 +1,11 @@
-import type { EdgeDoc, GraphDoc, NodeData, NodeDoc, NodeType } from "./types";
+import type {
+  DataFormat,
+  EdgeDoc,
+  GraphDoc,
+  NodeData,
+  NodeDoc,
+  NodeType,
+} from "./types";
 
 export type WorkflowGraphs = Record<string, GraphDoc>;
 export type Port = { id: string; missing: boolean };
@@ -393,4 +400,110 @@ export function flowToGraphPoint(point: Point, view: GraphDoc["view"]): Point {
 export function graphToFlowPoint(point: Point, view: GraphDoc["view"]): Point {
   const zoom = view.zoom ?? 1;
   return { x: point.x * zoom + view.pan_x, y: point.y * zoom + view.pan_y };
+}
+
+/** Rendered card size in graph units, used to keep new nodes out of occupied space. */
+export const CARD_SIZE = { width: 224, height: 104 };
+
+/** The first position at or after `start` whose card would not overlap an existing
+ * node, stepping diagonally so repeated adds fan out instead of stacking. */
+export function freePosition(graph: GraphDoc, start: Point): Point {
+  const gap = 24;
+  const overlaps = (point: Point) =>
+    graph.nodes.some(
+      (node) =>
+        point.x < node.x + CARD_SIZE.width + gap &&
+        point.x + CARD_SIZE.width + gap > node.x &&
+        point.y < node.y + CARD_SIZE.height + gap &&
+        point.y + CARD_SIZE.height + gap > node.y,
+    );
+  let candidate = { x: Math.round(start.x), y: Math.round(start.y) };
+  for (let step = 0; step < 64 && overlaps(candidate); step++)
+    candidate = { x: candidate.x + 36, y: candidate.y + 36 };
+  return candidate;
+}
+
+export function scriptRuntimeFor(name: string): "python" | "shell" | "node" {
+  return /\.(m?js|cjs)$/i.test(name)
+    ? "node"
+    : /\.py$/i.test(name)
+      ? "python"
+      : "shell";
+}
+
+export function dataFormatFor(name: string): DataFormat {
+  const ext = name.split(".").at(-1)?.toLowerCase() || "";
+  if (ext === "csv") return "csv";
+  if (ext === "tsv") return "tsv";
+  if (["json", "ndjson", "jsonl"].includes(ext)) return "json";
+  if (["md", "markdown"].includes(ext)) return "markdown";
+  if (["png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "svg"].includes(ext))
+    return "image";
+  if (ext === "pdf") return "pdf";
+  if (ext === "parquet") return "parquet";
+  if (["txt", "text", "log"].includes(ext)) return "text";
+  return "binary";
+}
+
+/** A node name no other node uses, derived from `base` with a numbered suffix. */
+export function uniqueName(base: string, taken: ReadonlySet<string>): string {
+  const root = base.trim();
+  if (!root) return "";
+  if (!taken.has(root)) return root;
+  const stem = root.replace(/-copy(-\d+)?$/, "");
+  let candidate = `${stem}-copy`;
+  for (let n = 2; taken.has(candidate); n++) candidate = `${stem}-copy-${n}`;
+  return candidate;
+}
+
+export type Placement = { offset: Point } | { at: Point };
+
+/** Insert copies of `nodes` (and the wires among them) with fresh ids, unique names
+ * and a shared displacement, returning the new document and the inserted ids. */
+export function cloneNodes(
+  graph: GraphDoc,
+  nodes: NodeDoc[],
+  edges: EdgeDoc[],
+  placement: Placement = { offset: { x: 40, y: 40 } },
+): { graph: GraphDoc; ids: string[] } {
+  if (!nodes.length) return { graph, ids: [] };
+  const taken = new Set(
+    graph.nodes.flatMap((node) =>
+      node.name?.trim() ? [node.name.trim()] : [],
+    ),
+  );
+  const origin = {
+    x: Math.min(...nodes.map((node) => node.x)),
+    y: Math.min(...nodes.map((node) => node.y)),
+  };
+  const shift =
+    "at" in placement
+      ? { x: placement.at.x - origin.x, y: placement.at.y - origin.y }
+      : placement.offset;
+  const ids = new Map<string, string>();
+  const working: GraphDoc = { ...graph, nodes: [...graph.nodes] };
+  for (const node of nodes) {
+    const id = nextNodeId(working);
+    ids.set(node.id, id);
+    const name = node.name?.trim() ? uniqueName(node.name, taken) : undefined;
+    if (name) taken.add(name);
+    const copy: NodeDoc = {
+      ...structuredClone(node),
+      id,
+      x: node.x + shift.x,
+      y: node.y + shift.y,
+    };
+    if (name) copy.name = name;
+    else delete copy.name;
+    working.nodes.push(copy);
+  }
+  const copied = edges.flatMap((edge) => {
+    const from = ids.get(edge.from);
+    const to = ids.get(edge.to);
+    return from && to ? [{ ...edge, from, to }] : [];
+  });
+  return {
+    graph: { ...working, edges: [...graph.edges, ...copied] },
+    ids: [...ids.values()],
+  };
 }

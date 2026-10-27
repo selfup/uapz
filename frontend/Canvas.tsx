@@ -4,7 +4,9 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type DragEvent,
   type KeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
 } from "react";
 import {
   ReactFlow,
@@ -37,21 +39,38 @@ import {
   typedData,
   visibleEdgeHandle,
   workflowPorts,
+  type Point,
   type Port,
   type WorkflowGraphs,
 } from "./graph";
 
+/** The drag payload type library rows put on the clipboard for canvas drops. */
+export const LIBRARY_DRAG_TYPE = "application/x-uapz-library";
+
 export interface CanvasProps {
   graph: GraphDoc;
   selected: string | null;
-  onSelect: (id: string | null) => void;
+  /** Every selected node id. The primary `selected` node is always shown selected. */
+  selection?: string[];
+  onSelect: (id: string | null, extend?: boolean) => void;
+  onSelectionChange?: (ids: string[]) => void;
   onChange: (doc: GraphDoc) => void;
   onOpenWorkflow: (id: string) => void;
-  onAdd: (position: { x: number; y: number }) => void;
+  onAdd: (position: Point) => void;
+  onDropLibrary?: (payload: string, position: Point) => void;
+  onRunNode?: (id: string, fresh: boolean) => void;
+  onDuplicate?: (ids: string[]) => void;
+  onCopy?: (ids: string[]) => void;
+  onPaste?: (position: Point) => void;
+  canPaste?: boolean;
   readOnly: boolean;
   workflowGraphs: WorkflowGraphs;
   marks: Record<string, string>;
+  /** The first validation problem per node id, shown on the card. */
+  problems?: Record<string, string>;
   frameSignal: number;
+  /** Pan and zoom to a node; each new sequence number is one request. */
+  focus?: { id: string; seq: number } | null;
   /** View-only navigation state may be retained for read-only child frames. */
   onViewportChange?: (view: GraphDoc["view"]) => void;
 }
@@ -64,8 +83,21 @@ type CardData = {
   legacyDefault: boolean;
   exports: Record<string, string>;
   mark?: string;
+  problem?: string;
 };
 type CardNode = Node<CardData, "card">;
+type MenuTarget =
+  | { kind: "node"; id: string }
+  | { kind: "edge"; id: string }
+  | { kind: "pane"; position: Point };
+type MenuItem = {
+  label: string;
+  keys?: string;
+  danger?: boolean;
+  disabled?: boolean;
+  run: () => void;
+};
+const MENU_WIDTH = 200;
 const portHandle = (name: string) => `port:${encodeURIComponent(name)}`;
 
 function Card({ id, data, selected }: NodeProps<CardNode>) {
@@ -105,6 +137,16 @@ function Card({ id, data, selected }: NodeProps<CardNode>) {
       <div className="graph-card-kind">
         <span>{config?.type || data.node.kind || "blank"}</span>
         <span className="graph-card-id">{id}</span>
+        {data.problem && (
+          <span
+            className="card-problem"
+            role="img"
+            aria-label={`Problem: ${data.problem}`}
+            title={data.problem}
+          >
+            !
+          </span>
+        )}
         {data.mark && (
           <span
             className={`run-dot ${data.mark.toLowerCase()}`}
@@ -204,15 +246,31 @@ const viewportOf = (graph: GraphDoc): Viewport => ({
   y: graph.view.pan_y,
   zoom: graph.view.zoom ?? 1,
 });
+const sameIds = (left: string[], right: string[]) =>
+  left.length === right.length &&
+  left.every((id, index) => id === right[index]);
 
 function CanvasInner(props: CanvasProps) {
-  const { graph, selected, readOnly, workflowGraphs, marks } = props;
+  const { graph, selected, readOnly, workflowGraphs, marks, problems } = props;
   const flow = useReactFlow<CardNode>();
+  const wrapper = useRef<HTMLDivElement>(null);
+  const menuElement = useRef<HTMLDivElement>(null);
   const latest = useRef(props);
   latest.current = props;
   const [selectedEdge, setSelectedEdge] = useState<string | null>(null);
+  const [menu, setMenu] = useState<{
+    x: number;
+    y: number;
+    target: MenuTarget;
+  } | null>(null);
   const [viewport, setViewport] = useState<Viewport>(() => viewportOf(graph));
   const previousFrameSignal = useRef(props.frameSignal);
+  const selectionKey = JSON.stringify([props.selection || [], selected]);
+  const selectionSet = useMemo(
+    () =>
+      new Set([...(props.selection || []), ...(selected ? [selected] : [])]),
+    [selectionKey],
+  );
   const portsById = useMemo(
     () =>
       new Map(
@@ -235,7 +293,7 @@ function CanvasInner(props: CanvasProps) {
           // read-only cards outside the pane's gesture handling as well.
           className: "nopan",
           position: { x: node.x, y: node.y },
-          selected: selected === node.id,
+          selected: selectionSet.has(node.id),
           draggable: !readOnly,
           connectable: !readOnly,
           deletable: !readOnly,
@@ -246,6 +304,7 @@ function CanvasInner(props: CanvasProps) {
             readOnly,
             exports: graph.outputs || {},
             mark: marks[node.id],
+            problem: problems?.[node.id],
             legacyDefault:
               named &&
               ports.filter((port) => !port.missing).length !== 1 &&
@@ -255,9 +314,11 @@ function CanvasInner(props: CanvasProps) {
           },
         };
       }),
-    [graph, selected, portsById, readOnly, marks],
+    [graph, selectionSet, portsById, readOnly, marks, problems],
   );
   const [nodes, setNodes] = useState<CardNode[]>(cards);
+  const nodesRef = useRef(nodes);
+  nodesRef.current = nodes;
   useEffect(() => {
     // React Flow owns measurements and in-progress drag positions. The graph's
     // positions are committed on drag stop, so status/selection refreshes must
@@ -285,6 +346,39 @@ function CanvasInner(props: CanvasProps) {
       void flow.fitView({ padding: 0.2, duration: 200, maxZoom: 1 });
     }
   }, [props.frameSignal, flow]);
+  useEffect(() => {
+    if (!menu) return;
+    const close = () => setMenu(null);
+    const pointer = (event: PointerEvent) => {
+      if (!menuElement.current?.contains(event.target as globalThis.Node))
+        close();
+    };
+    const key = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
+    window.addEventListener("pointerdown", pointer, true);
+    window.addEventListener("keydown", key, true);
+    window.addEventListener("wheel", close, { passive: true });
+    window.addEventListener("blur", close);
+    return () => {
+      window.removeEventListener("pointerdown", pointer, true);
+      window.removeEventListener("keydown", key, true);
+      window.removeEventListener("wheel", close);
+      window.removeEventListener("blur", close);
+    };
+  }, [menu]);
+  useEffect(() => {
+    if (menu) setMenu(null);
+  }, [graph, readOnly]);
+  useEffect(() => {
+    if (!props.focus) return;
+    void flow.fitView({
+      nodes: [{ id: props.focus.id }],
+      padding: 0.4,
+      duration: 250,
+      maxZoom: 1,
+    });
+  }, [props.focus?.seq, flow]);
   const edges = useMemo<Edge[]>(
     () =>
       graph.edges.map((edge, index) => {
@@ -315,34 +409,45 @@ function CanvasInner(props: CanvasProps) {
           reconnectable: false,
           className: missing ? "missing-wire" : undefined,
           style: missing
-            ? { stroke: "#d59855", strokeDasharray: "5 4" }
+            ? { stroke: "var(--warning)", strokeDasharray: "5 4" }
             : undefined,
         };
       }),
     [graph, portsById, selectedEdge, readOnly],
   );
 
-  const select = (id: string | null) => {
+  const select = (id: string | null, extend = false) => {
     setSelectedEdge(null);
-    props.onSelect(id);
+    props.onSelect(id, extend);
   };
+  const selectedIds = () =>
+    nodesRef.current.filter((node) => node.selected).map((node) => node.id);
   const changeNodes = (changes: NodeChange<CardNode>[]) => {
     // React Flow's measurement and selection updates are local UI state. Persist
     // positions only at the end of a drag, and never mutate a read-only child.
-    setNodes((current) =>
-      applyNodeChanges(
-        readOnly
-          ? changes.filter(
-              (change) =>
-                change.type !== "position" &&
-                change.type !== "remove" &&
-                change.type !== "add" &&
-                change.type !== "replace",
-            )
-          : changes,
-        current,
-      ),
-    );
+    const allowed = readOnly
+      ? changes.filter(
+          (change) =>
+            change.type !== "position" &&
+            change.type !== "remove" &&
+            change.type !== "add" &&
+            change.type !== "replace",
+        )
+      : changes;
+    const next = applyNodeChanges(allowed, nodesRef.current);
+    nodesRef.current = next;
+    setNodes(next);
+    if (allowed.some((change) => change.type === "select")) {
+      const ids = next.filter((node) => node.selected).map((node) => node.id);
+      const current = latest.current;
+      const known = [
+        ...new Set([
+          ...(current.selection || []),
+          ...(current.selected ? [current.selected] : []),
+        ]),
+      ];
+      if (!sameIds(ids, known)) current.onSelectionChange?.(ids);
+    }
   };
   const connect = (connection: Connection) => {
     const current = latest.current;
@@ -359,39 +464,163 @@ function CanvasInner(props: CanvasProps) {
     );
     if (changed !== current.graph) current.onChange(changed);
   };
+  const removeEdge = (id: string) => {
+    const current = latest.current;
+    current.onChange({
+      ...current.graph,
+      edges: current.graph.edges.filter(
+        (edge, index) => edgeId(edge, index) !== id,
+      ),
+    });
+    setSelectedEdge(null);
+  };
+  const removeNodes = (ids: string[]) => {
+    const current = latest.current;
+    if (!ids.length) return;
+    current.onChange(deleteNodes(current.graph, ids));
+    select(null);
+  };
   const keyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     const target = event.target as HTMLElement;
     if (target.closest('input, textarea, select, [contenteditable="true"]'))
       return;
     if (event.key === "Escape") {
+      setMenu(null);
       select(null);
       return;
     }
     if (readOnly || !["Delete", "Backspace"].includes(event.key)) return;
     if (selectedEdge) {
-      props.onChange({
-        ...graph,
-        edges: graph.edges.filter(
-          (edge, index) => edgeId(edge, index) !== selectedEdge,
-        ),
-      });
-      setSelectedEdge(null);
+      removeEdge(selectedEdge);
       event.preventDefault();
-    } else if (selected) {
-      props.onChange(deleteNodes(graph, [selected]));
-      select(null);
-      event.preventDefault();
+    } else {
+      const ids = selectedIds();
+      if (!ids.length && selected) ids.push(selected);
+      if (ids.length) {
+        removeNodes(ids);
+        event.preventDefault();
+      }
     }
   };
+  const openMenu = (
+    event: ReactMouseEvent | MouseEvent,
+    target: MenuTarget,
+  ) => {
+    event.preventDefault();
+    const bounds = wrapper.current?.getBoundingClientRect();
+    const x = event.clientX - (bounds?.left ?? 0);
+    const y = event.clientY - (bounds?.top ?? 0);
+    const width = bounds?.width ?? Infinity;
+    const height = bounds?.height ?? Infinity;
+    setMenu({
+      x: Math.max(0, Math.min(x, width - MENU_WIDTH - 8)),
+      y: Math.max(0, Math.min(y, height - 220)),
+      target,
+    });
+  };
+  const flowPoint = (event: { clientX: number; clientY: number }) =>
+    flow.screenToFlowPosition({ x: event.clientX, y: event.clientY });
+  const menuItems = (target: MenuTarget): MenuItem[] => {
+    const current = latest.current;
+    if (target.kind === "node") {
+      const node = current.graph.nodes.find((item) => item.id === target.id);
+      const ids = selectionSet.has(target.id) ? [...selectionSet] : [target.id];
+      const many = ids.length > 1;
+      const items: MenuItem[] = [];
+      if (node && typedData(node)?.type === "workflow")
+        items.push({
+          label: "Open child graph",
+          run: () => current.onOpenWorkflow(target.id),
+        });
+      if (readOnly) return items;
+      if (current.onRunNode && !many) {
+        const run = current.onRunNode;
+        items.push({ label: "Run node", run: () => run(target.id, false) });
+        items.push({ label: "Run fresh", run: () => run(target.id, true) });
+      }
+      if (current.onCopy) {
+        const copy = current.onCopy;
+        items.push({
+          label: many ? `Copy ${ids.length} nodes` : "Copy",
+          keys: "⌘C",
+          run: () => copy(ids),
+        });
+      }
+      if (current.onDuplicate) {
+        const duplicate = current.onDuplicate;
+        items.push({
+          label: many ? `Duplicate ${ids.length} nodes` : "Duplicate",
+          keys: "⌘D",
+          run: () => duplicate(ids),
+        });
+      }
+      items.push({
+        label: many ? `Delete ${ids.length} nodes` : "Delete",
+        keys: "⌫",
+        danger: true,
+        run: () => removeNodes(ids),
+      });
+      return items;
+    }
+    if (target.kind === "edge")
+      return readOnly
+        ? []
+        : [
+            {
+              label: "Delete wire",
+              keys: "⌫",
+              danger: true,
+              run: () => removeEdge(target.id),
+            },
+          ];
+    const items: MenuItem[] = [];
+    if (!readOnly) {
+      items.push({
+        label: "Add node here",
+        run: () => current.onAdd(target.position),
+      });
+      if (current.onPaste) {
+        const paste = current.onPaste;
+        items.push({
+          label: "Paste here",
+          keys: "⌘V",
+          disabled: !current.canPaste,
+          run: () => paste(target.position),
+        });
+      }
+    }
+    items.push({
+      label: "Fit graph",
+      run: () => void flow.fitView({ padding: 0.2, duration: 200, maxZoom: 1 }),
+    });
+    return items;
+  };
+  const acceptsLibraryDrop = (event: DragEvent) =>
+    !readOnly &&
+    Array.from(event.dataTransfer.types).includes(LIBRARY_DRAG_TYPE);
+  const items = menu ? menuItems(menu.target) : [];
 
   return (
     <div
+      ref={wrapper}
       className={`graph-canvas${readOnly ? " is-readonly" : ""}`}
       onKeyDown={keyDown}
       tabIndex={0}
       aria-label={
         readOnly ? "Read-only workflow graph" : "Workflow graph editor"
       }
+      onDragOver={(event) => {
+        if (!acceptsLibraryDrop(event)) return;
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "copy";
+      }}
+      onDrop={(event) => {
+        if (!acceptsLibraryDrop(event)) return;
+        const payload = event.dataTransfer.getData(LIBRARY_DRAG_TYPE);
+        if (!payload) return;
+        event.preventDefault();
+        latest.current.onDropLibrary?.(payload, flowPoint(event));
+      }}
     >
       <ReactFlow<CardNode>
         nodes={nodes}
@@ -407,8 +636,8 @@ function CanvasInner(props: CanvasProps) {
         panOnDrag
         zoomOnDoubleClick={false}
         deleteKeyCode={null}
-        multiSelectionKeyCode={null}
-        selectionKeyCode={null}
+        multiSelectionKeyCode={readOnly ? null : ["Meta", "Control"]}
+        selectionKeyCode={readOnly ? null : "Shift"}
         viewport={viewport}
         onViewportChange={setViewport}
         minZoom={0.15}
@@ -428,24 +657,40 @@ function CanvasInner(props: CanvasProps) {
         }}
         onNodeClick={(event, node) => {
           event.stopPropagation();
-          select(node.id);
+          select(node.id, event.metaKey || event.ctrlKey || event.shiftKey);
         }}
         onNodeDoubleClick={(event, node) => {
           event.stopPropagation();
           if (typedData(node.data.node)?.type === "workflow")
             props.onOpenWorkflow(node.id);
         }}
-        onNodeDragStop={(_event, node) => {
+        onNodeContextMenu={(event, node) => {
+          if (!selectionSet.has(node.id)) select(node.id);
+          openMenu(event, { kind: "node", id: node.id });
+        }}
+        onEdgeContextMenu={(event, edge) => {
+          props.onSelect(null);
+          setSelectedEdge(edge.id);
+          openMenu(event, { kind: "edge", id: edge.id });
+        }}
+        onPaneContextMenu={(event) =>
+          openMenu(event, { kind: "pane", position: flowPoint(event) })
+        }
+        onNodeDragStop={(_event, _node, dragged) => {
           const current = latest.current;
-          if (!current.readOnly)
-            current.onChange({
-              ...current.graph,
-              nodes: current.graph.nodes.map((item) =>
-                item.id === node.id
-                  ? { ...item, x: node.position.x, y: node.position.y }
-                  : item,
-              ),
-            });
+          if (current.readOnly) return;
+          const moved = new Map(
+            dragged.map((node) => [node.id, node.position] as const),
+          );
+          current.onChange({
+            ...current.graph,
+            nodes: current.graph.nodes.map((item) => {
+              const position = moved.get(item.id);
+              return position
+                ? { ...item, x: position.x, y: position.y }
+                : item;
+            }),
+          });
         }}
         onEdgeClick={(event, edge) => {
           event.stopPropagation();
@@ -459,37 +704,44 @@ function CanvasInner(props: CanvasProps) {
             !(event.target as Element).classList.contains("react-flow__pane")
           )
             return;
-          props.onAdd(
-            flow.screenToFlowPosition({ x: event.clientX, y: event.clientY }),
-          );
+          props.onAdd(flowPoint(event));
         }}
         attributionPosition="top-right"
         defaultEdgeOptions={{ type: "default", interactionWidth: 20 }}
       >
-        <Background
-          variant={BackgroundVariant.Dots}
-          gap={24}
-          size={1}
-          color="#3a3d43"
-        />
+        <Background variant={BackgroundVariant.Dots} gap={24} size={1} />
         <Controls showInteractive={false} />
       </ReactFlow>
-      {graph.nodes.length === 0 && (
-        <div className="graph-empty">
-          <strong>
-            {readOnly ? "This workflow is empty" : "Build a workflow"}
-          </strong>
-          <span>
-            {readOnly
-              ? "Select another graph in the library."
-              : "Double-click the canvas to add a node."}
-          </span>
+      {menu && items.length > 0 && (
+        <div
+          ref={menuElement}
+          className="canvas-menu"
+          role="menu"
+          aria-label="Canvas actions"
+          style={{ left: menu.x, top: menu.y, width: MENU_WIDTH }}
+        >
+          {items.map((item) => (
+            <button
+              key={item.label}
+              type="button"
+              role="menuitem"
+              className={item.danger ? "danger" : undefined}
+              disabled={item.disabled}
+              onClick={() => {
+                setMenu(null);
+                item.run();
+              }}
+            >
+              <span>{item.label}</span>
+              {item.keys && <kbd>{item.keys}</kbd>}
+            </button>
+          ))}
         </div>
       )}
       <div className="graph-help">
         {readOnly
           ? "Read-only child · select to inspect · drag canvas to pan"
-          : "Drag to pan · scroll to zoom · drag ports to connect · Delete removes selection"}
+          : "Drag to pan · ⇧ drag to select many · drag ports to connect · right-click for actions"}
       </div>
     </div>
   );

@@ -544,6 +544,67 @@ fn auto_layout(ids: &[String], edges: &[EdgeDoc]) -> Vec<(f32, f32)> {
         .collect()
 }
 
+/// Remove a saved graph's markdown and JSON files.
+pub fn delete(name: &str) -> Result<(), String> {
+    delete_in(Path::new(DIR), name)
+}
+
+fn delete_in(dir: &Path, name: &str) -> Result<(), String> {
+    listed_name(name)?;
+    let (md, json) = paths_in(dir, name);
+    let mut removed = false;
+    for path in [md, json] {
+        match fs::remove_file(&path) {
+            Ok(()) => removed = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("delete {}: {e}", path.display())),
+        }
+    }
+    if removed {
+        Ok(())
+    } else {
+        Err(format!("`{name}` is not a saved graph"))
+    }
+}
+
+fn require_unused(dir: &Path, name: &str) -> Result<(), String> {
+    safe_name(name)?;
+    let (md, json) = paths_in(dir, name);
+    if md.exists() || json.exists() {
+        return Err(format!("a graph named `{name}` already exists"));
+    }
+    Ok(())
+}
+
+/// Save a graph under a new name and remove the old files. The new name must be its
+/// own sanitized form and must not be taken.
+pub fn rename(from: &str, to: &str) -> Result<(), String> {
+    rename_in(Path::new(DIR), from, to)
+}
+
+fn rename_in(dir: &Path, from: &str, to: &str) -> Result<(), String> {
+    if from == to {
+        return safe_name(to);
+    }
+    require_unused(dir, to)?;
+    let mut doc = load_in(dir, from)?;
+    doc.name = to.to_string();
+    save_in(dir, &doc)?;
+    delete_in(dir, from)
+}
+
+/// Save a copy of a graph under a new, unused name.
+pub fn duplicate(from: &str, to: &str) -> Result<(), String> {
+    duplicate_in(Path::new(DIR), from, to)
+}
+
+fn duplicate_in(dir: &Path, from: &str, to: &str) -> Result<(), String> {
+    require_unused(dir, to)?;
+    let mut doc = load_in(dir, from)?;
+    doc.name = to.to_string();
+    save_in(dir, &doc).map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -873,5 +934,56 @@ mod tests {
         assert!(save_kind_in(&dir, &evil).is_err());
         assert!(list_kinds_in(&dir.join("nope")).is_empty());
         fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod graph_file_management_tests {
+    use super::*;
+
+    fn scratch() -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("uapz-doc-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn graphs_can_be_duplicated_renamed_and_deleted() {
+        let dir = scratch();
+        let doc: GraphDoc = serde_json::from_str(
+            r#"{"version":1,"name":"first","view":{"pan_x":0,"pan_y":0},"nodes":[],"edges":[]}"#,
+        )
+        .unwrap();
+        save_in(&dir, &doc).unwrap();
+        duplicate_in(&dir, "first", "second").unwrap();
+        assert_eq!(list_in(&dir), vec!["first", "second"]);
+        assert!(
+            duplicate_in(&dir, "first", "second")
+                .unwrap_err()
+                .contains("already exists")
+        );
+        rename_in(&dir, "second", "third").unwrap();
+        assert_eq!(load_in(&dir, "third").unwrap().name, "third");
+        assert_eq!(list_in(&dir), vec!["first", "third"]);
+        assert!(
+            rename_in(&dir, "first", "third")
+                .unwrap_err()
+                .contains("already exists")
+        );
+        assert!(rename_in(&dir, "first", "../bad").is_err());
+        rename_in(&dir, "first", "first").unwrap();
+        delete_in(&dir, "third").unwrap();
+        assert_eq!(list_in(&dir), vec!["first"]);
+        assert!(
+            delete_in(&dir, "third")
+                .unwrap_err()
+                .contains("not a saved graph")
+        );
+        assert!(delete_in(&dir, "../first").is_err());
+        fs::remove_dir_all(dir).unwrap();
     }
 }

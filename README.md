@@ -70,9 +70,11 @@ checker, path confinement, the library's on-disk layout, the executor (scripts, 
 chains, timeouts, the cache, cancellation, write-file nodes), streamed replies in every
 provider's shape and the request shape for every provider. Frontend unit tests cover
 graph edits, snapshot selection, output comparisons and the IPC wrapper. Browser tests
-cover named-port wiring, labels and colors, keyboard edits, read-only children, saved
-positions during live status updates, run and review recovery, workflow-wide output,
-automatic scrolling and scrollback, and delayed save, navigation and output responses:
+cover named-port wiring, labels and colors, keyboard edits, undo and redo,
+multi-selection, copy and paste, the context menu, library drag and drop, read-only
+children, saved positions during live status updates, run and review recovery,
+workflow-wide output, automatic scrolling and scrollback, session restore, workflow
+management, the theme, and delayed save, navigation and output responses:
 
 ```sh
 cargo fmt --all --check
@@ -131,10 +133,15 @@ cargo test -p uapz live_ -- --ignored --nocapture
 
 ## Using it
 
-The project header holds the workflow name, Save, New and Run. A searchable library
-is on the left, the canvas is in the center, and the inspector is on the right. Drag
-the dividers to resize either panel. Run status and review shortcuts stay visible in
-the footer, including while inspecting a child workflow.
+The project header holds the workflow name, Save, New, Run and **Run fresh**, which
+runs without reusing cached outputs. Both run buttons wait while the graph has
+validation problems and show how many. A searchable library is on the left, the canvas
+is in the center, and the inspector is on the right. Drag the dividers to resize either
+panel, or hide one from the canvas toolbar (⌘B, ⌘J). Panel sizes, the open workflow and
+the theme (system, dark or light, chosen in the footer) come back on the next launch.
+Closing the window or quitting with unsaved changes asks whether to save first. Run
+status and review shortcuts stay visible in the footer, including while inspecting a
+child workflow; the footer's help opens the full shortcut list (`?`).
 
 **Canvas**
 
@@ -143,11 +150,20 @@ the footer, including while inspecting a child workflow.
 - Drag from a node's right-hand port to another node's left-hand port to connect them.
   Self-connections and duplicates are ignored.
 - Click a node or a wire to select it. Backspace or Delete removes it. Deleting a node
-  removes its wires.
+  removes its wires. Shift-drag draws a selection box and ⌘-click adds a node to the
+  selection; selected nodes move and delete together.
+- ⌘Z undoes any edit and ⌘⇧Z redoes it. Typing in a field counts as one step.
+- ⌘C, ⌘V and ⌘D copy, paste and duplicate the selection, keeping the wires among the
+  copies and giving copies unique names. Repeated pastes step away from the originals.
+- Right-click a node, a wire or empty space for a menu: run, copy, duplicate or delete
+  the node, delete the wire, add or paste at that spot, open a child graph.
 - Double-click empty space, press cmd-n or ctrl-n, or click **Add node** to add the type
   selected in the toolbar: **Blank**, one of the eight types, or **Database (write)**.
-  Library rows add presets and saved kinds directly. A writable database starts with its
-  read-only setting off.
+  Library rows add presets and saved kinds directly, and can be dragged onto the canvas
+  to land where they drop. Added nodes otherwise take free space near the middle of the
+  view. A writable database starts with its read-only setting off.
+- A node whose configuration has a problem shows an amber badge; hover it for the
+  message.
 - Escape clears the selection.
 - Neutral node cards show their name, type, summary and run status, with a slim accent
   in the saved node color (or the type's default color). Titles use the node's own name,
@@ -177,7 +193,9 @@ the footer, including while inspecting a child workflow.
   results from every node, including cached results, named outputs and child workflows.
   Selecting nodes or navigating children during execution keeps this feed open.
   Scroll up to pause automatic following; **Follow output** returns to the latest activity.
-  Failed steps retain their partial streamed answers in the current feed.
+  Failed steps retain their partial streamed answers in the current feed. Click a node's
+  name in the feed to select it on the canvas. **Copy** copies an output's text and
+  **Show in Finder** reveals a saved file.
 - Large outputs initially load up to 256 KiB; **Load full output** retrieves the rest.
   The live feed retains up to 2,048 events and 2 MiB, with notices for omitted entries.
   Completed outputs remain accessible through run history and the cache, subject to
@@ -198,6 +216,10 @@ the footer, including while inspecting a child workflow.
   or go back to blank under **Node options** in Configure.
 - Problems are listed under the form as they happen (`model: model is empty`, `query:
   DELETE is not allowed in a read-only query`). A valid config says so.
+- **Fetch models** asks the provider which model ids it offers and lists them in the
+  Model field; the form says when the current id is not among them. Remote providers
+  and server databases also say whether the named environment variable is set for the
+  app, which catches a key exported in one shell but not in the launcher's.
 - **Save agent** / **Save database** writes the config into the library under the name in
   the field next to it and labels the node with that name. Invalid configs are refused.
 - In an agent, **Save prompt** writes the prompt text to `prompts/<name>.md`. Clicking a
@@ -240,8 +262,11 @@ the footer, including while inspecting a child workflow.
 Search by name, category or path. Matching sections expand while searching; their
 headers show matching counts. Every section header also collapses on click.
 
-- **Workflows**: saved graphs. Click one to load it; name, Save (cmd-s) and New
-  (cmd-shift-n) are in the project header.
+- **Workflows**: saved graphs. Click one to load it; hover a row to rename, duplicate
+  or delete it (deleting also removes its run history). Name, Save (cmd-s) and New
+  (cmd-shift-n) are in the project header. When the list is empty, **Install example
+  workflows** copies the bundled examples into `graphs/` and opens the first one; the
+  same button appears on an empty canvas until every example is present.
 - **Nodes**: built-in node types, ready to add to the current workflow.
 - **Custom nodes**: blank, colored node kinds. **Custom node kind** opens the name and color
   fields; **Save kind** adds the kind to the library. Click a row to add a node, or use
@@ -287,8 +312,9 @@ values and file contents both participate in downstream cache keys, so changing 
 recomputes affected agents and scripts. Saving a graph stores input definitions and
 defaults, never the Run form's overrides.
 
-To try both features without a model or API key, copy the included example into the
-graph library before starting the app:
+To try both features without a model or API key, press **Install example workflows**
+on an empty canvas, or copy the included example into the graph library before
+starting the app:
 
 ```sh
 mkdir -p graphs
@@ -782,10 +808,16 @@ ids and `-->` edges (node shapes and `|labels|` are tolerated) and laid out left
 | cmd-s, ctrl-s | Save graph |
 | cmd-shift-n, ctrl-shift-n | New graph |
 | cmd-enter, ctrl-enter | Run workflow |
+| cmd-shift-enter, ctrl-shift-enter | Run workflow without cached outputs |
 | cmd-n, ctrl-n | Add node of the selected type |
+| cmd-z, cmd-shift-z | Undo, redo |
+| cmd-c, cmd-v, cmd-d | Copy, paste, duplicate the selected nodes |
 | Backspace, Delete | Delete selection |
 | Escape | Clear canvas selection |
-| cmd-q | Quit |
+| Shift-drag, cmd-click | Box-select, add to the selection |
+| cmd-b, cmd-j | Show or hide the library, the inspector |
+| ? | Shortcut list |
+| cmd-q | Quit (asks about unsaved changes) |
 
 ## Layout
 
@@ -794,7 +826,9 @@ ids and `-->` edges (node shapes and `|labels|` are tolerated) and laid out left
 | `frontend/App.tsx` | Workspace header, searchable library, child navigation, run state and layout |
 | `frontend/Canvas.tsx`, `frontend/graph.ts` | React Flow cards, ports, wires, view controls and pure graph edits |
 | `frontend/Inspector.tsx` | Node configuration, validation, results, reviews and history |
-| `frontend/api.ts`, `frontend/types.ts` | Typed Tauri IPC boundary and persisted document shapes |
+| `frontend/api.ts`, `frontend/types.ts` | Typed Tauri IPC boundary, host events and persisted document shapes |
+| `frontend/OutputActions.tsx`, `frontend/clipboard.ts` | Copy and reveal controls shared by the inspector and run output |
+| `src/examples.rs` | The bundled example workflows and their installer |
 | `frontend/*.test.ts`, `tests/` | Frontend unit tests and Playwright interaction tests with mocked IPC |
 | `src-tauri/src/main.rs` | Tauri window, workspace selection and native IPC commands |
 | `src-tauri/src/smoke.js` | Opt-in native webview/IPC/execution smoke test |
@@ -818,6 +852,4 @@ with Vite, TypeScript, Vitest and Playwright for development and tests. The Rust
 uses `serde` and `serde_json`, `ureq` for HTTP, `url` for connection and endpoint URLs,
 and `base64` for image replies.
 
-The next pass will harden the TypeScript code, focusing on runtime validation at the IPC
-boundary, asynchronous state handling and failure-path test coverage. Resumable batch
-execution, per-item results, batch review and export remain deferred.
+Resumable batch execution, per-item results, batch review and export remain deferred.

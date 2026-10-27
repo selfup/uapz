@@ -183,12 +183,14 @@ test("unsaved edits can be kept or discarded in the desktop confirmation dialog"
   await page.locator('[data-id="n0"]').click();
   await page.getByLabel("Name", { exact: true }).fill("keepMe");
   await page.getByRole("button", { name: "New", exact: true }).click();
-  const dialog = page.getByRole("dialog", { name: "Confirm change" });
+  const dialog = page.getByRole("dialog", { name: "Unsaved changes" });
   await expect(dialog).toBeVisible();
   await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
   await expect(page.getByLabel("Name", { exact: true })).toHaveValue("keepMe");
   await page.getByRole("button", { name: "New", exact: true }).click();
-  await dialog.getByRole("button", { name: "Continue", exact: true }).click();
+  await dialog
+    .getByRole("button", { name: "Discard changes", exact: true })
+    .click();
   await expect(
     page.getByRole("heading", { name: "Build a workflow" }),
   ).toBeVisible();

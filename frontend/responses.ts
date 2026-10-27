@@ -375,6 +375,13 @@ const responses: { [M in Method]: Schema<Protocol[M]["result"]> } = {
   clear_cache: integer,
   describe_schema: string,
   write_sql: string,
+  list_models: strings,
+  env_var_set: boolean,
+  delete_graph: nil,
+  rename_graph: object({ name: string }),
+  duplicate_graph: object({ name: string }),
+  reveal: nil,
+  install_examples: object({ installed: strings, skipped: strings }),
 };
 
 export function decodeResponse<M extends Method>(
