@@ -613,7 +613,7 @@ impl AppService {
                 Ok(json!({"name": to}))
             }
             "reveal" => {
-                let path = validate::resolve_inside(&self.root, string(&args, "path")?)?;
+                let path = validate::resolve_absolute_inside(&self.root, string(&args, "path")?)?;
                 reveal(&path)?;
                 Ok(Value::Null)
             }
@@ -894,20 +894,27 @@ impl AppService {
 /// inside the workspace first, so nothing the renderer names can leave it.
 fn reveal(path: &std::path::Path) -> Result<(), String> {
     use std::process::{Command, Stdio};
-    let mut command = if cfg!(target_os = "macos") {
-        let mut command = Command::new("open");
-        command.arg("-R").arg(path);
-        command
+    if !path.exists() {
+        return Err(format!("{} no longer exists", path.display()));
+    }
+    // Paths travel as OS strings, never formatted into one: a non-UTF-8 name survives, and
+    // on Windows a name carrying `,` stays part of `/select,` rather than adding switches.
+    let (program, args): (&str, Vec<std::ffi::OsString>) = if cfg!(target_os = "macos") {
+        ("open", vec!["-R".into(), path.as_os_str().to_owned()])
     } else if cfg!(target_os = "windows") {
-        let mut command = Command::new("explorer");
-        command.arg(format!("/select,{}", path.display()));
-        command
+        let mut select = std::ffi::OsString::from("/select,");
+        select.push(path.as_os_str());
+        ("explorer", vec![select])
     } else {
-        let mut command = Command::new("xdg-open");
-        command.arg(path.parent().unwrap_or(path));
-        command
+        (
+            "xdg-open",
+            vec![path.parent().unwrap_or(path).as_os_str().to_owned()],
+        )
     };
-    command
+    // `open -R` and `explorer /select,` report a bad destination only after launch, so a
+    // stale path has to be caught before spawning.
+    Command::new(program)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1703,6 +1710,37 @@ mod tests {
             history::graph_name("Draft: question?")
         );
         assert_eq!(history_graph("").unwrap(), "untitled");
+    }
+
+    #[test]
+    fn reveal_takes_the_absolute_path_a_run_reported_and_refuses_to_leave_the_workspace() {
+        let workspace = Workspace::new();
+        let saved = workspace.root.join("data/note.txt");
+        std::fs::write(&saved, b"x").unwrap();
+        let reported = saved.canonicalize().unwrap();
+        // The renderer echoes the absolute path a run reported; it resolves back inside.
+        assert_eq!(
+            validate::resolve_absolute_inside(&workspace.root, &reported.to_string_lossy())
+                .unwrap(),
+            reported
+        );
+        // Absolute only widens what may be named. A path outside the workspace is refused
+        // by the containment proof, and a `..` segment by the path rules, before any
+        // process starts, so the same proof backs both the validator and the command.
+        let outside = std::env::temp_dir().join(format!("uapz-reveal-out-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let escape = outside.to_string_lossy().to_string();
+        let err = workspace
+            .service
+            .request("reveal", json!({"path":escape}))
+            .unwrap_err();
+        assert!(err.contains("outside the workspace"), "{err}");
+        let err = workspace
+            .service
+            .request("reveal", json!({"path":"data/../data/note.txt"}))
+            .unwrap_err();
+        assert!(err.contains("`..`"), "{err}");
+        std::fs::remove_dir_all(outside).unwrap();
     }
 
     #[test]

@@ -45,6 +45,31 @@ pub fn check_size(bytes: usize, limit: u64) -> Result<(), String> {
     }
 }
 
+/// Create a managed directory for writing, refusing one that is a symlink. [`directory`]
+/// refuses a linked directory when it reads; a writer must agree, or it would publish
+/// through the link into whatever that points at.
+pub fn directory_for_write(dir: &Path) -> Result<(), String> {
+    let refuse = |meta: &fs::Metadata| {
+        if meta.is_dir() {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} is not an ordinary directory (symlinks are refused)",
+                dir.display()
+            ))
+        }
+    };
+    match fs::symlink_metadata(dir) {
+        Ok(meta) => return refuse(&meta),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("{}: {e}", dir.display())),
+    }
+    fs::create_dir_all(dir).map_err(|e| format!("create {}/: {e}", dir.display()))?;
+    // A link swapped in for the new directory is caught before anything is written.
+    let meta = fs::symlink_metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    refuse(&meta)
+}
+
 /// Read an ordinary file with a limit on the actual read, not just the metadata seen
 /// before it. Callers that permit symlinks must first resolve and validate their target.
 pub fn read(path: &Path, limit: u64) -> Result<Vec<u8>, String> {

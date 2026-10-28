@@ -141,7 +141,7 @@ pub fn prompt_path(name: &str) -> PathBuf {
 
 pub fn save_prompt(name: &str, text: &str) -> Result<PathBuf, String> {
     validate::text("prompt", text, validate::MAX_PROMPT_LEN)?;
-    fs::create_dir_all(PROMPTS_DIR).map_err(|e| format!("create {PROMPTS_DIR}/: {e}"))?;
+    storage::directory_for_write(Path::new(PROMPTS_DIR))?;
     let path = prompt_path(name);
     storage::write_atomic(&path, text.as_bytes())?;
     Ok(path)
@@ -283,7 +283,7 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     let text = serde_json::to_string_pretty(value).map_err(|e| e.to_string())? + "\n";
     storage::check_size(text.len(), storage::MAX_DOCUMENT_BYTES)?;
     if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).map_err(|e| format!("create {}/: {e}", dir.display()))?;
+        storage::directory_for_write(dir)?;
     }
     storage::write_atomic(path, text.as_bytes())
 }

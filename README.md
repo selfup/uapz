@@ -1,5 +1,7 @@
 # uapz
 
+![uapz screenshot](https://github.com/user-attachments/assets/56b9a918-1418-4551-bb40-a607404ba398)
+
 A desktop node-graph editor with a Tauri 2 shell, a React and React Flow canvas, and a
 Rust execution core. Nodes are boxes you drag around and wire together; each one can
 carry typed content: an **agent**,

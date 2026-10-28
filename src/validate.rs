@@ -366,6 +366,35 @@ pub fn resolve_inside(root: &Path, raw: &str) -> Result<PathBuf, String> {
     Ok(real)
 }
 
+/// Resolve a path the renderer echoed back, which may be absolute. Runs and their outputs
+/// report destinations as absolute paths, so a command that acts on one must accept that
+/// form. The containment proof is [`resolve_inside`]: absolute only widens what may be
+/// named, never what may be reached.
+pub fn resolve_absolute_inside(root: &Path, raw: &str) -> Result<PathBuf, String> {
+    let root = root
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", root.display()))?;
+    let trimmed = raw.trim();
+    if trimmed.chars().any(char::is_control) {
+        return Err("path contains a control character".into());
+    }
+    if trimmed.len() > MAX_PATH_LEN {
+        return Err(format!("path is longer than {MAX_PATH_LEN} characters"));
+    }
+    let raw_path = Path::new(trimmed);
+    let relative = if raw_path.is_absolute() {
+        raw_path
+            .strip_prefix(&root)
+            .map_err(|_| "path is outside the workspace".to_string())?
+            .to_str()
+            .ok_or("path is not valid UTF-8")?
+            .to_string()
+    } else {
+        trimmed.to_string()
+    };
+    resolve_inside(&root, &relative)
+}
+
 /// Model output with a surrounding Markdown code fence removed: "```sql\n…\n```" becomes
 /// "…". Text without a fence is only trimmed.
 pub fn unfenced(text: &str) -> String {
@@ -1429,6 +1458,57 @@ mod tests {
         ] {
             assert!(endpoint_url(bad).is_err(), "{bad:?} should be rejected");
         }
+    }
+
+    #[test]
+    fn absolute_paths_the_renderer_echoes_stay_inside_the_root() {
+        let root = std::env::temp_dir().join(format!(
+            "uapz-absolute-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("agents/a/outputs")).unwrap();
+        std::fs::write(root.join("agents/a/outputs/1.png"), b"x").unwrap();
+        let outside =
+            std::env::temp_dir().join(format!("uapz-absolute-out-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"s").unwrap();
+        let real_root = root.canonicalize().unwrap();
+
+        // The absolute form a run reported is accepted and resolves to the same file.
+        let saved = real_root.join("agents/a/outputs/1.png");
+        assert_eq!(
+            resolve_absolute_inside(&root, &saved.to_string_lossy()).unwrap(),
+            saved
+        );
+        // A relative form still works, for callers that have one.
+        assert_eq!(
+            resolve_absolute_inside(&root, "agents/a/outputs/1.png").unwrap(),
+            saved
+        );
+        // Absolute only widens what may be named, never what may be reached.
+        let escape = outside.join("secret.txt");
+        assert!(
+            resolve_absolute_inside(&root, &escape.to_string_lossy())
+                .unwrap_err()
+                .contains("outside the workspace")
+        );
+        assert!(resolve_absolute_inside(&root, "../secret.txt").is_err());
+        assert!(resolve_absolute_inside(&root, "/etc/passwd").is_err());
+        assert!(resolve_absolute_inside(&root, "").is_err());
+        assert!(resolve_absolute_inside(&root, "agents/a\0").is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&escape, real_root.join("agents/a/outputs/link.txt"))
+                .unwrap();
+            let link = saved.with_file_name("link.txt");
+            assert!(resolve_absolute_inside(&root, &link.to_string_lossy()).is_err());
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&outside).unwrap();
     }
 
     #[test]

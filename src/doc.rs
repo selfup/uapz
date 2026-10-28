@@ -186,7 +186,7 @@ fn save_in(dir: &Path, doc: &GraphDoc) -> Result<(PathBuf, PathBuf), String> {
     let markdown = doc.markdown();
     storage::check_size(text.len(), storage::MAX_DOCUMENT_BYTES)?;
     storage::check_size(markdown.len(), storage::MAX_DOCUMENT_BYTES)?;
-    fs::create_dir_all(dir).map_err(|e| format!("create {}/: {e}", dir.display()))?;
+    storage::directory_for_write(dir)?;
     let (md, json) = paths_in(dir, &doc.name);
     storage::write_atomic(&md, markdown.as_bytes())?;
     storage::write_atomic(&json, text.as_bytes())?;
@@ -268,7 +268,7 @@ fn save_kind_in(dir: &Path, kind: &NodeKind) -> Result<PathBuf, String> {
     safe_name(&kind.name)?;
     let text = serde_json::to_string_pretty(kind).map_err(|e| e.to_string())? + "\n";
     storage::check_size(text.len(), storage::MAX_DOCUMENT_BYTES)?;
-    fs::create_dir_all(dir).map_err(|e| format!("create {}/: {e}", dir.display()))?;
+    storage::directory_for_write(dir)?;
     let path = dir.join(format!("{}.json", kind.name));
     storage::write_atomic(&path, text.as_bytes())?;
     Ok(path)
@@ -985,5 +985,43 @@ mod graph_file_management_tests {
         );
         assert!(delete_in(&dir, "../first").is_err());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn graphs_and_kinds_refuse_a_linked_managed_directory() {
+        let base = scratch().join("linked");
+        let dir = base.join("graphs");
+        let outside = base.join("outside");
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let doc: GraphDoc = serde_json::from_str(
+            r#"{"version":1,"name":"planted","view":{"pan_x":0,"pan_y":0},"nodes":[],"edges":[]}"#,
+        )
+        .unwrap();
+        let kind = NodeKind {
+            name: "Plant".into(),
+            color: "#123456".into(),
+        };
+        // Control: both writers work against an ordinary directory.
+        save_in(&dir, &doc).unwrap();
+        save_kind_in(&dir, &kind).unwrap();
+        fs::remove_dir_all(&base).unwrap();
+
+        #[cfg(unix)]
+        {
+            fs::create_dir_all(&base).unwrap();
+            fs::create_dir_all(&outside).unwrap();
+            std::os::unix::fs::symlink(&outside, &dir).unwrap();
+            let err = save_in(&dir, &doc).unwrap_err();
+            assert!(err.contains("symlinks are refused"), "{err}");
+            let err = save_kind_in(&dir, &kind).unwrap_err();
+            assert!(err.contains("symlinks are refused"), "{err}");
+            assert_eq!(
+                fs::read_dir(&outside).unwrap().count(),
+                0,
+                "nothing was published through the link"
+            );
+            fs::remove_dir_all(&base).unwrap();
+        }
     }
 }
