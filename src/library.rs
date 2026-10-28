@@ -106,13 +106,22 @@ pub fn delete_agent(name: &str) -> Result<(), String> {
 
 /// Save one run's output as `<agents_dir>/<name>/outputs/<timestamp>.<ext>`. The executor
 /// passes its agents directory (`agents/` under the working directory in the app).
+///
+/// The directory is walked from the workspace root so every component is checked: an
+/// `agents/` that is a link is refused at the top, not just at `outputs/` below it.
 pub fn write_agent_output(
-    agents_dir: &Path,
+    root: &Path,
     name: &str,
     output: OutputType,
     bytes: &[u8],
 ) -> Result<PathBuf, String> {
-    let dir = agents_dir.join(validate::file_stem(name)).join(OUTPUTS_DIR);
+    let dir = storage::directory(
+        root,
+        &Path::new(AGENTS_DIR)
+            .join(validate::file_stem(name))
+            .join(OUTPUTS_DIR),
+        true,
+    )?;
     write_output_in(&dir, output, bytes, timestamp())
 }
 
@@ -408,6 +417,36 @@ mod tests {
         assert_eq!(fs::read_to_string(&a).unwrap(), "one");
         assert_eq!(fs::read_to_string(&b).unwrap(), "two");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn writes_refuse_a_linked_managed_directory_at_any_depth() {
+        let root = scratch("linked");
+        let agents = root.join(AGENTS_DIR);
+        let outside = scratch("linked-out");
+        fs::create_dir_all(&outside).unwrap();
+
+        // Control: an ordinary managed directory still works, with nothing there yet.
+        let saved = write_agent_output(&root, "acme", OutputType::Text, b"ok").unwrap();
+        assert_eq!(fs::read_to_string(&saved).unwrap(), "ok");
+        fs::remove_dir_all(&root).unwrap();
+
+        #[cfg(unix)]
+        {
+            // A link where `agents/` belongs is refused, even though the output path is
+            // three components deep and its own leaf does not exist yet.
+            fs::create_dir_all(&root).unwrap();
+            std::os::unix::fs::symlink(&outside, &agents).unwrap();
+            let err = write_agent_output(&root, "acme", OutputType::Text, b"planted").unwrap_err();
+            assert!(err.contains("symlinks are refused"), "{err}");
+            assert_eq!(
+                fs::read_dir(&outside).unwrap().count(),
+                0,
+                "nothing was published through the link"
+            );
+            fs::remove_dir_all(&root).unwrap();
+        }
+        fs::remove_dir_all(&outside).unwrap();
     }
 
     #[test]

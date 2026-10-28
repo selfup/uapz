@@ -2015,7 +2015,7 @@ impl Runner<'_> {
             ));
         }
         let bytes = streamed.bytes;
-        let saved = library::write_agent_output(&self.dirs.agents, name, config.output, &bytes)?;
+        let saved = library::write_agent_output(&self.dirs.root, name, config.output, &bytes)?;
         self.log(format!("saved {}", saved.display()));
         let mut output = Output::new(
             bytes,
@@ -3417,7 +3417,11 @@ mod tests {
         assert_eq!(out.as_text(), Some("two rows"));
         let saved = out.saved.unwrap();
         assert!(
-            saved.starts_with(root.join("agents/summarizer/outputs")),
+            saved.starts_with(
+                root.canonicalize()
+                    .unwrap()
+                    .join("agents/summarizer/outputs")
+            ),
             "{saved:?}"
         );
         let file = saved.file_name().unwrap().to_str().unwrap();
@@ -3455,7 +3459,7 @@ mod tests {
         assert!(
             out.saved
                 .unwrap()
-                .starts_with(root.join("agents/n7/outputs"))
+                .starts_with(root.canonicalize().unwrap().join("agents/n7/outputs"))
         );
         fs::remove_dir_all(&root).unwrap();
     }
