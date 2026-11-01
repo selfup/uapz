@@ -1,5 +1,5 @@
 import type { Page } from "@playwright/test";
-import type { Library } from "../frontend/types";
+import type { GraphDoc, Library } from "../frontend/types";
 import { test, expect, queueReply, callsFor } from "./support/workspace";
 
 async function libraryWith(page: Page, files: Partial<Library>) {
@@ -148,6 +148,15 @@ test("file run inputs offer the data directory listing", async ({ page }) => {
 test("validation problems mark the card and hold Run workflow until fixed", async ({
   page,
 }) => {
+  // The app validates 250ms after the graph loads; wait for that call so the
+  // queued reply reaches the validation triggered by the edit below.
+  await expect
+    .poll(async () =>
+      (await callsFor(page, "validate_graph")).some(
+        (call) => (call.args.doc as GraphDoc).name === "Demo",
+      ),
+    )
+    .toBe(true);
   await queueReply(page, {
     method: "validate_graph",
     value: {
