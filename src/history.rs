@@ -55,6 +55,10 @@ pub struct Run {
     pub log: Vec<String>,
     /// Every node that ran, was reused or failed, by document id.
     pub nodes: BTreeMap<String, NodeRun>,
+    /// The first node whose own step failed, when one did. `nodes` keeps every failure
+    /// but no order; a failed outcome's error is this node's, and the headline names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -253,7 +257,10 @@ pub fn record(
         Err(e) if e == exec::CANCELLED => Outcome::Cancelled,
         Err(e) => Outcome::Failed { error: e.clone() },
     };
-    if let (Some(id), Outcome::Failed { error }) = (&report.failed, &outcome) {
+    // Every node whose own step failed keeps its error, whether the run then went on to
+    // finish other targets, failed, or was cancelled: the canvas showed each one as
+    // failed while the run was live, and the record must say the same afterwards.
+    for (id, error) in &report.failures {
         let mut failed = NodeRun::empty(State::Failed, data_of(id));
         failed.error = Some(error.clone());
         nodes.insert(id.clone(), failed);
@@ -269,6 +276,7 @@ pub fn record(
         outcome,
         log: report.log.clone(),
         nodes,
+        failed: report.failed.clone(),
     }
 }
 
@@ -310,15 +318,24 @@ impl Run {
             Outcome::Ok => format!("✓ {} · {targets} · {secs:.1}s{reused}", self.time()),
             Outcome::Failed { .. } => {
                 let node = self
-                    .nodes
-                    .iter()
-                    .find(|(_, n)| n.state == State::Failed)
-                    .map(|(id, _)| format!(" · {id} failed"))
+                    .first_failed()
+                    .map(|id| format!(" · {id} failed"))
                     .unwrap_or_else(|| " · failed".to_string());
                 format!("✗ {} · {targets}{node} · {secs:.1}s", self.time())
             }
             Outcome::Cancelled => format!("■ {} · {targets} · cancelled", self.time()),
         }
+    }
+
+    /// The node that failed first: the stored one, else (for records written before it
+    /// was stored) the first failed node by id.
+    fn first_failed(&self) -> Option<String> {
+        self.failed.clone().or_else(|| {
+            self.nodes
+                .iter()
+                .find(|(_, n)| n.state == State::Failed)
+                .map(|(id, _)| id.clone())
+        })
     }
 
     /// The run as a [`Report`], as if it had just finished, with the outputs fetched from
@@ -330,11 +347,21 @@ impl Run {
             .filter(|(_, n)| n.state != State::Failed)
             .filter_map(|(id, n)| Some((id.clone(), n.output(cache)?)))
             .collect();
-        let failed = self
+        // The first failure leads, as in the executor's report; the record keeps no
+        // order among the rest.
+        let failed = self.first_failed();
+        let mut failures: Vec<(String, String)> = self
             .nodes
             .iter()
-            .find(|(_, n)| n.state == State::Failed)
-            .map(|(id, _)| id.clone());
+            .filter(|(_, n)| n.state == State::Failed)
+            .map(|(id, n)| (id.clone(), n.error.clone().unwrap_or_default()))
+            .collect();
+        if let Some(first) = failures
+            .iter()
+            .position(|(id, _)| Some(id) == failed.as_ref())
+        {
+            failures.rotate_left(first);
+        }
         let result = match &self.outcome {
             Outcome::Ok => self
                 .targets
@@ -371,6 +398,7 @@ impl Run {
                 .collect(),
             outputs,
             failed,
+            failures,
         }
     }
 }
@@ -455,12 +483,17 @@ pub fn list(root: &Path, graph: &str) -> Vec<Run> {
     let mut files = record_files(&dir);
     files.sort();
     files.reverse();
+    // The directory a record is listed from is authoritative. A rename moves the files
+    // without rewriting them, so the stored name can be stale, and a reader that asks
+    // for this run under its stored name would look in a directory that no longer exists.
+    let graph = graph_name(graph);
     files
         .iter()
         .filter_map(|path| {
             serde_json::from_slice::<Run>(&storage::read(path, storage::MAX_DOCUMENT_BYTES).ok()?)
                 .ok()
                 .map(|mut run| {
+                    run.graph = graph.clone();
                     restore_workflow_snapshots(&mut run);
                     run
                 })
@@ -561,6 +594,13 @@ mod tests {
         if let Ok(out) = &result {
             outputs.insert("n1".to_string(), out.clone());
         }
+        // The executor never counts a cancel as a node's own failure.
+        let failures = match (&result, failed) {
+            (Err(error), Some(id)) if error != exec::CANCELLED => {
+                vec![(id.to_string(), error.clone())]
+            }
+            _ => Vec::new(),
+        };
         Report {
             workflows: BTreeMap::new(),
             named_outputs: BTreeMap::new(),
@@ -572,6 +612,7 @@ mod tests {
             reused: vec!["n0".into()],
             outputs,
             failed: failed.map(str::to_string),
+            failures,
         }
     }
 
@@ -750,6 +791,24 @@ mod tests {
         // The junk file was counted by the pruning and the oldest records went first.
         assert!(!dir.join("20261025T000000000Z.json").exists());
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn renamed_records_report_the_directory_they_are_listed_from() {
+        let root = scratch("renamed");
+        let run = record(&doc(), &["n1".into()], &report(Ok(output("v")), None), None);
+        assert_eq!(run.graph, "My Graph");
+        save(&root, &run).unwrap();
+        assert_eq!(rename(&root, "My Graph", "Renamed").unwrap(), 1);
+        assert!(list(&root, "My Graph").is_empty());
+        let listed = list(&root, "Renamed");
+        assert_eq!(listed.len(), 1);
+        // The file still says "My Graph" inside; a reader asking for this run by that
+        // name would look in a directory that no longer exists.
+        assert_eq!(listed[0].graph, "Renamed");
+        assert_eq!(listed[0].id, run.id);
+        assert_eq!(listed[0].nodes, run.nodes);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

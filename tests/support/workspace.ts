@@ -170,12 +170,20 @@ async function mockService(page: Page) {
         __TAURI_INTERNALS__: {
           invoke: (
             command: string,
-            payload: { method: string; args: Record<string, any> },
+            payload?: Record<string, any>,
           ) => Promise<any>;
+          transformCallback: (
+            callback: (value: unknown) => void,
+            once?: boolean,
+          ) => number;
+        };
+        __TAURI_EVENT_PLUGIN_INTERNALS__: {
+          unregisterListener: (event: string, eventId: number) => void;
         };
         __testState: any;
       };
       host.isTauri = true;
+      let callbackId = 0;
       const state: any = {
         graphs: { Demo: parent, Parts: child, Extract: leaf },
         runtime: null,
@@ -185,12 +193,53 @@ async function mockService(page: Page) {
         replies: [] as Reply[],
         pending: {} as Record<string, () => void>,
         released: {} as Record<string, boolean>,
+        // The desktop shell's side of events and the quit command.
+        callbacks: {} as Record<number, (value: unknown) => void>,
+        listeners: {} as Record<string, number[]>,
+        quits: 0,
+        emit: (event: string) => {
+          for (const id of state.listeners[event] || [])
+            state.callbacks[id]?.({ event, id, payload: null });
+        },
       };
       host.__testState = state;
+      const removeListener = (event: string, eventId: number) => {
+        state.listeners[event] = (state.listeners[event] || []).filter(
+          (id: number) => id !== eventId,
+        );
+      };
+      // `unlisten` drops the listener here first, then tells the shell.
+      host.__TAURI_EVENT_PLUGIN_INTERNALS__ = {
+        unregisterListener: removeListener,
+      };
       host.__TAURI_INTERNALS__ = {
-        invoke: async (command, { method, args = {} }) => {
+        transformCallback: (callback, once = false) => {
+          const id = ++callbackId;
+          state.callbacks[id] = (value: unknown) => {
+            if (once) delete state.callbacks[id];
+            callback(value);
+          };
+          return id;
+        },
+        invoke: async (command, payload = {}) => {
+          if (command === "plugin:event|listen") {
+            (state.listeners[payload.event] ||= []).push(payload.handler);
+            return payload.handler;
+          }
+          if (command === "plugin:event|unlisten") {
+            removeListener(payload.event, payload.eventId);
+            return null;
+          }
+          if (command === "quit") {
+            state.quits += 1;
+            return null;
+          }
           if (command !== "request")
             throw new Error(`Unexpected IPC ${command}`);
+          const { method, args = {} } = payload as {
+            method: string;
+            args?: Record<string, any>;
+          };
           state.calls.push({ method, args: structuredClone(args) });
           const index = state.replies.findIndex(
             (reply: Reply) =>
@@ -308,11 +357,14 @@ async function mockService(page: Page) {
                 throw new Error("Stale review");
               state.runtime.running = false;
               state.runtime.review = null;
+              // `partialResults` makes every node's preview incomplete, so the
+              // inspector offers to load the full output.
               const result = {
                 state: "ran",
                 preview: "Example",
                 label: "Text · 7 bytes",
-                complete: true,
+                complete: !state.partialResults,
+                ...(state.partialResults ? { key: "partial" } : {}),
               };
               state.runtime.run = {
                 id: "20261025T120000000Z",

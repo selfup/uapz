@@ -239,6 +239,7 @@ export default function App() {
   } | null>(null);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [deciding, setDeciding] = useState(false);
   const [pendingRunId, setPendingRunId] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [kindEditor, setKindEditor] = useState(false);
@@ -299,6 +300,7 @@ export default function App() {
   const saveInFlight = useRef(false);
   const preparingRun = useRef(false);
   const startingRun = useRef(false);
+  const decidingReview = useRef(false);
   const pendingRun = useRef<string | null>(null);
   const runtimeRequest = useRef(0);
   const appliedRuntimeRequest = useRef(0);
@@ -490,8 +492,13 @@ export default function App() {
           }
         }
         if (state?.running) delay = 150;
+        // A run ends with a record, or with only an error when its worker
+        // stopped before writing one. Both are terminal: the editor comes
+        // back either way, and the status must not keep saying "running".
         if (
-          state?.run &&
+          state &&
+          !state.running &&
+          (state.run || state.error) &&
           state.run_id !== lastCompleted.current &&
           state.run_id === attachedRun
         ) {
@@ -500,31 +507,34 @@ export default function App() {
           // it. Keep a history run explicitly selected in that interval while
           // still recording the newly completed results and refreshing history.
           const showCompletion = !historicalRef.current;
-          if (showCompletion) {
-            setShownRun(state.run);
-            setHistorical(false);
-          }
           const run = state.run;
-          setRemembered((current) => ({
-            nodes: { ...current.nodes, ...run.nodes },
-            origins: {
-              ...current.origins,
-              ...Object.fromEntries(
-                Object.keys(run.nodes).map((id) => [id, run]),
-              ),
-            },
-          }));
+          if (run) {
+            if (showCompletion) {
+              setShownRun(run);
+              setHistorical(false);
+            }
+            setRemembered((current) => ({
+              nodes: { ...current.nodes, ...run.nodes },
+              origins: {
+                ...current.origins,
+                ...Object.fromEntries(
+                  Object.keys(run.nodes).map((id) => [id, run]),
+                ),
+              },
+            }));
+          }
           void refreshHistory(graph.name);
-          if (showCompletion) {
+          if (showCompletion)
             setNotice(
-              state.run.outcome.kind === "ok"
-                ? `Completed in ${(state.run.elapsed_ms / 1000).toFixed(1)}s`
-                : state.run.outcome.kind === "cancelled"
+              run?.outcome.kind === "ok"
+                ? `Completed in ${(run.elapsed_ms / 1000).toFixed(1)}s`
+                : run?.outcome.kind === "cancelled"
                   ? "Run cancelled"
                   : "Run failed",
             );
-            if (state.error) setError(state.error);
-          }
+          // A crashed worker or an unsaved record is about this run, not the
+          // one on display, so it is reported whichever run is shown.
+          if (state.error) setError(state.error);
         }
       } catch (error) {
         if (!disposed) setError(messageOf(error));
@@ -1161,18 +1171,28 @@ export default function App() {
     }
   }
   async function reviewDecision(decision: "apply" | "reject") {
-    if (!runtime?.review) return;
-    const runId = runtime.run_id;
-    await request("review", {
-      run_id: runtime.run_id,
-      review_id: runtime.review.id,
-      decision,
-    });
-    if (runtimeRef.current?.run_id !== runId) return;
-    await readRuntime(
-      (state) =>
-        state?.run_id === runId && runtimeRef.current?.run_id === runId,
-    );
+    // One decision per review. The panel stays on screen until the next
+    // status read confirms the service consumed it, so a second click in that
+    // interval would be answered with "there is no pending review".
+    if (!runtime?.review || decidingReview.current) return;
+    decidingReview.current = true;
+    setDeciding(true);
+    try {
+      const runId = runtime.run_id;
+      await request("review", {
+        run_id: runtime.run_id,
+        review_id: runtime.review.id,
+        decision,
+      });
+      if (runtimeRef.current?.run_id !== runId) return;
+      await readRuntime(
+        (state) =>
+          state?.run_id === runId && runtimeRef.current?.run_id === runId,
+      );
+    } finally {
+      decidingReview.current = false;
+      setDeciding(false);
+    }
   }
   async function usePrompt(name: string) {
     const config = activeNode && typedData(activeNode);
@@ -1265,6 +1285,21 @@ export default function App() {
       writeLayout({
         lastGraph: { workspace: library?.workspace ?? "", name: result.name },
       });
+      // The runs held here all belong to the open document, and the service
+      // now lists them under the new name. Output requests are made with the
+      // name a run carries, so the copies kept here must follow the rename.
+      const retitle = (run: Run): Run => ({ ...run, graph: result.name });
+      setShownRun((run) => (run ? retitle(run) : run));
+      setHistory((runs) => runs.map(retitle));
+      setRemembered((current) => ({
+        nodes: current.nodes,
+        origins: Object.fromEntries(
+          Object.entries(current.origins).map(([id, run]) => [
+            id,
+            retitle(run),
+          ]),
+        ),
+      }));
     }
     setNotice(`Renamed ${name} to ${result.name}`);
   }
@@ -1343,22 +1378,30 @@ export default function App() {
   }
   closeRequested.current = () => {
     if (closePrompt.current) return;
-    if (!dirtyRef.current) {
+    // Quitting cancels an active run (the shell cancels it on exit), so a run
+    // in progress needs the same confirmation as unsaved work.
+    const unsaved = dirtyRef.current;
+    const running =
+      !!runtimeRef.current?.running || pendingRun.current !== null;
+    if (!unsaved && !running) {
       void quitApp();
       return;
     }
     closePrompt.current = true;
     void (async () => {
       try {
-        const running = !!runtimeRef.current?.running;
         const choice = await choose(
-          running
+          unsaved && running
             ? "This workflow has unsaved changes, and a run is in progress. Quitting cancels the run."
-            : "This workflow has unsaved changes.",
+            : unsaved
+              ? "This workflow has unsaved changes."
+              : "A run is in progress. Quitting cancels it.",
           {
             title: "Quit uapz?",
-            confirm: "Quit without saving",
-            ...(readOnly ? {} : { alternative: "Save and quit" }),
+            confirm: unsaved
+              ? "Quit without saving"
+              : "Quit and cancel the run",
+            ...(unsaved && !readOnly ? { alternative: "Save and quit" } : {}),
           },
         );
         if (choice === "cancel") return;
@@ -2277,6 +2320,7 @@ export default function App() {
           {!readOnly && runtime?.review && (
             <ReviewPanel
               runtime={runtime}
+              deciding={deciding}
               onDecision={(decision) =>
                 void action(() => reviewDecision(decision))
               }
@@ -2578,10 +2622,13 @@ function ShortcutsDialog({ onClose }: { onClose: () => void }) {
 
 function ReviewPanel({
   runtime,
+  deciding,
   onDecision,
   onCancel,
 }: {
   runtime: RuntimeState;
+  /** A decision is on its way to the service; the buttons wait for its answer. */
+  deciding: boolean;
   onDecision: (decision: "apply" | "reject") => void;
   onCancel: () => void;
 }) {
@@ -2656,13 +2703,13 @@ function ReviewPanel({
       <div className="review-actions">
         <button
           className="primary"
-          disabled={runtime.cancelling}
+          disabled={runtime.cancelling || deciding}
           onClick={() => onDecision("apply")}
         >
           Apply changes
         </button>
         <button
-          disabled={runtime.cancelling}
+          disabled={runtime.cancelling || deciding}
           onClick={() => onDecision("reject")}
         >
           Reject

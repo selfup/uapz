@@ -175,6 +175,11 @@ pub struct Report {
     /// The node whose own step failed when `result` is an error: the deepest one, not the
     /// nodes that failed only because it did.
     pub failed: Option<String>,
+    /// Every node whose own step failed this run, with its error, in the order they
+    /// failed. `failed` is the first. Independent targets can each fail, and a run can
+    /// be cancelled after one of them did; the record keeps all of them, so what the
+    /// canvas showed live and what the history says agree.
+    pub failures: Vec<(String, String)>,
 }
 
 impl Report {
@@ -198,6 +203,7 @@ impl Report {
             reused: Vec::new(),
             outputs: HashMap::new(),
             failed: None,
+            failures: Vec::new(),
         }
     }
 }
@@ -689,6 +695,7 @@ fn run_prepared(
         errors: HashMap::new(),
         reused: Vec::new(),
         failed: None,
+        failures: Vec::new(),
     };
     let all = targets.len() != 1;
     if all {
@@ -735,6 +742,7 @@ fn run_prepared(
             .map(|(id, done)| (id, Arc::unwrap_or_clone(done.output)))
             .collect(),
         failed: runner.failed,
+        failures: runner.failures,
     }
 }
 
@@ -758,6 +766,8 @@ struct Runner<'a> {
     reused: Vec<String>,
     /// The first node whose own step failed.
     failed: Option<String>,
+    /// Every node whose own step failed, with its error, in order.
+    failures: Vec<(String, String)>,
 }
 
 /// Index once so walking a deep graph does not rescan every node and edge at each step.
@@ -1173,6 +1183,7 @@ impl Runner<'_> {
     fn record_failure(&mut self, id: &str, error: &str) {
         if error != CANCELLED && !self.errors.contains_key(id) {
             self.failed.get_or_insert_with(|| id.to_string());
+            self.failures.push((id.to_string(), error.to_string()));
             self.state(id, NodeState::Failed);
         }
         self.errors.insert(id.to_string(), error.to_string());
@@ -5120,6 +5131,36 @@ mod tests {
             })
             .collect();
         assert_eq!(failed, ["n0", "n1"]);
+        // What the canvas showed live is what the record says: both failures, each
+        // with its own error, not only the first.
+        let failures: Vec<&str> = report.failures.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(failures, ["n0", "n1"]);
+        assert!(
+            report
+                .failures
+                .iter()
+                .all(|(_, e)| e.contains("missing.txt"))
+        );
+        let run = history::record(&doc, &sinks(&doc), &report, None);
+        assert_eq!(
+            run.outcome,
+            history::Outcome::Failed {
+                error: report.result.unwrap_err()
+            }
+        );
+        for id in ["n0", "n1"] {
+            assert_eq!(run.nodes[id].state, history::State::Failed, "{id}");
+            assert!(
+                run.nodes[id]
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("missing.txt")
+            );
+        }
+        let back = run.report(None);
+        assert_eq!(back.failures.len(), 2);
+        assert_eq!(back.failed.as_deref(), Some("n0"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -5159,9 +5200,24 @@ mod tests {
             &no_env,
             &control,
         );
-        assert_eq!(report.result.unwrap_err(), CANCELLED);
+        assert_eq!(report.result.as_ref().unwrap_err(), CANCELLED);
         assert!(report.outputs.is_empty());
         assert!(!report.log.iter().any(|line| line.starts_with("n1:")));
+        // The cancel wins the outcome, but n0's own failure happened and was shown live;
+        // the record keeps it rather than dropping the node altogether.
+        assert_eq!(report.failed.as_deref(), Some("n0"));
+        assert_eq!(report.failures.len(), 1);
+        let run = history::record(&doc, &sinks(&doc), &report, None);
+        assert_eq!(run.outcome, history::Outcome::Cancelled);
+        assert_eq!(run.nodes["n0"].state, history::State::Failed);
+        assert!(
+            run.nodes["n0"]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("missing.txt")
+        );
+        assert!(!run.nodes.contains_key("n1"));
         fs::remove_dir_all(root).unwrap();
     }
 

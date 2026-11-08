@@ -238,6 +238,41 @@ impl Session {
         self.event(FeedBody::Output { id, result });
     }
 
+    /// The worker's last transition: `running` → finished, once, from any run state. The
+    /// record is `None` when the worker panicked before producing one; the error says so
+    /// and the marks of nodes that never got a final state are dropped either way, so a
+    /// finished session never shows a node as pending or running.
+    fn finish(&mut self, outcome: Option<(history::Run, Option<String>)>) {
+        self.marks
+            .retain(|_, state| *state != "pending" && *state != "running");
+        self.running = false;
+        self.review = None;
+        self.stream = None;
+        let Some((run, save_error)) = outcome else {
+            self.error = Some("the execution worker stopped unexpectedly".into());
+            return;
+        };
+        self.log = run
+            .log
+            .iter()
+            .rev()
+            .scan(0usize, |bytes, line| {
+                if *bytes >= MAX_LIVE_LOG {
+                    None
+                } else {
+                    let line = tail(line, MAX_LIVE_TEXT.min(MAX_LIVE_LOG - *bytes));
+                    *bytes += line.len();
+                    Some(line)
+                }
+            })
+            .collect();
+        self.log.reverse();
+        self.log_bytes = self.log.iter().map(String::len).sum();
+        self.workflows = run.workflows.clone();
+        self.run = Some(run);
+        self.error = save_error;
+    }
+
     fn cancel(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
         if let Some((_, pending)) = self.review.take() {
@@ -828,37 +863,11 @@ impl AppService {
                         run.log
                             .push(format!("The run record was not saved: {error}"));
                     }
-                    let mut state = lock(&session);
-                    state
-                        .marks
-                        .retain(|_, state| *state != "pending" && *state != "running");
-                    state.log = run
-                        .log
-                        .iter()
-                        .rev()
-                        .scan(0usize, |bytes, line| {
-                            if *bytes >= MAX_LIVE_LOG {
-                                None
-                            } else {
-                                let line = tail(line, MAX_LIVE_TEXT.min(MAX_LIVE_LOG - *bytes));
-                                *bytes += line.len();
-                                Some(line)
-                            }
-                        })
-                        .collect();
-                    state.log.reverse();
-                    state.log_bytes = state.log.iter().map(String::len).sum();
-                    state.workflows = run.workflows.clone();
-                    state.run = Some(run);
-                    state.error = save_error;
+                    (run, save_error)
                 }));
-                let mut state = lock(&session);
-                state.running = false;
-                state.review = None;
-                state.stream = None;
-                if result.is_err() {
-                    state.error = Some("the execution worker stopped unexpectedly".into());
-                }
+                // A panic unwinds past the record; the session still leaves `running`
+                // the same way, so no node stays pending or running forever.
+                lock(&session).finish(result.ok());
             });
         if let Err(error) = spawn {
             *current = None;
@@ -1384,6 +1393,105 @@ mod tests {
                 .unwrap(),
             json!([])
         );
+    }
+
+    #[test]
+    fn history_outputs_stay_reachable_under_a_renamed_graph() {
+        let workspace = Workspace::new();
+        workspace
+            .service
+            .request("start_run", json!({"doc":input_doc()}))
+            .unwrap();
+        let finished = workspace.until(|s| s["running"] == false);
+        let run_id = finished["run"]["id"].as_str().unwrap().to_string();
+        // Library helpers resolve `graphs/` relative to the working directory, so the
+        // rename goes through the history module directly, as the service does after
+        // moving the graph files.
+        history::rename(&workspace.root, "service-input", "renamed-input").unwrap();
+        // A later run of another graph replaces the live session, so the renamed run
+        // can only be reached through its record.
+        let mut other = input_doc();
+        other.name = "service-other".into();
+        workspace
+            .service
+            .request("start_run", json!({"doc":other}))
+            .unwrap();
+        workspace.until(|s| s["running"] == false && s["graph"]["name"] == "service-other");
+        let runs = workspace
+            .service
+            .request("history", json!({"graph":"renamed-input"}))
+            .unwrap();
+        assert_eq!(runs.as_array().unwrap().len(), 1);
+        assert_eq!(runs[0]["id"], run_id);
+        // The record names the graph it is now listed under, so the name a client reads
+        // from the record leads back to the record.
+        assert_eq!(runs[0]["graph"], "renamed-input");
+        let output = workspace
+            .service
+            .request(
+                "output",
+                json!({"graph":runs[0]["graph"],"run_id":run_id,"node":"n0"}),
+            )
+            .unwrap();
+        assert_eq!(output["text"], "hello");
+        assert!(
+            workspace
+                .service
+                .request(
+                    "output",
+                    json!({"graph":"service-input","run_id":run_id,"node":"n0"})
+                )
+                .unwrap_err()
+                .contains("no longer stored")
+        );
+    }
+
+    #[test]
+    fn a_crashed_worker_leaves_no_pending_or_running_marks() {
+        let workspace = Workspace::new();
+        let started = workspace
+            .service
+            .request("start_run", json!({"doc":review_doc()}))
+            .unwrap();
+        let state = workspace.until(|s| s["review"].is_object());
+        assert_eq!(state["marks"]["n0"], "ran");
+        assert_eq!(state["marks"]["n1"], "running");
+        let session = workspace
+            .service
+            .session(started["run_id"].as_str().unwrap())
+            .unwrap();
+        // Hold the review's reply channel: `finish` drops the session's copy, and a
+        // closed channel would wake the real worker, which would then finish for real
+        // and overwrite the state under test.
+        let pending = lock(&session).review.take();
+        assert!(pending.is_some());
+        // The worker's unwinding path reaches `finish` with no record.
+        lock(&session).finish(None);
+        let state = workspace.state();
+        assert_eq!(state["running"], false);
+        assert_eq!(state["cancelling"], false);
+        assert!(state["review"].is_null());
+        assert!(state["stream"].is_null());
+        assert!(state["run"].is_null());
+        assert!(
+            state["error"]
+                .as_str()
+                .unwrap()
+                .contains("stopped unexpectedly")
+        );
+        assert_eq!(state["marks"], json!({"n0":"ran"}));
+        assert!(
+            workspace
+                .service
+                .request("cancel_run", json!({"run_id":started["run_id"]}))
+                .unwrap_err()
+                .contains("already finished")
+        );
+        // The real worker is still blocked on its review. Wake it with the cancel flag
+        // and let it write its record before the scratch workspace goes away.
+        workspace.service.cancel_active();
+        workspace.until(|s| !s["run"].is_null());
+        drop(pending);
     }
 
     #[test]

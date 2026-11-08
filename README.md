@@ -67,6 +67,9 @@ UAPZ_WORKSPACE_DIR=/absolute/path/to/workspace npm run desktop
 The workspace holds graphs, presets, scripts, data, cache and history. Existing workspace
 directories can be opened directly; graph and history formats remain compatible.
 
+`STATE_MACHINES.md` lists every state machine in the app with its invariants, transition
+tables and the tests that pin them, plus the known reachable gaps.
+
 Tests cover the file formats, the Mermaid parser, every node config's validation, the SQL
 checker, path confinement, the library's on-disk layout, the executor (scripts, SQLite,
 chains, timeouts, the cache, cancellation, write-file nodes), streamed replies in every
@@ -76,7 +79,8 @@ cover named-port wiring, labels and colors, keyboard edits, undo and redo,
 multi-selection, copy and paste, the context menu, library drag and drop, read-only
 children, saved positions during live status updates, run and review recovery,
 workflow-wide output, automatic scrolling and scrollback, session restore, workflow
-management, the theme, and delayed save, navigation and output responses:
+management, the theme, delayed save, navigation and output responses, a run that ends
+without a record, one decision per review, and quitting while a run is active:
 
 ```sh
 cargo fmt --all --check
