@@ -14,3 +14,4 @@ nodes
 *sbom.syft.json
 .ori/
 /runs/
+STATE_MACHINES.md
