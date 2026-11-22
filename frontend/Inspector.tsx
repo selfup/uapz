@@ -85,6 +85,7 @@ const DEFAULTS = {
   input: defaultNodeData("input"),
   workflow: defaultNodeData("workflow"),
   agent: defaultNodeData("agent"),
+  acp: defaultNodeData("acp"),
   database: defaultNodeData("database"),
   script: defaultNodeData("script"),
   data: defaultNodeData("data"),
@@ -93,6 +94,7 @@ const DEFAULTS = {
 } as { [K in NodeType]: Extract<Config, { type: K }> };
 const NODE_TYPES = [
   "agent",
+  "acp",
   "database",
   "input",
   "workflow",
@@ -101,6 +103,32 @@ const NODE_TYPES = [
   "directory",
   "file",
 ] as const satisfies readonly NodeType[];
+
+function isWritableNode(data: Config): boolean {
+  return (
+    data.type === "file" ||
+    ((data.type === "database" || data.type === "acp") && !data.read_only)
+  );
+}
+function nextNodeColor(
+  currentColor: string | null | undefined,
+  original: Config,
+  data: Config,
+): string {
+  const writable = isWritableNode(data);
+  const defaultOrWrite =
+    !currentColor ||
+    currentColor === COLORS[data.type] ||
+    currentColor === "#ef4444";
+  const toggledReadOnly =
+    (original.type === "database" || original.type === "acp") &&
+    data.type === original.type &&
+    original.read_only !== data.read_only;
+  if (!currentColor || (toggledReadOnly && defaultOrWrite)) {
+    return writable ? "#ef4444" : COLORS[data.type];
+  }
+  return currentColor;
+}
 
 const errorMessage = errorText;
 /** Typed config for the selected node; blank or unknown shapes are null. */
@@ -158,6 +186,12 @@ export default function Inspector(props: InspectorProps) {
   const [models, setModels] = useState<{
     key: string;
     names: string[];
+  } | null>(null);
+  const [acpOptions, setAcpOptions] = useState<{
+    key: string;
+    agent: string | null;
+    models: string[];
+    modes: string[];
   } | null>(null);
   const config = nodeConfig(node);
   const serialized = JSON.stringify(config);
@@ -273,12 +307,10 @@ export default function Inspector(props: InspectorProps) {
   ) => {
     if (!node || !config || readOnly || config.type !== original.type) return;
     const data = { ...original, ...patch };
-    const writable =
-      data.type === "file" || (data.type === "database" && !data.read_only);
     onChange({
       ...node,
       data,
-      color: node.color || (writable ? "#ef4444" : COLORS[data.type]),
+      color: nextNodeColor(node.color, original, data),
     });
   };
   const updateAsync = <T extends Config>(
@@ -291,12 +323,10 @@ export default function Inspector(props: InspectorProps) {
     const targetConfig = nodeConfig(target);
     if (!targetConfig || targetConfig.type !== original.type) return false;
     const data = { ...original, ...patch };
-    const writable =
-      data.type === "file" || (data.type === "database" && !data.read_only);
     current.onChange({
       ...target,
       data,
-      color: target.color || (writable ? "#ef4444" : COLORS[data.type]),
+      color: nextNodeColor(target.color, original, data),
     });
     return true;
   };
@@ -470,8 +500,18 @@ export default function Inspector(props: InspectorProps) {
                 {config ? (
                   <>
                     <div className="ins-section-label">
-                      <span style={{ background: COLORS[config.type] }} />
-                      {NODE_LABELS[config.type]}
+                      <span
+                        style={{
+                          background: isWritableNode(config)
+                            ? "#ef4444"
+                            : COLORS[config.type],
+                        }}
+                      />
+                      {config.type === "database" && !config.read_only
+                        ? "Database (write)"
+                        : config.type === "acp" && !config.read_only
+                          ? "ACP Agent (write)"
+                          : NODE_LABELS[config.type]}
                     </div>
                     <NodeConfigForm
                       data={config}
@@ -485,6 +525,8 @@ export default function Inspector(props: InspectorProps) {
                       library={library}
                       models={models}
                       setModels={setModels}
+                      acpOptions={acpOptions}
+                      setAcpOptions={setAcpOptions}
                       schema={schema}
                       setSchema={setSchema}
                       child={child}

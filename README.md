@@ -4,7 +4,7 @@
 
 A desktop node-graph editor with a Tauri 2 shell, a React and React Flow canvas, and a
 Rust execution core. Nodes are boxes you drag around and wire together; each one can
-carry typed content: an **agent**,
+carry typed content: an **agent**, an **ACP agent**,
 a **database**, a **script**, a **data** file, a **directory**, a **file to write**, a
 named **Run input** supplied each time the graph runs, or a **Workflow** calling a saved graph.
 Graphs save as a Markdown file with a Mermaid diagram plus a JSON sidecar, and reusable
@@ -177,7 +177,7 @@ child workflow; the footer's help opens the full shortcut list (`?`).
 - Right-click a node, a wire or empty space for a menu: run, copy, duplicate or delete
   the node, delete the wire, add or paste at that spot, open a child graph.
 - Double-click empty space, press cmd-n or ctrl-n, or click **Add node** to add the type
-  selected in the toolbar: **Blank**, one of the eight types, or **Database (write)**.
+  selected in the toolbar: **Blank**, one of the nine types, or **Database (write)**.
   Library rows add presets and saved kinds directly, and can be dragged onto the canvas
   to land where they drop. Added nodes otherwise take free space near the middle of the
   view. A writable database starts with its read-only setting off.
@@ -229,7 +229,7 @@ child workflow; the footer's help opens the full shortcut list (`?`).
   agent wired after it write `{{name}}` for its output. Names are letters, digits, `_`
   and `-`, start with a letter, and must be unique to be useful; the panel says when one
   is not.
-- A blank node offers buttons to give it one of the eight content types, plus
+- A blank node offers buttons to give it one of the nine content types, plus
   **Database (write)** with its read-only setting off.
   A typed node can change type
   or go back to blank under **Node options** in Configure.
@@ -446,6 +446,27 @@ before being written to `generated/heading.md` and `generated/body.md`.
 | Temperature | 0.0 to 2.0. Not sent to Anthropic, whose API version 2026-10-21 has no sampling parameters |
 | Output | Text, JSON, Embedding or Image; must match the model type |
 
+**ACP Agent**
+
+Drives a locally installed CLI coding agent (such as `claude-acp`, `codex-acp`,
+`cursor-agent acp`, `opencode acp`, `gemini --acp`, or `antigravity-acp`) over the
+Agent Client Protocol (JSON-RPC 2.0 on `stdio`), using the CLI's own local
+authentication.
+
+| Field | Notes |
+| --- | --- |
+| Agent preset | Fills Command and Arguments for common ACP CLIs, or select Custom command |
+| Command | Executable name on PATH or absolute path |
+| Arguments | One CLI argument per line |
+| Working directory | Relative to the workspace root (`.` for the workspace itself) |
+| Model / Mode | Optional model and mode values; **Check agent & fetch options** queries `session/new` for supported choices |
+| Prompt / Message | Supports `{{name}}` placeholders and saved prompts under `prompts/` |
+| Output | Text or JSON, saved to `agents/<name>/outputs/` |
+| Timeout | Seconds, 1 to 86,400 |
+| Read-only mode | On by default: only `read`, `search`, and `think` tool permissions are approved while `edit`, `delete`, and `execute` requests are denied. Turning it off approves tool permissions and marks the node red |
+
+ACP Agent nodes observe live workspace files, so they never reuse cached outputs.
+
 **Database**
 
 | Field | Notes |
@@ -567,6 +588,7 @@ with independent targets after a failure:
 | Script | `uv run --quiet <file>`, `sh`/`bash`/`zsh <file>` or `node <file>` with the arguments, in `scripts/` | stdin | stdout as text; non-zero exit or the timeout is an error |
 | Database | `sqlite3 -json`, `duckdb -json`, `psql --csv` or `mysql --batch` with the query on stdin | the SQL to run, only when the node's own query is empty; data comes from the input file | rows as JSON (file engines) or CSV/TSV (server engines) |
 | Agent | One request to the provider | the user message, or the `{{name}}` placeholders of its prompt and message | text, JSON, an embedding vector or an image, saved to `agents/<name>/outputs/` |
+| ACP Agent | One ACP session turn (`initialize`, `session/new`, `session/prompt`) on `stdio` | the message, or the `{{name}}` placeholders of its prompt and message | text or JSON, saved to `agents/<name>/outputs/` |
 | Directory | Walks the directory (hidden entries and symlinks skipped, `.gitignore` honored when asked, 32 levels deep) | nothing | text: `Directory <path>: N files matched`, one line per file with its size, then `=== path ===` sections with contents until the budget is spent; binary files are named, not shown |
 | Write file | Creates, replaces or appends to the file, after checking the path again and resolving symlinks | the content | the content it wrote, with the file's path in the status line |
 
@@ -615,8 +637,8 @@ first. A reply received after cancellation is not saved or cached, and the run r
 
 **Cache.** Every agent's and script's output is kept across runs, keyed on the node's
 configuration, its inputs' outputs and (for scripts) the script file itself, so running a
-downstream node again re-uses the agents above it. Data, directory, database and
-write-file nodes always run: they read or change live state, and they are cheap. Every
+downstream node again re-uses the agents above it. Data, directory, database, ACP agent
+and write-file nodes always run: they read or change live state. Every
 node's output is hashed for the nodes after it, so editing a comment in a script does not
 re-run the agent that reads its output, while changing a data file does. The log says
 `n3: reused the cached Text · 2 KB` for each hit, the status line counts them, **Run
@@ -859,6 +881,7 @@ ids and `-->` edges (node shapes and `|labels|` are tolerated) and laid out left
 | `src/review.rs` | File snapshots, bounded diffs, review decisions and stale-file checks |
 | `src/history.rs` | Run records, input values, output previews and history replay |
 | `src/providers.rs` | Provider request builders and reply parsers; the HTTP client, plain and streamed |
+| `src/acp.rs` | Synchronous ACP v1 JSON-RPC over stdio client, capability checks, and permission policy |
 | `scripts/setup.sh` | Frontend, Playwright and Rust crate dependency install |
 | `.github/workflows/ci.yml`, `scripts/run-tests.sh` | Rust/frontend checks, builds and interaction tests |
 | `src/node_data.rs` | The typed node content: configs, enums, summaries, validation |

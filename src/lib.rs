@@ -1,5 +1,6 @@
 //! UI-independent workflow execution, persistence and application services.
 
+pub mod acp;
 pub mod app;
 pub mod calls;
 pub mod doc;

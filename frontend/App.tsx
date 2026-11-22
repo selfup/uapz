@@ -1103,8 +1103,12 @@ export default function App() {
   }
   async function usePrompt(name: string) {
     const config = activeNode && typedData(activeNode);
-    if (readOnly || !activeNode || config?.type !== "agent")
-      throw new Error("Select an Agent node to load a prompt.");
+    if (
+      readOnly ||
+      !activeNode ||
+      (config?.type !== "agent" && config?.type !== "acp")
+    )
+      throw new Error("Select an Agent or ACP Agent node to load a prompt.");
     const requestId = ++promptRequest.current;
     const selection = promptSelection.current;
     const stillSelected = () =>
@@ -1126,7 +1130,7 @@ export default function App() {
     const currentConfig = current && typedData(current);
     if (
       !current ||
-      currentConfig?.type !== "agent" ||
+      (currentConfig?.type !== "agent" && currentConfig?.type !== "acp") ||
       currentConfig.prompt !== config.prompt
     )
       return;

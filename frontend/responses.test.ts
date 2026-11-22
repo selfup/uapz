@@ -32,6 +32,7 @@ describe("desktop response decoding", () => {
   it("accepts every node type and keeps blank/legacy optional fields usable", () => {
     const types: NodeType[] = [
       "agent",
+      "acp",
       "database",
       "script",
       "data",
@@ -231,5 +232,20 @@ describe("desktop response decoding", () => {
     expect(() =>
       decodeResponse("load_graph", { ...emptyGraph(), nodes: Array(2) }),
     ).toThrow(/Invalid load_graph response/);
+  });
+
+  it("decodes probe_acp responses and rejects malformed payloads", () => {
+    const ok = {
+      agent: "Claude ACP",
+      models: ["sonnet", "opus"],
+      modes: ["ask", "code"],
+    };
+    expect(decodeResponse("probe_acp", ok)).toEqual(ok);
+    expect(
+      decodeResponse("probe_acp", { agent: null, models: [], modes: [] }),
+    ).toEqual({ agent: null, models: [], modes: [] });
+    expect(() =>
+      decodeResponse("probe_acp", { agent: 123, models: [], modes: [] }),
+    ).toThrow(/Invalid probe_acp response/);
   });
 });

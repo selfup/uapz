@@ -59,8 +59,8 @@ use serde::{Deserialize, Serialize};
 use crate::doc::{GraphDoc, NodeDoc};
 use crate::library;
 use crate::node_data::{
-    AgentConfig, Auth, DataConfig, DatabaseConfig, DbEngine, DirectoryConfig, FileConfig,
-    ModelType, NodeData, NodeType, OutputType, Runtime, ScriptConfig, WriteMode,
+    AcpConfig, AgentConfig, Auth, DataConfig, DatabaseConfig, DbEngine, DirectoryConfig,
+    FileConfig, ModelType, NodeData, NodeType, OutputType, Runtime, ScriptConfig, WriteMode,
 };
 use crate::providers::{self, Http};
 use crate::storage;
@@ -1320,7 +1320,8 @@ impl Runner<'_> {
                 let source = read_bounded(&path, MAX_FILE_BYTES)?;
                 Some(cache_key(&config_json, &source, &upstream_keys))
             }
-            NodeData::Data(_)
+            NodeData::Acp(_)
+            | NodeData::Data(_)
             | NodeData::Workflow(_)
             | NodeData::Input(_)
             | NodeData::Database(_)
@@ -1418,20 +1419,27 @@ impl Runner<'_> {
                 self.run_database(config, &join_text(id, &upstream, &outputs)?)
             }
             NodeData::Agent(config) => {
-                let inputs: Vec<Input> = upstream
-                    .iter()
-                    .zip(outputs)
-                    .map(|(from, output)| Input {
-                        id: from.clone(),
-                        name: self.input_name(from),
-                        output,
-                    })
-                    .collect();
+                let inputs = build_inputs(&upstream, outputs, |from| self.input_name(from));
                 let filled = fill_agent(id, config, &inputs)?;
                 if let Some(note) = &filled.note {
                     self.log(format!("{id}: {note}"));
                 }
                 self.run_agent(&filled.config, id, &name, &filled.input)
+            }
+            NodeData::Acp(config) => {
+                let inputs = build_inputs(&upstream, outputs, |from| self.input_name(from));
+                let (prompt, input, note) = fill_templates(
+                    id,
+                    &config.prompt,
+                    &config.message,
+                    MAX_INPUT_BYTES,
+                    None,
+                    &inputs,
+                )?;
+                if let Some(note) = &note {
+                    self.log(format!("{id}: {note}"));
+                }
+                self.run_acp(config, id, &name, &prompt, &input)
             }
             NodeData::Directory(config) => self.run_directory(config),
             NodeData::File(config) if config.bundle => {
@@ -2036,6 +2044,92 @@ impl Runner<'_> {
         output.saved = Some(saved);
         Ok(output)
     }
+
+    fn run_acp(
+        &mut self,
+        config: &AcpConfig,
+        id: &str,
+        name: &str,
+        prompt: &str,
+        input: &str,
+    ) -> Result<Output, String> {
+        let cwd = validate::resolve_directory_inside(&self.dirs.root, &config.cwd)?;
+        let prompt_trimmed = prompt.trim();
+        let input_trimmed = input.trim();
+        let mut combined = match (prompt_trimmed.is_empty(), input_trimmed.is_empty()) {
+            (true, true) => {
+                return Err("nothing to send: the ACP agent has no prompt and no input".into());
+            }
+            (false, true) => prompt_trimmed.to_string(),
+            (true, false) => input_trimmed.to_string(),
+            (false, false) => format!("{prompt_trimmed}\n\n{input_trimmed}"),
+        };
+        if config.output == OutputType::Json {
+            combined.push_str("\n\n");
+            combined.push_str(providers::JSON_INSTRUCTION);
+        }
+        let args = if config.args.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", config.args.join(" "))
+        };
+        let shown_cwd = match config.cwd.trim() {
+            "" => ".",
+            other => other,
+        };
+        self.log(format!(
+            "-> acp `{}{args}` in {shown_cwd} ({})",
+            config.command.trim(),
+            if config.read_only {
+                "read-only"
+            } else {
+                "write"
+            }
+        ));
+        let progress = self.control.progress.clone();
+        let cancel = self.control.cancel.clone();
+        let mut acp_logs = Vec::new();
+        let mut on_text = |text: &str| {
+            if let Some(progress) = &progress {
+                progress(Progress::Text {
+                    id: id.to_string(),
+                    text: text.to_string(),
+                });
+            }
+            !cancel.load(Ordering::Relaxed)
+        };
+        let mut on_log = |line: &str| {
+            if let Some(progress) = &progress {
+                progress(Progress::Log(line.to_string()));
+            }
+            acp_logs.push(line.to_string());
+        };
+        let turn = match crate::acp::run(
+            config,
+            &cwd,
+            &combined,
+            &self.control.cancel,
+            &mut on_text,
+            &mut on_log,
+        ) {
+            Ok(turn) => {
+                self.log.extend(acp_logs);
+                turn
+            }
+            Err(e) => {
+                self.log.extend(acp_logs);
+                self.check_cancel()?;
+                return Err(e);
+            }
+        };
+        self.check_cancel()?;
+        let bytes = providers::format_text_output(config.output, &turn.text)?;
+        let saved = library::write_agent_output(&self.dirs.root, name, config.output, &bytes)?;
+        self.log(format!("saved {}", saved.display()));
+        let mut output = Output::new(bytes, true, config.output.label());
+        output.saved = Some(saved);
+        Ok(output)
+    }
 }
 
 /// The model that answered when it is not the one asked for. Servers name snapshots
@@ -2174,12 +2268,55 @@ struct Filled {
     note: Option<String>,
 }
 
+fn build_inputs(
+    upstream: &[String],
+    outputs: Vec<Arc<Output>>,
+    mut input_name: impl FnMut(&str) -> Option<String>,
+) -> Vec<Input> {
+    upstream
+        .iter()
+        .zip(outputs)
+        .map(|(from, output)| Input {
+            id: from.clone(),
+            name: input_name(from),
+            output,
+        })
+        .collect()
+}
+
 /// Fill the `{{name}}` placeholders of an agent's prompt and message from its inputs. A
 /// placeholder names an input by the node's name, else by its id. The inputs nothing
 /// names are joined with blank lines: on their own they are the message, as for every
 /// other node; after a message with text they follow it. Binary output has no place in
 /// text.
 fn fill_agent(id: &str, config: &AgentConfig, inputs: &[Input]) -> Result<Filled, String> {
+    let limit = context_bytes(config);
+    let (prompt, input, note) = fill_templates(
+        id,
+        &config.prompt,
+        &config.message,
+        limit,
+        Some(config.context_size),
+        inputs,
+    )?;
+    Ok(Filled {
+        config: AgentConfig {
+            prompt,
+            ..config.clone()
+        },
+        input,
+        note,
+    })
+}
+
+fn fill_templates(
+    id: &str,
+    prompt_template: &str,
+    message_template: &str,
+    limit: usize,
+    context_size: Option<u32>,
+    inputs: &[Input],
+) -> Result<(String, String, Option<String>), String> {
     let mut used: Vec<usize> = Vec::new();
     let mut lookup = |hole: &str| -> Result<&str, String> {
         let by_name: Vec<usize> = inputs
@@ -2227,12 +2364,9 @@ fn fill_agent(id: &str, config: &AgentConfig, inputs: &[Input]) -> Result<Filled
         }
         Ok(text)
     };
-    let limit = context_bytes(config);
-    let over_context = |e: String| {
-        format!(
-            "{id}: {e}; prompt and input are over the context size of {}",
-            config.context_size
-        )
+    let over_context = |e: String| match context_size {
+        Some(size) => format!("{id}: {e}; prompt and input are over the context size of {size}"),
+        None => format!("{id}: {e}"),
     };
     // Preserve lookup diagnostics; only size errors need the context explanation.
     let render_error = |e| match e {
@@ -2241,10 +2375,10 @@ fn fill_agent(id: &str, config: &AgentConfig, inputs: &[Input]) -> Result<Filled
         }
         validate::RenderError::Lookup(error) => error,
     };
-    let prompt = validate::render(&config.prompt, limit, &mut lookup).map_err(render_error)?;
+    let prompt = validate::render(prompt_template, limit, &mut lookup).map_err(render_error)?;
     let remaining = limit - prompt.len();
     let message =
-        validate::render(&config.message, remaining, &mut lookup).map_err(render_error)?;
+        validate::render(message_template, remaining, &mut lookup).map_err(render_error)?;
 
     let mut rest: Vec<&str> = Vec::with_capacity(inputs.len());
     for (n, input) in inputs.iter().enumerate() {
@@ -2289,14 +2423,7 @@ fn fill_agent(id: &str, config: &AgentConfig, inputs: &[Input]) -> Result<Filled
             .collect();
         format!("placed inputs: {}", parts.join(" · "))
     });
-    Ok(Filled {
-        config: AgentConfig {
-            prompt,
-            ..config.clone()
-        },
-        input,
-        note,
-    })
+    Ok((prompt, input, note))
 }
 
 /// The upstream outputs as one text, blank-line separated. Binary output is an error:
@@ -7019,6 +7146,127 @@ mod tests {
         .unwrap();
         assert!(error.contains(program), "{error}");
         assert!(error.contains("not installed"), "{error}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn acp_nodes_stream_enforce_read_only_toggle_save_outputs_and_never_cache() {
+        let root = scratch("acp");
+        fs::write(root.join("data/note.txt"), "hello-from-data").unwrap();
+        let mock_script = r#"
+mode="text"
+if [ "${1:-}" = "--json" ]; then mode="json"; fi
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentInfo":{"name":"MockSh"}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"s1"}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call","toolCallId":"t1","kind":"edit","title":"Edit file"}}}\n'
+      printf '{"jsonrpc":"2.0","id":99,"method":"session/request_permission","params":{"sessionId":"s1","toolCall":{"toolCallId":"t1","kind":"edit","title":"Edit file"},"options":[{"optionId":"allow","kind":"allow_once"},{"optionId":"reject","kind":"reject_once"}]}}\n'
+      IFS= read -r perm
+      perm_choice="unknown"
+      case "$perm" in
+        *'"allow"'*) perm_choice="allow" ;;
+        *'"reject"'*) perm_choice="reject" ;;
+      esac
+      if [ "$mode" = "json" ]; then
+        printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"```json\n{\"perm\":\"'"$perm_choice"'\"}\n```"}}}}'
+      else
+        has_input="no"
+        case "$line" in
+          *hello-from-data*) has_input="yes" ;;
+        esac
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"perm=%s input=%s"}}}}\n' "$perm_choice" "$has_input"
+      fi
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+        fs::write(root.join("mock-acp.sh"), mock_script).unwrap();
+
+        let mut source = node("n0", data("note.txt", DataFormat::Text));
+        source.name = Some("note".into());
+        let acp_node = |read_only: bool, output: OutputType, extra_arg: Option<&str>| {
+            let mut args = vec!["mock-acp.sh".to_string()];
+            if let Some(arg) = extra_arg {
+                args.push(arg.to_string());
+            }
+            node(
+                "n1",
+                Some(NodeData::Acp(AcpConfig {
+                    command: "sh".into(),
+                    args,
+                    cwd: ".".into(),
+                    model: String::new(),
+                    mode: String::new(),
+                    prompt: "Use {{note}}".into(),
+                    message: String::new(),
+                    output,
+                    read_only,
+                    timeout_secs: 10,
+                })),
+            )
+        };
+
+        let doc = graph(
+            vec![source.clone(), acp_node(true, OutputType::Text, None)],
+            &[("n0", "n1")],
+        );
+        let http = FakeHttp::new(200, "{}");
+        let (control, seen) = recording_control();
+        let first = run_with(&doc, "n1", Dirs::under(&root), &http, &no_env, &control);
+        let out = first.result.expect("read-only acp run");
+        assert_eq!(out.as_text(), Some("perm=reject input=yes"));
+        let saved = out.saved.as_ref().expect("saved output");
+        assert!(saved.exists());
+        assert!(first.log.iter().any(|l| l.contains("denied tool [edit]")));
+        let streamed: String = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|p| match p {
+                Progress::Text { id, text } if id == "n1" => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(streamed, "perm=reject input=yes");
+
+        // Second run with the same warm cache must NOT reuse the ACP output.
+        let second = run_with(&doc, "n1", Dirs::under(&root), &http, &no_env, &control);
+        assert!(second.result.is_ok());
+        assert!(second.reused.is_empty(), "{:?}", second.reused);
+
+        // Writable mode approves `edit` permissions and supports JSON formatting.
+        let write_doc = graph(
+            vec![source, acp_node(false, OutputType::Json, Some("--json"))],
+            &[("n0", "n1")],
+        );
+        let write_report = run_with(
+            &write_doc,
+            "n1",
+            Dirs::under(&root),
+            &http,
+            &no_env,
+            &control,
+        );
+        let write_out = write_report.result.expect("writable acp json run");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(write_out.as_text().unwrap()).unwrap(),
+            serde_json::json!({ "perm": "allow" })
+        );
+        assert!(
+            write_report
+                .log
+                .iter()
+                .any(|l| l.contains("approved tool [edit]"))
+        );
+
         fs::remove_dir_all(&root).unwrap();
     }
 }

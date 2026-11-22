@@ -20,8 +20,49 @@ import {
 
 type Config = NodeData;
 type Agent = Extract<NodeData, { type: "agent" }>;
+type Acp = Extract<NodeData, { type: "acp" }>;
 type Database = Extract<NodeData, { type: "database" }>;
 type Workflow = Extract<NodeData, { type: "workflow" }>;
+
+const ACP_PRESETS = [
+  { id: "custom", label: "Custom command", command: "", args: [] as string[] },
+  {
+    id: "claude",
+    label: "Claude Code (claude-acp)",
+    command: "claude-acp",
+    args: [] as string[],
+  },
+  {
+    id: "codex",
+    label: "Codex (codex-acp)",
+    command: "codex-acp",
+    args: [] as string[],
+  },
+  {
+    id: "cursor",
+    label: "Cursor (cursor-agent acp)",
+    command: "cursor-agent",
+    args: ["acp"],
+  },
+  {
+    id: "opencode",
+    label: "OpenCode (opencode acp)",
+    command: "opencode",
+    args: ["acp"],
+  },
+  {
+    id: "gemini",
+    label: "Gemini CLI (gemini --acp)",
+    command: "gemini",
+    args: ["--acp"],
+  },
+  {
+    id: "antigravity",
+    label: "Antigravity (antigravity-acp)",
+    command: "antigravity-acp",
+    args: [] as string[],
+  },
+] as const;
 type InspectorLibrary = Pick<
   Library,
   "agents" | "databases" | "prompts" | "graphs" | "scripts" | "data"
@@ -95,6 +136,20 @@ export type NodeConfigFormProps = {
   library: InspectorLibrary;
   models: { key: string; names: string[] } | null;
   setModels: (value: { key: string; names: string[] } | null) => void;
+  acpOptions: {
+    key: string;
+    agent: string | null;
+    models: string[];
+    modes: string[];
+  } | null;
+  setAcpOptions: (
+    value: {
+      key: string;
+      agent: string | null;
+      models: string[];
+      modes: string[];
+    } | null,
+  ) => void;
   schema: { revision: number; text: string } | null;
   setSchema: (value: { revision: number; text: string } | null) => void;
   child: { name: string; graph: GraphDoc; fields: Field[] } | null;
@@ -136,6 +191,8 @@ export default function NodeConfigForm(props: NodeConfigFormProps) {
     library,
     models,
     setModels,
+    acpOptions,
+    setAcpOptions,
     schema,
     setSchema,
     child,
@@ -149,6 +206,96 @@ export default function NodeConfigForm(props: NodeConfigFormProps) {
     updateAsync,
     perform,
   } = props;
+
+function renderSavedPrompts(
+  promptText: string,
+  applyPrompt: (prompt: string) => boolean,
+) {
+  if (readOnly) return null;
+  return (
+    <details className="ins-details">
+      <summary>Saved prompts</summary>
+      <div className="ins-details-body">
+        <Select
+          label="Load prompt"
+          value=""
+          options={[
+            ["", "Choose a saved prompt…"],
+            ...library.prompts.map((name) => [name, name] as const),
+          ]}
+          onChange={(name) => {
+            if (name)
+              void perform(async (isActive) => {
+                const prompt = await request("load_prompt", { name });
+                if (isActive() && applyPrompt(prompt)) setDraft({ prompt: name });
+              }, "Prompt loaded");
+          }}
+        />
+        <div className="ins-inline">
+          <Text
+            label="Prompt name"
+            value={draft.prompt || ""}
+            onChange={(prompt) => setDraft({ prompt })}
+          />
+          <button
+            type="button"
+            disabled={busy || !draft.prompt?.trim() || !promptText.trim()}
+            onClick={() =>
+              void perform(async () => {
+                await request("save_prompt", {
+                  name: draft.prompt || "",
+                  text: promptText,
+                });
+                onLibraryChanged?.();
+              }, "Prompt saved")
+            }
+          >
+            Save prompt
+          </button>
+        </div>
+      </div>
+    </details>
+  );
+}
+
+function renderConnectedInputs(prompt: string, message: string) {
+  if (!upstream.length) return null;
+  return (
+    <section className="ins-inputs">
+      <h3>Connected inputs</h3>
+      {upstream.map((input) => {
+        const references = (template: string) =>
+          [...template.matchAll(/\{\{\s*([^{}]+?)\s*\}\}/g)].some((match) =>
+            [input.alias, input.handle].includes(match[1]?.trim() || ""),
+          );
+        const inPrompt = references(prompt);
+        const inMessage = references(message);
+        const previous =
+          results?.[input.source?.id || ""] ||
+          activeRun?.nodes[input.source?.id || ""];
+        const port = input.handle.split(".")[1];
+        const output = port ? previous?.named_outputs?.[port] : previous;
+        return (
+          <div key={input.handle}>
+            <span className="ins-port-dot" />
+            <span
+              title={output?.error || output?.label || "Not run yet"}
+            >{`{{${input.alias}}}`}</span>
+            <small>
+              {inPrompt && inMessage
+                ? "Prompt + message"
+                : inPrompt
+                  ? "Prompt"
+                  : inMessage
+                    ? "Message"
+                    : "Appended to message"}
+            </small>
+          </div>
+        );
+      })}
+    </section>
+  );
+}
 
 function renderAgent(data: Agent) {
   const local = ["ollama", "lmstudio", "llamacpp"].includes(data.provider);
@@ -281,54 +428,8 @@ function renderAgent(data: Agent) {
         onChange={(prompt) => update(data, { prompt })}
         help="Use {{name}} to place a named upstream node’s output."
       />
-      {!readOnly && (
-        <details className="ins-details">
-          <summary>Saved prompts</summary>
-          <div className="ins-details-body">
-            <Select
-              label="Load prompt"
-              value=""
-              options={[
-                ["", "Choose a saved prompt…"],
-                ...library.prompts.map((name) => [name, name] as const),
-              ]}
-              onChange={(name) => {
-                if (name)
-                  void perform(async (isActive) => {
-                    const prompt = await request("load_prompt", {
-                      name,
-                    });
-                    if (isActive() && updateAsync(data, { prompt }))
-                      setDraft({ prompt: name });
-                  }, "Prompt loaded");
-              }}
-            />
-            <div className="ins-inline">
-              <Text
-                label="Prompt name"
-                value={draft.prompt || ""}
-                onChange={(prompt) => setDraft({ prompt })}
-              />
-              <button
-                type="button"
-                disabled={
-                  busy || !draft.prompt?.trim() || !data.prompt.trim()
-                }
-                onClick={() =>
-                  void perform(async () => {
-                    await request("save_prompt", {
-                      name: draft.prompt || "",
-                      text: data.prompt,
-                    });
-                    onLibraryChanged?.();
-                  }, "Prompt saved")
-                }
-              >
-                Save prompt
-              </button>
-            </div>
-          </div>
-        </details>
+      {renderSavedPrompts(data.prompt, (prompt) =>
+        updateAsync(data, { prompt }),
       )}
       <Text
         label="Message"
@@ -363,44 +464,150 @@ function renderAgent(data: Agent) {
         options={outputOptions}
         onChange={(output) => update(data, { output })}
       />
-      {upstream.length > 0 && (
-        <section className="ins-inputs">
-          <h3>Connected inputs</h3>
-          {upstream.map((input) => {
-            const references = (template: string) =>
-              [...template.matchAll(/\{\{\s*([^{}]+?)\s*\}\}/g)].some(
-                (match) =>
-                  [input.alias, input.handle].includes(
-                    match[1]?.trim() || "",
-                  ),
-              );
-            const inPrompt = references(data.prompt);
-            const inMessage = references(data.message || "");
-            const previous =
-              results?.[input.source?.id || ""] ||
-              activeRun?.nodes[input.source?.id || ""];
-            const port = input.handle.split(".")[1];
-            const output = port ? previous?.named_outputs?.[port] : previous;
-            return (
-              <div key={input.handle}>
-                <span className="ins-port-dot" />
-                <span
-                  title={output?.error || output?.label || "Not run yet"}
-                >{`{{${input.alias}}}`}</span>
-                <small>
-                  {inPrompt && inMessage
-                    ? "Prompt + message"
-                    : inPrompt
-                      ? "Prompt"
-                      : inMessage
-                        ? "Message"
-                        : "Appended to message"}
-                </small>
-              </div>
-            );
-          })}
-        </section>
+      {renderConnectedInputs(data.prompt, data.message || "")}
+    </>
+  );
+}
+
+function renderAcp(data: Acp) {
+  const acpKey = JSON.stringify([
+    data.command.trim(),
+    data.args,
+    data.cwd.trim(),
+  ]);
+  const listed = acpOptions?.key === acpKey ? acpOptions : null;
+  const matchedPreset =
+    ACP_PRESETS.find(
+      (preset) =>
+        preset.id !== "custom" &&
+        preset.command === data.command.trim() &&
+        JSON.stringify(preset.args) === JSON.stringify(data.args),
+    )?.id ?? "custom";
+  return (
+    <>
+      <Select
+        label="Agent preset"
+        value={matchedPreset}
+        options={ACP_PRESETS.map((preset) => [preset.id, preset.label] as const)}
+        onChange={(id) => {
+          const preset = ACP_PRESETS.find((item) => item.id === id);
+          if (!preset || preset.id === "custom") return;
+          update(data, { command: preset.command, args: [...preset.args] });
+        }}
+        help="Uses your locally installed and logged-in CLI agent."
+      />
+      <Text
+        label="Command"
+        value={data.command}
+        placeholder="claude-acp"
+        onChange={(command) => update(data, { command })}
+        help="Executable name on PATH or absolute path."
+        mono
+      />
+      <Lines
+        label="Arguments"
+        value={data.args}
+        onChange={(args) => update(data, { args })}
+        help="One argument per line."
+      />
+      <Text
+        label="Working directory"
+        value={data.cwd}
+        onChange={(cwd) => update(data, { cwd })}
+        help="Relative to the workspace; . uses the workspace root."
+        mono
+      />
+      <div className="ins-two">
+        <Text
+          label="Model"
+          value={data.model || ""}
+          choices={listed?.models}
+          onChange={(model) => update(data, { model })}
+          help="Optional. Leave empty for the agent's default."
+        />
+        <Text
+          label="Mode"
+          value={data.mode || ""}
+          choices={listed?.modes}
+          onChange={(mode) => update(data, { mode })}
+          help="Optional session mode."
+        />
+      </div>
+      {!readOnly && (
+        <div className="ins-button-row ins-models">
+          <button
+            type="button"
+            disabled={busy || !data.command.trim()}
+            title="Start the ACP agent briefly to query its available models and modes"
+            onClick={() =>
+              void perform(async (isActive) => {
+                const probed = await request("probe_acp", {
+                  config: bareConfig(data),
+                });
+                if (isActive()) setAcpOptions({ key: acpKey, ...probed });
+              }, "ACP agent checked")
+            }
+          >
+            Check agent & fetch options
+          </button>
+          {listed && (
+            <span className="ins-help">
+              {listed.agent ? `${listed.agent} · ` : ""}
+              {listed.models.length} model
+              {listed.models.length === 1 ? "" : "s"},{" "}
+              {listed.modes.length} mode
+              {listed.modes.length === 1 ? "" : "s"}
+            </span>
+          )}
+        </div>
       )}
+      <Text
+        label="Prompt"
+        value={data.prompt}
+        multiline
+        rows={7}
+        onChange={(prompt) => update(data, { prompt })}
+        help="Use {{name}} to place a named upstream node’s output."
+      />
+      {renderSavedPrompts(data.prompt, (prompt) =>
+        updateAsync(data, { prompt }),
+      )}
+      <Text
+        label="Message"
+        value={data.message || ""}
+        multiline
+        rows={4}
+        onChange={(message) => update(data, { message })}
+        help="Empty sends all inputs together. Place {{name}} here to direct an input into the message; other inputs follow."
+      />
+      <div className="ins-two">
+        <Select
+          label="Output format"
+          value={data.output}
+          options={[
+            ["text", "Text"],
+            ["json", "JSON"],
+          ]}
+          onChange={(output) => update(data, { output })}
+        />
+        <NumberField
+          label="Timeout in seconds"
+          value={data.timeout_secs}
+          min={1}
+          onChange={(timeout_secs) => update(data, { timeout_secs })}
+        />
+      </div>
+      <Toggle
+        label="Read-only mode"
+        value={data.read_only}
+        onChange={(read_only) => update(data, { read_only })}
+        help={
+          data.read_only
+            ? "Read, search, and think tool permissions are approved; edit, delete, and execute requests are denied. Agents enforce permissions cooperatively."
+            : "All tool permissions (file edits, deletes, shell commands) are approved automatically. This node appears red on the canvas."
+        }
+      />
+      {renderConnectedInputs(data.prompt, data.message || "")}
     </>
   );
 }
@@ -679,6 +886,8 @@ function renderForm(data: Config) {
   switch (data.type) {
     case "agent":
       return renderAgent(data);
+    case "acp":
+      return renderAcp(data);
     case "database":
       return renderDatabase(data);
     case "workflow":

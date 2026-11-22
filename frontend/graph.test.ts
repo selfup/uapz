@@ -288,6 +288,7 @@ describe("runtime node data", () => {
   it("renders partial known configurations without crashing before validation", () => {
     for (const type of [
       "agent",
+      "acp",
       "database",
       "directory",
       "file",
@@ -303,6 +304,16 @@ describe("runtime node data", () => {
         withData({ type: "agent", provider: "constructor", model: "m" }),
       ),
     ).toBe("Constructor · m");
+    expect(
+      nodeSummary(
+        withData({
+          type: "acp",
+          command: "/opt/homebrew/bin/claude-acp",
+          model: "sonnet",
+          read_only: false,
+        }),
+      ),
+    ).toBe("claude-acp · sonnet · write");
   });
 });
 
@@ -383,6 +394,16 @@ describe("graph mutations", () => {
       throw new Error("Expected a database configuration");
     expect(
       nodeColor({ id: "n1", x: 0, y: 0, data: { ...db, read_only: false } }),
+    ).toBe("#ef4444");
+    const acp = defaultNodeData("acp");
+    if (acp.type !== "acp") throw new Error("Expected an ACP configuration");
+    expect(nodeLabel({ id: "n1", x: 0, y: 0, data: acp })).toBe("ACP Agent");
+    expect(nodeColor({ id: "n1", x: 0, y: 0, data: acp })).toBe("#d946ef");
+    expect(
+      nodeLabel({ id: "n1", x: 0, y: 0, data: { ...acp, read_only: false } }),
+    ).toBe("ACP Agent (write)");
+    expect(
+      nodeColor({ id: "n1", x: 0, y: 0, data: { ...acp, read_only: false } }),
     ).toBe("#ef4444");
   });
 

@@ -2,6 +2,7 @@ export type NodeType =
   | "input"
   | "workflow"
   | "agent"
+  | "acp"
   | "database"
   | "script"
   | "data"
@@ -32,6 +33,18 @@ export interface AgentConfig {
   context_size: number;
   temperature: number;
   output: OutputType;
+}
+export interface AcpConfig {
+  command: string;
+  args: string[];
+  cwd: string;
+  model?: string;
+  mode?: string;
+  prompt: string;
+  message?: string;
+  output: "text" | "json";
+  read_only: boolean;
+  timeout_secs: number;
 }
 export interface DatabaseConfig {
   engine: "sqlite" | "duckdb" | "postgres" | "mysql";
@@ -66,6 +79,7 @@ export type DataFormat =
   | "binary";
 export type NodeData =
   | ({ type: "agent" } & AgentConfig)
+  | ({ type: "acp" } & AcpConfig)
   | ({ type: "database" } & DatabaseConfig)
   | ({ type: "input" } & InputConfig)
   | ({ type: "workflow" } & WorkflowConfig)

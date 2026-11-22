@@ -21,8 +21,8 @@ use crate::{
     exec::{self, Cache, Control, Progress},
     history, library,
     node_data::{
-        AgentConfig, Auth, DataFormat, DatabaseConfig, DbEngine, ModelType, NodeData, NodeType,
-        OutputType, Provider, Runtime, WriteMode,
+        AcpConfig, AgentConfig, Auth, DataFormat, DatabaseConfig, DbEngine, ModelType, NodeData,
+        NodeType, OutputType, Provider, Runtime, WriteMode,
     },
     providers::{self, UreqHttp},
     review, storage, validate,
@@ -628,6 +628,19 @@ impl AppService {
                     key.as_deref(),
                 )?)
             }
+            "probe_acp" => {
+                let config: AcpConfig = field(&args, "config")?;
+                validate::command(&config.command)?;
+                validate::args(&config.args)?;
+                let cwd = validate::resolve_directory_inside(&self.root, &config.cwd)?;
+                let result =
+                    crate::acp::probe(&config, &cwd, LISTING_TIMEOUT, &AtomicBool::new(false))?;
+                Ok(json!({
+                    "agent": result.agent,
+                    "models": result.models,
+                    "modes": result.modes,
+                }))
+            }
             "env_var_set" => {
                 let name = string(&args, "name")?;
                 validate::env_var(name)?;
@@ -1139,7 +1152,12 @@ fn wiring_issues(graph: &GraphDoc, plans: &calls::Plans) -> Vec<Value> {
                 issues.push(json!({"node":node.id,"field":"inputs","message":"A Run input is a source; remove its incoming wires"}));
             }
         }
-        if let Some(NodeData::Agent(agent)) = &node.data {
+        let templates = match &node.data {
+            Some(NodeData::Agent(agent)) => Some((&agent.prompt, &agent.message)),
+            Some(NodeData::Acp(acp)) => Some((&acp.prompt, &acp.message)),
+            _ => None,
+        };
+        if let Some((prompt, message)) = templates {
             let aliases: Vec<_> = upstream
                 .iter()
                 .filter_map(|handle| {
@@ -1152,7 +1170,7 @@ fn wiring_issues(graph: &GraphDoc, plans: &calls::Plans) -> Vec<Value> {
                     Some(port.map_or_else(|| name.to_string(), |port| format!("{name}.{port}")))
                 })
                 .collect();
-            for (field, template) in [("prompt", &agent.prompt), ("message", &agent.message)] {
+            for (field, template) in [("prompt", prompt), ("message", message)] {
                 for hole in validate::placeholders(template) {
                     let count = aliases.iter().filter(|alias| **alias == hole).count();
                     let message = if count > 1 {
@@ -1179,7 +1197,9 @@ fn wiring_issues(graph: &GraphDoc, plans: &calls::Plans) -> Vec<Value> {
         }
         let requires_text = matches!(
             node.data,
-            Some(NodeData::Agent(_) | NodeData::Database(_) | NodeData::Script(_))
+            Some(
+                NodeData::Agent(_) | NodeData::Acp(_) | NodeData::Database(_) | NodeData::Script(_)
+            )
         ) || matches!(&node.data, Some(NodeData::File(config)) if config.bundle || upstream.len() != 1);
         if requires_text {
             for handle in upstream.iter().filter(|handle| binary.contains(*handle)) {
@@ -2765,5 +2785,51 @@ mod tests {
                 .iter()
                 .any(|e| e["kind"] == "text")
         );
+    }
+
+    #[test]
+    fn bootstrap_lists_acp_and_graph_validation_checks_acp_placeholders_and_binary_wires() {
+        let workspace = Workspace::new();
+        let boot = workspace.service.request("bootstrap", json!({})).unwrap();
+        assert!(
+            boot["catalog"]["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["type"] == "acp" && item["label"] == "ACP Agent")
+        );
+
+        let mut graph = input_doc();
+        graph.nodes.push(node(
+            "n1",
+            None,
+            NodeData::Data(crate::node_data::DataConfig {
+                path: "logo.png".into(),
+                format: DataFormat::Image,
+            }),
+        ));
+        graph.nodes.push(node(
+            "n2",
+            None,
+            NodeData::Acp(AcpConfig {
+                command: "mock-acp".into(),
+                prompt: "Inspect {{missing}}".into(),
+                ..Default::default()
+            }),
+        ));
+        graph.edges.push(EdgeDoc {
+            from: "n1".into(),
+            to: "n2".into(),
+            output: None,
+        });
+        let result = workspace
+            .service
+            .request("validate_graph", json!({"doc":graph}))
+            .unwrap();
+        let issues = result["issues"].as_array().unwrap();
+        assert!(issues.iter().any(|issue| issue["node"] == "n2"
+            && issue["message"].as_str().unwrap().contains("{{missing}}")));
+        assert!(issues.iter().any(|issue| issue["node"] == "n2"
+            && issue["message"].as_str().unwrap().contains("binary output")));
     }
 }

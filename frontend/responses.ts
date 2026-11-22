@@ -57,6 +57,18 @@ const agentFields = {
   temperature: number,
   output: choice("text", "json", "embedding", "image"),
 };
+const acpFields = {
+  command: string,
+  args: strings,
+  cwd: string,
+  model: optional(string),
+  mode: optional(string),
+  prompt: string,
+  message: optional(string),
+  output: choice("text", "json"),
+  read_only: boolean,
+  timeout_secs: integer,
+};
 const databaseFields = {
   engine: choice("sqlite", "duckdb", "postgres", "mysql"),
   path: string,
@@ -77,6 +89,7 @@ const binding = variant("kind", {
 });
 export const nodeDataSchema: Schema<NodeData> = variant("type", {
   agent: object({ type: choice("agent"), ...agentFields }),
+  acp: object({ type: choice("acp"), ...acpFields }),
   database: object({ type: choice("database"), ...databaseFields }),
   input: object({ type: choice("input"), ...inputFields }),
   workflow: object({
@@ -201,6 +214,7 @@ const library = object({
       object({
         type: choice(
           "agent",
+          "acp",
           "database",
           "input",
           "workflow",
@@ -376,6 +390,11 @@ const responses: { [M in Method]: Schema<Protocol[M]["result"]> } = {
   describe_schema: string,
   write_sql: string,
   list_models: strings,
+  probe_acp: object({
+    agent: nullable(string),
+    models: strings,
+    modes: strings,
+  }),
   env_var_set: boolean,
   delete_graph: nil,
   rename_graph: object({ name: string }),

@@ -47,7 +47,7 @@ const ANTHROPIC_FALLBACK_MODELS: &[&str] = &[
 pub const MAX_OUTPUT_TOKENS: u32 = 16_000;
 /// Replies larger than this are cut off; images are the only big ones.
 pub const MAX_REPLY_BYTES: u64 = 64 * 1024 * 1024;
-const JSON_INSTRUCTION: &str = "Respond with a single JSON value and nothing else.";
+pub(crate) const JSON_INSTRUCTION: &str = "Respond with a single JSON value and nothing else.";
 /// The error [`generate_streaming`] returns when its callback stopped the request.
 pub const STOPPED: &str = "the request was stopped";
 /// How much of a streamed body is read at a time.
@@ -768,14 +768,19 @@ pub fn parse_reply(config: &AgentConfig, reply: &Reply) -> Result<Vec<u8>, Strin
 }
 
 /// Text output in the configured shape: raw text, or validated and pretty-printed JSON.
-fn finish_text(config: &AgentConfig, text: &str) -> Result<Vec<u8>, String> {
-    match config.output {
+pub(crate) fn format_text_output(output: OutputType, text: &str) -> Result<Vec<u8>, String> {
+    match output {
         OutputType::Json => {
             let value = extract_json(text)?;
             serde_json::to_vec_pretty(&value).map_err(|e| e.to_string())
         }
         _ => Ok(text.as_bytes().to_vec()),
     }
+}
+
+/// Text output in the configured shape: raw text, or validated and pretty-printed JSON.
+fn finish_text(config: &AgentConfig, text: &str) -> Result<Vec<u8>, String> {
+    format_text_output(config.output, text)
 }
 
 /// Pull one JSON value out of model text: the whole thing, a fenced block, or the span

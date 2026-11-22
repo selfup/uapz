@@ -1,4 +1,5 @@
 import type {
+  AcpConfig,
   AgentConfig,
   DatabaseConfig,
   Field,
@@ -85,6 +86,10 @@ export interface Protocol {
     string
   >;
   list_models: Call<{ config: AgentConfig }, string[]>;
+  probe_acp: Call<
+    { config: AcpConfig },
+    { agent: string | null; models: string[]; modes: string[] }
+  >;
   env_var_set: Call<{ name: string }, boolean>;
   delete_graph: Call<{ name: string }, null>;
   rename_graph: Call<{ from: string; to: string }, { name: string }>;

@@ -15,6 +15,7 @@ export const NODE_LABELS: Record<NodeType, string> = {
   input: "Run input",
   workflow: "Workflow",
   agent: "Agent",
+  acp: "ACP Agent",
   database: "Database",
   script: "Script",
   data: "Data",
@@ -38,6 +39,7 @@ export const NODE_COLORS: Record<NodeType, string> = {
   input: "#06b6d4",
   workflow: "#6366f1",
   agent: "#8b5cf6",
+  acp: "#d946ef",
   database: "#0ea5e9",
   script: "#f59e0b",
   data: "#22c55e",
@@ -51,9 +53,11 @@ export function nodeLabel(node: NodeDoc): string {
     node.name?.trim() ||
     node.kind?.trim() ||
     (data
-      ? data.type === "database" && !data.read_only
+      ? data.type === "database" && data.read_only === false
         ? "Database (write)"
-        : NODE_LABELS[data.type]
+        : data.type === "acp" && data.read_only === false
+          ? "ACP Agent (write)"
+          : NODE_LABELS[data.type]
       : "Blank node")
   );
 }
@@ -62,7 +66,9 @@ export function nodeColor(node: NodeDoc): string {
   if (/^#[\da-f]{6}$/i.test(node.color || "")) return node.color!;
   const data = typedData(node);
   if (data)
-    return data.type === "file" || (data.type === "database" && !data.read_only)
+    return data.type === "file" ||
+      (data.type === "database" && data.read_only === false) ||
+      (data.type === "acp" && data.read_only === false)
       ? "#ef4444"
       : NODE_COLORS[data.type];
   return "#9ca3af";
@@ -114,6 +120,17 @@ export function nodeSummary(node: NodeDoc): string {
         : "choose a saved graph";
     case "agent":
       return `${title(data.provider)} · ${text(data.model).trim() || "no model"}`;
+    case "acp": {
+      const cmd =
+        text(data.command)
+          .trim()
+          .split(/[/\\]/)
+          .filter(Boolean)
+          .pop() || "no command";
+      const model = text(data.model).trim();
+      const mode = data.read_only === false ? " · write" : "";
+      return `${cmd}${model ? ` · ${model}` : ""}${mode}`;
+    }
     case "database":
       return `${title(data.engine)} · ${["sqlite", "duckdb"].includes(data.engine) ? fileName(data.path) : text(data.url_env).trim() || "no connection"}${data.read_only ? "" : " · write"}`;
     case "script":
@@ -148,6 +165,20 @@ export function defaultNodeData(type: NodeType): NodeData {
         context_size: 8192,
         temperature: 0.7,
         output: "text",
+      };
+    case "acp":
+      return {
+        type,
+        command: "",
+        args: [],
+        cwd: ".",
+        model: "",
+        mode: "",
+        prompt: "",
+        message: "",
+        output: "text",
+        read_only: true,
+        timeout_secs: 300,
       };
     case "database":
       return {

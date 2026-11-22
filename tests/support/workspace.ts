@@ -151,6 +151,7 @@ async function mockService(page: Page) {
       "input",
       "workflow",
       "agent",
+      "acp",
       "database",
       "script",
       "data",
@@ -422,6 +423,12 @@ async function mockService(page: Page) {
                 label: "Text",
                 saved: null,
                 complete: true,
+              };
+            case "probe_acp":
+              return {
+                agent: "Mock ACP",
+                models: ["default"],
+                modes: ["ask", "code"],
               };
             default:
               throw new Error(`Unexpected method ${method}`);

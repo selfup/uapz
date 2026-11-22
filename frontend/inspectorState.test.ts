@@ -102,6 +102,30 @@ describe("node result configuration comparison", () => {
       sameNodeConfig(script, { ...script, args: [...script.args].reverse() }),
     ).toBe(false);
   });
+
+  it("treats omitted empty model, mode and message on ACP nodes as matching defaults", () => {
+    const trimmed: NodeData = {
+      type: "acp",
+      command: "claude-acp",
+      args: [],
+      cwd: ".",
+      prompt: "Inspect {{source}}",
+      output: "text",
+      read_only: true,
+      timeout_secs: 300,
+    };
+    expect(
+      sameNodeConfig(trimmed, {
+        ...trimmed,
+        model: "",
+        mode: "",
+        message: "",
+      }),
+    ).toBe(true);
+    expect(
+      sameNodeConfig(trimmed, { ...trimmed, read_only: false }),
+    ).toBe(false);
+  });
 });
 
 describe("previous output comparison", () => {

@@ -146,6 +146,7 @@ test("node library exposes all typed forms and saving keeps their typed configs"
     "Run input",
     "Workflow",
     "Agent",
+    "ACP Agent",
     "Database",
     "Script",
     "Data",
@@ -169,12 +170,42 @@ test("node library exposes all typed forms and saving keeps their typed configs"
     "input",
     "workflow",
     "agent",
+    "acp",
     "database",
     "script",
     "data",
     "directory",
     "file",
   ]);
+});
+
+test("ACP Agent read-only toggle switches card color and writable label", async ({
+  page,
+}) => {
+  await page
+    .locator(".library")
+    .getByRole("button", { name: "ACP Agent", exact: true })
+    .click();
+  const card = page.locator('[data-id="n3"] .graph-card');
+  await expect(card.locator(".graph-card-title")).toHaveText("ACP Agent");
+  await expect(card).not.toHaveClass(/\bwrites\b/);
+  await page
+    .getByLabel("Agent preset", { exact: true })
+    .selectOption("claude");
+  await expect(page.getByLabel("Command", { exact: true })).toHaveValue(
+    "claude-acp",
+  );
+  const toggle = page.getByLabel("Read-only mode", { exact: true });
+  await expect(toggle).toBeChecked();
+  await toggle.uncheck();
+  await expect(card).toHaveClass(/\bwrites\b/);
+  await expect(card.locator(".graph-card-title")).toHaveText(
+    "ACP Agent (write)",
+  );
+  await expect(card).toHaveCSS("border-left-color", "rgb(239, 68, 68)");
+  await toggle.check();
+  await expect(card).not.toHaveClass(/\bwrites\b/);
+  await expect(card.locator(".graph-card-title")).toHaveText("ACP Agent");
 });
 
 test("unsaved edits can be kept or discarded in the desktop confirmation dialog", async ({

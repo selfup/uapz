@@ -590,6 +590,24 @@ pub fn in_range<T: PartialOrd + std::fmt::Display>(
     }
 }
 
+/// Command-line executable name or path: non-empty, bounded, printable, and not tilde-prefixed.
+pub fn command(raw: &str) -> Result<(), String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("command is empty".into());
+    }
+    if raw.len() > MAX_PATH_LEN {
+        return Err(format!("command is longer than {MAX_PATH_LEN} characters"));
+    }
+    if raw.chars().any(char::is_control) {
+        return Err("command contains a control character".into());
+    }
+    if raw.starts_with('~') {
+        return Err("use an executable name on PATH or an absolute path, not `~`".into());
+    }
+    Ok(())
+}
+
 /// Command-line arguments: a bounded number of bounded, printable strings.
 pub fn args(args: &[String]) -> Result<(), String> {
     if args.len() > MAX_ARGS {
@@ -1431,6 +1449,13 @@ mod tests {
 
     #[test]
     fn ranges_and_args() {
+        assert!(command("claude-acp").is_ok());
+        assert!(command(" /usr/local/bin/codex-acp ").is_ok());
+        assert!(command("").is_err());
+        assert!(command("   ").is_err());
+        assert!(command("~/bin/acp").is_err());
+        assert!(command("acp\n--help").is_err());
+        assert!(command(&"x".repeat(MAX_PATH_LEN + 1)).is_err());
         assert!(in_range("t", 0.5, 0.0, 2.0).is_ok());
         assert!(in_range("t", 2.5, 0.0, 2.0).is_err());
         assert!(args(&["--flag".into(), "value".into()]).is_ok());

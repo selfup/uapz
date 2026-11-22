@@ -113,7 +113,8 @@ function Card({ id, data, selected }: NodeProps<CardNode>) {
   const config = typedData(data.node);
   const writes =
     config?.type === "file" ||
-    (config?.type === "database" && !config.read_only);
+    (config?.type === "database" && !config.read_only) ||
+    (config?.type === "acp" && !config.read_only);
   const aliases = (port?: string) =>
     Object.entries(data.exports)
       .filter(

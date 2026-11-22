@@ -13,10 +13,13 @@ use crate::library::{DATA_DIR, SCRIPTS_DIR};
 use crate::validate::{self, Issue, MAX_PROMPT_LEN};
 
 /// Fill color of every node that writes outside the app's own output folders, as
-/// `#rrggbb`: a database allowed to write and a write-file node. Red, so it stands out.
+/// `#rrggbb`: a database allowed to write, a writable ACP agent, and a write-file node.
+/// Red, so it stands out.
 pub const WRITE_COLOR: &str = "#ef4444";
 /// Picker label for a database node created with its read-only flag off.
 pub const WRITABLE_DATABASE_LABEL: &str = "Database (write)";
+/// Label for an ACP agent node with its read-only flag off.
+pub const WRITABLE_ACP_LABEL: &str = "ACP Agent (write)";
 
 /// The kinds of content a node can carry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -25,6 +28,7 @@ pub enum NodeType {
     Input,
     Workflow,
     Agent,
+    Acp,
     Database,
     Script,
     Data,
@@ -34,10 +38,11 @@ pub enum NodeType {
 }
 
 impl NodeType {
-    pub const ALL: [NodeType; 8] = [
+    pub const ALL: [NodeType; 9] = [
         Self::Input,
         Self::Workflow,
         Self::Agent,
+        Self::Acp,
         Self::Database,
         Self::Script,
         Self::Data,
@@ -50,6 +55,7 @@ impl NodeType {
             Self::Input => "Run input",
             Self::Workflow => "Workflow",
             Self::Agent => "Agent",
+            Self::Acp => "ACP Agent",
             Self::Database => "Database",
             Self::Script => "Script",
             Self::Data => "Data",
@@ -59,12 +65,13 @@ impl NodeType {
     }
 
     /// Fill color for nodes of this type, as `#rrggbb`. Write-file nodes are red like a
-    /// writable database: red means the node changes something outside `agents/`.
+    /// writable database or ACP agent: red means the node changes something outside `agents/`.
     pub fn color(self) -> &'static str {
         match self {
             Self::Input => "#06b6d4",
             Self::Workflow => "#6366f1",
             Self::Agent => "#8b5cf6",
+            Self::Acp => "#d946ef",
             Self::Database => "#0ea5e9",
             Self::Script => "#f59e0b",
             Self::Data => "#22c55e",
@@ -85,6 +92,7 @@ impl NodeType {
             Self::Input => NodeData::Input(crate::workflow::InputConfig::default()),
             Self::Workflow => NodeData::Workflow(crate::calls::Config::default()),
             Self::Agent => NodeData::Agent(AgentConfig::default()),
+            Self::Acp => NodeData::Acp(AcpConfig::default()),
             Self::Database => NodeData::Database(DatabaseConfig::default()),
             Self::Script => NodeData::Script(ScriptConfig::default()),
             Self::Data => NodeData::Data(DataConfig::default()),
@@ -101,6 +109,7 @@ pub enum NodeData {
     Input(crate::workflow::InputConfig),
     Workflow(crate::calls::Config),
     Agent(AgentConfig),
+    Acp(AcpConfig),
     Database(DatabaseConfig),
     Script(ScriptConfig),
     Data(DataConfig),
@@ -114,6 +123,7 @@ impl NodeData {
             Self::Input(_) => NodeType::Input,
             Self::Workflow(_) => NodeType::Workflow,
             Self::Agent(_) => NodeType::Agent,
+            Self::Acp(_) => NodeType::Acp,
             Self::Database(_) => NodeType::Database,
             Self::Script(_) => NodeType::Script,
             Self::Data(_) => NodeType::Data,
@@ -122,19 +132,21 @@ impl NodeData {
         }
     }
 
-    /// Fill color for the canvas and sidebar: the type's, except that a database allowed
-    /// to write is red so it stands out.
+    /// Fill color for the canvas and sidebar: the type's, except that a database or ACP
+    /// agent allowed to write is red so it stands out.
     pub fn color(&self) -> &'static str {
         match self {
             Self::Database(d) if !d.read_only => WRITE_COLOR,
+            Self::Acp(a) if !a.read_only => WRITE_COLOR,
             other => other.node_type().color(),
         }
     }
 
-    /// The type's label, or `Database (write)` for a database allowed to write.
+    /// The type's label, or `(write)` for a database or ACP agent allowed to write.
     pub fn label(&self) -> &'static str {
         match self {
             Self::Database(d) if !d.read_only => WRITABLE_DATABASE_LABEL,
+            Self::Acp(a) if !a.read_only => WRITABLE_ACP_LABEL,
             other => other.node_type().label(),
         }
     }
@@ -145,6 +157,7 @@ impl NodeData {
             Self::Input(input) => input.summary(),
             Self::Workflow(call) => call.summary(),
             Self::Agent(a) => a.summary(),
+            Self::Acp(a) => a.summary(),
             Self::Database(d) => d.summary(),
             Self::Script(s) => s.summary(),
             Self::Data(d) => d.summary(),
@@ -159,6 +172,7 @@ impl NodeData {
             Self::Input(input) => input.validate(),
             Self::Workflow(call) => call.validate(),
             Self::Agent(a) => a.validate(),
+            Self::Acp(a) => a.validate(),
             Self::Database(d) => d.validate(),
             Self::Script(s) => s.validate(),
             Self::Data(d) => d.validate(),
@@ -519,6 +533,104 @@ impl AgentConfig {
 
 fn join_labels<'a>(labels: impl Iterator<Item = &'a str>) -> String {
     labels.collect::<Vec<_>>().join(" or ")
+}
+
+// ----- acp agent -----
+
+/// A local CLI coding agent driven via the Agent Client Protocol (ACP) over stdio.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AcpConfig {
+    pub command: String,
+    pub args: Vec<String>,
+    /// Working directory relative to the workspace root. `.` or empty uses the workspace root.
+    pub cwd: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub mode: String,
+    pub prompt: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub message: String,
+    pub output: OutputType,
+    /// When true, only read/search/think tool permissions are approved automatically;
+    /// edit/delete/execute requests are denied. Turning this off marks the node red.
+    pub read_only: bool,
+    pub timeout_secs: u32,
+}
+
+impl Default for AcpConfig {
+    fn default() -> Self {
+        Self {
+            command: String::new(),
+            args: Vec::new(),
+            cwd: ".".to_string(),
+            model: String::new(),
+            mode: String::new(),
+            prompt: String::new(),
+            message: String::new(),
+            output: OutputType::Text,
+            read_only: true,
+            timeout_secs: 300,
+        }
+    }
+}
+
+impl AcpConfig {
+    pub fn summary(&self) -> String {
+        let cmd = self
+            .command
+            .trim()
+            .rsplit(['/', '\\'])
+            .find(|s| !s.is_empty())
+            .unwrap_or("no command");
+        let model = self.model.trim();
+        let mode = if self.read_only { "" } else { " · write" };
+        if model.is_empty() {
+            format!("{cmd}{mode}")
+        } else {
+            format!("{cmd} · {model}{mode}")
+        }
+    }
+
+    pub fn validate(&self) -> Vec<Issue> {
+        let mut issues = Vec::new();
+        if let Err(e) = validate::command(&self.command) {
+            issues.push(Issue::new("command", e));
+        }
+        if let Err(e) = validate::args(&self.args) {
+            issues.push(Issue::new("args", e));
+        }
+        if let Err(e) = validate::directory_path(&self.cwd) {
+            issues.push(Issue::new("cwd", e));
+        }
+        if !self.model.trim().is_empty()
+            && let Err(e) = validate::model_id(&self.model)
+        {
+            issues.push(Issue::new("model", e));
+        }
+        let mode = self.mode.trim();
+        if !mode.is_empty() {
+            if let Err(e) = validate::text("mode", mode, validate::MAX_MODEL_ID_LEN) {
+                issues.push(Issue::new("mode", e));
+            } else if mode.chars().any(char::is_control) {
+                issues.push(Issue::new("mode", "mode contains a control character"));
+            }
+        }
+        if let Err(e) = validate::text("prompt", &self.prompt, MAX_PROMPT_LEN) {
+            issues.push(Issue::new("prompt", e));
+        }
+        if let Err(e) = validate::text("message", &self.message, MAX_PROMPT_LEN) {
+            issues.push(Issue::new("message", e));
+        }
+        if !matches!(self.output, OutputType::Text | OutputType::Json) {
+            issues.push(Issue::new("output", "an ACP agent produces Text or JSON"));
+        }
+        if let Err(e) = validate::in_range("timeout", self.timeout_secs, 1, MAX_TIMEOUT_SECS) {
+            issues.push(Issue::new("timeout", e));
+        }
+        issues
+    }
 }
 
 // ----- database -----
@@ -1441,6 +1553,67 @@ mod tests {
             }
             .validate()
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn acp_nodes_validate_and_track_read_only_toggle() {
+        let blank = AcpConfig::default();
+        assert!(blank.read_only);
+        assert_eq!(blank.cwd, ".");
+        assert_eq!(blank.timeout_secs, 300);
+        assert_eq!(blank.summary(), "no command");
+        let blank_issues: Vec<&str> = blank.validate().iter().map(|i| i.field).collect();
+        assert_eq!(blank_issues, ["command"]);
+
+        let valid = AcpConfig {
+            command: "/opt/homebrew/bin/claude-acp".into(),
+            args: vec!["--verbose".into()],
+            cwd: ".".into(),
+            model: "claude-opus".into(),
+            mode: "ask".into(),
+            prompt: "Review {{source}}".into(),
+            message: String::new(),
+            output: OutputType::Text,
+            read_only: true,
+            timeout_secs: 120,
+        };
+        assert!(valid.validate().is_empty(), "{:?}", valid.validate());
+        assert_eq!(valid.summary(), "claude-acp · claude-opus");
+
+        let read = NodeData::Acp(valid.clone());
+        assert_eq!(read.node_type(), NodeType::Acp);
+        assert_eq!(read.color(), NodeType::Acp.color());
+        assert_eq!(read.label(), "ACP Agent");
+
+        let write = NodeData::Acp(AcpConfig {
+            read_only: false,
+            ..valid
+        });
+        assert_eq!(write.color(), WRITE_COLOR);
+        assert_eq!(write.label(), WRITABLE_ACP_LABEL);
+        assert!(write.summary().ends_with(" · write"), "{}", write.summary());
+
+        let json = serde_json::to_string(&read).unwrap();
+        assert!(json.starts_with(r#"{"type":"acp""#), "{json}");
+        assert_eq!(serde_json::from_str::<NodeData>(&json).unwrap(), read);
+
+        let bad = AcpConfig {
+            command: "~/bin/acp".into(),
+            args: vec!["bad\narg".into()],
+            cwd: "../outside".into(),
+            model: "../bad".into(),
+            mode: "a\nb".into(),
+            output: OutputType::Image,
+            timeout_secs: 0,
+            ..AcpConfig::default()
+        };
+        let fields: Vec<&str> = bad.validate().iter().map(|i| i.field).collect();
+        assert_eq!(
+            fields,
+            [
+                "command", "args", "cwd", "model", "mode", "output", "timeout"
+            ]
         );
     }
 }

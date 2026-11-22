@@ -19,9 +19,16 @@ export function sameNodeConfig(
   const normalize = (data: NodeData | null | undefined) =>
     data?.type === "agent"
       ? { ...data, message: data.message || "" }
-      : data?.type === "file"
-        ? { ...data, review: Boolean(data.review) }
-        : data;
+      : data?.type === "acp"
+        ? {
+            ...data,
+            model: data.model || "",
+            mode: data.mode || "",
+            message: data.message || "",
+          }
+        : data?.type === "file"
+          ? { ...data, review: Boolean(data.review) }
+          : data;
   return (
     JSON.stringify(canonical(normalize(left))) ===
     JSON.stringify(canonical(normalize(right)))
