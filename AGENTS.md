@@ -52,7 +52,6 @@ I repeat: for python use `uv run python -`
 ## Commits
 
 - No agent attribution in commits (no `Co-authored-by`, `Made-with`, or similar trailers/footers)
-- Author/committer identity must be the human owner’s configured git user only
 
 ## Writing
 
