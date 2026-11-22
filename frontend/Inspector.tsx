@@ -47,7 +47,6 @@ export type InspectorProps = {
   readOnly?: boolean;
   scopeKey?: string | number;
   onChange: (node: NodeDoc) => void;
-  onPublish?: (handle: string, name: string) => void;
   onGraphChange?: (graph: GraphDoc) => void;
   onRun?: (fresh: boolean) => void;
   onDelete?: () => void;
@@ -104,6 +103,7 @@ const NODE_TYPES = [
 ] as const satisfies readonly NodeType[];
 
 const errorMessage = errorText;
+/** Typed config for the selected node; blank or unknown shapes are null. */
 function nodeConfig(node: NodeDoc | null): Config | null {
   return node ? typedData(node) ?? null : null;
 }
@@ -118,7 +118,6 @@ export default function Inspector(props: InspectorProps) {
     node,
     readOnly = false,
     onChange,
-    onPublish,
     onGraphChange,
     onRun,
     onDelete,
@@ -195,6 +194,8 @@ export default function Inspector(props: InspectorProps) {
   const capturedFingerprint = JSON.stringify(capturedGraph);
 
   useEffect(() => {
+    // When App supplies issues (including []), trust that source. Local
+    // validate_node remains for child/snapshot inspection without graph issues.
     if (props.issues || !config) {
       setLocalIssues([]);
       return;
@@ -562,12 +563,11 @@ export default function Inspector(props: InspectorProps) {
               )}
               {config && !readOnly && (
                 <>
-                  {(onGraphChange || onPublish) && (
+                  {onGraphChange && (
                     <Publication
                       graph={graph}
                       node={node}
                       workflowGraphs={props.workflowGraphs}
-                      onPublish={onPublish}
                       onGraphChange={onGraphChange}
                     />
                   )}

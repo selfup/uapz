@@ -22,19 +22,16 @@ export const NODE_LABELS: Record<NodeType, string> = {
   file: "Write file",
 };
 
+/** True when `value` is typed node configuration the editor understands. */
+export function isNodeData(value: unknown): value is NodeData {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  if (!Object.hasOwn(value, "type")) return false;
+  const type = (value as Record<string, unknown>).type;
+  return typeof type === "string" && Object.hasOwn(NODE_LABELS, type);
+}
+
 export function typedData(node: NodeDoc): NodeData | undefined {
-  const data: unknown = node.data;
-  if (
-    !data ||
-    typeof data !== "object" ||
-    Array.isArray(data) ||
-    !Object.hasOwn(data, "type")
-  )
-    return undefined;
-  const type = (data as Record<string, unknown>).type;
-  return typeof type === "string" && Object.hasOwn(NODE_LABELS, type)
-    ? (data as NodeData)
-    : undefined;
+  return isNodeData(node.data) ? node.data : undefined;
 }
 
 export const NODE_COLORS: Record<NodeType, string> = {

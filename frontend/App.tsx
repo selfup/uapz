@@ -4,7 +4,6 @@ import {
   useRef,
   useState,
   type CSSProperties,
-  type ReactNode,
 } from "react";
 import {
   ArrowLeft,
@@ -28,32 +27,42 @@ import Inspector from "./Inspector";
 import RunPanel from "./RunPanel";
 import { ConfirmDialog, ShortcutsDialog, type Choice } from "./dialogs";
 import { clamp, readLayout, writeLayout, type Theme } from "./layout";
-import LibraryPanel, { LibraryRow, type LibraryGroup } from "./LibraryPanel";
+import LibraryPanel, {
+  LibraryRow,
+  type LibraryGroup,
+  type LibraryRowProps,
+} from "./LibraryPanel";
 import {
   parseLibraryItem,
   type CreateType,
   type LibraryItem,
 } from "./library";
+import {
+  createNodeData,
+  materializeLibraryItem,
+  scriptOrDataFromLibrary,
+} from "./materializeLibrary";
+import {
+  copyGraphSelection,
+  insertCopiedNodes,
+  pastePlacement,
+  visibleCanvasCenter,
+  type EditorClipboard,
+} from "./editorClipboard";
 import ReviewPanel from "./ReviewPanel";
 import RunInputForm from "./RunInputForm";
 import { onHostEvent, quitApp, request } from "./api";
 import {
   CARD_SIZE,
-  cloneNodes,
-  dataFormatFor,
   defaultNodeData,
   deleteNodes,
-  flowToGraphPoint,
   freePosition,
-  graphToFlowPoint,
   nextNodeId,
   NODE_COLORS,
   NODE_LABELS,
   nodeColor,
   nodeLabel,
-  scriptRuntimeFor,
   typedData,
-  type Placement,
   type Point,
 } from "./graph";
 import { deriveRunView } from "./runView";
@@ -66,14 +75,12 @@ import {
   safeGraphName,
 } from "./workspace";
 import type {
-  EdgeDoc,
   GraphDoc,
   Issue,
   Library,
   NodeData,
   NodeDoc,
   NodeRun,
-  NodeType,
   Run,
   RunForm,
   RuntimeState,
@@ -88,14 +95,6 @@ interface ChildView {
 }
 const messageOf = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
-function createData(type: CreateType): NodeData | undefined {
-  if (type === "blank") return undefined;
-  if (type === "database-write") {
-    const database = defaultNodeData("database");
-    if (database.type === "database") return { ...database, read_only: false };
-  }
-  return defaultNodeData(type as NodeType);
-}
 /** The workflows the service can install from its bundled examples. */
 const EXAMPLE_NAMES = [
   "reviewed-note",
@@ -174,8 +173,20 @@ export default function App() {
   });
   useEffect(() => {
     const root = document.documentElement;
-    if (theme === "system") delete root.dataset.theme;
-    else root.dataset.theme = theme;
+    const apply = (resolved: "light" | "dark") => {
+      // Dark uses the :root defaults; light is the only override attribute.
+      if (resolved === "light") root.dataset.theme = "light";
+      else delete root.dataset.theme;
+    };
+    if (theme !== "system") {
+      apply(theme);
+      return;
+    }
+    const media = window.matchMedia("(prefers-color-scheme: light)");
+    const sync = () => apply(media.matches ? "light" : "dark");
+    sync();
+    media.addEventListener("change", sync);
+    return () => media.removeEventListener("change", sync);
   }, [theme]);
   const inspectorColumn = useRef<HTMLElement>(null);
   const canvasHost = useRef<HTMLDivElement>(null);
@@ -183,11 +194,7 @@ export default function App() {
   const [clipboardSize, setClipboardSize] = useState(0);
   const undoStack = useRef<{ graph: GraphDoc; key: string; at: number }[]>([]);
   const redoStack = useRef<GraphDoc[]>([]);
-  const clipboard = useRef<{
-    nodes: NodeDoc[];
-    edges: EdgeDoc[];
-    pastes: number;
-  } | null>(null);
+  const clipboard = useRef<EditorClipboard | null>(null);
   const savedKey = useRef<string | null>(null);
   const dirtyRef = useRef(dirty);
   dirtyRef.current = dirty;
@@ -621,40 +628,31 @@ export default function App() {
   }
   function visibleCenter(): Point {
     const host = canvasHost.current;
-    const center = flowToGraphPoint(
-      {
-        x: (host?.clientWidth || 800) / 2,
-        y: (host?.clientHeight || 500) / 2,
-      },
-      graph.view,
-    );
-    return {
-      x: center.x - CARD_SIZE.width / 2,
-      y: center.y - CARD_SIZE.height / 2,
-    };
+    return visibleCanvasCenter(graph, {
+      width: host?.clientWidth || 800,
+      height: host?.clientHeight || 500,
+    });
   }
   function copyNodes(ids = selectedIds()) {
     if (readOnly || !ids.length) return false;
-    const chosen = new Set(ids);
-    clipboard.current = {
-      nodes: graph.nodes
-        .filter((node) => chosen.has(node.id))
-        .map((node) => structuredClone(node)),
-      edges: graph.edges.filter(
-        (edge) => chosen.has(edge.from) && chosen.has(edge.to),
-      ),
-      pastes: 0,
-    };
+    const clip = copyGraphSelection(graph, ids);
+    if (!clip) return false;
+    clipboard.current = clip;
     setClipboardSize(ids.length);
     setNotice(`Copied ${ids.length} node${ids.length === 1 ? "" : "s"}`);
     return true;
   }
   function insertCopies(
     nodes: NodeDoc[],
-    edges: EdgeDoc[],
-    placement: Placement,
+    edges: EditorClipboard["edges"],
+    placement: Parameters<typeof insertCopiedNodes>[3],
   ) {
-    const { graph: next, ids } = cloneNodes(graph, nodes, edges, placement);
+    const { graph: next, ids } = insertCopiedNodes(
+      graph,
+      nodes,
+      edges,
+      placement,
+    );
     if (!ids.length) return 0;
     updateGraph(next);
     setSelected(ids[0] ?? null);
@@ -679,23 +677,15 @@ export default function App() {
     if (readOnly || !clip) return false;
     clip.pastes += 1;
     const host = canvasHost.current;
-    const onScreen = (node: NodeDoc) => {
-      const point = graphToFlowPoint({ x: node.x, y: node.y }, graph.view);
-      return (
-        point.x >= 0 &&
-        point.y >= 0 &&
-        point.x <= (host?.clientWidth ?? 0) &&
-        point.y <= (host?.clientHeight ?? 0)
-      );
-    };
-    // Repeated pastes step away from the originals; copies from another
-    // workflow or off-screen land in the middle of the visible canvas.
-    const step = 40 * clip.pastes;
-    const placement: Placement = at
-      ? { at }
-      : clip.nodes.some(onScreen)
-        ? { offset: { x: step, y: step } }
-        : { at: visibleCenter() };
+    const placement = pastePlacement(
+      graph,
+      clip,
+      {
+        width: host?.clientWidth ?? 0,
+        height: host?.clientHeight ?? 0,
+      },
+      at,
+    );
     const count = insertCopies(clip.nodes, clip.edges, placement);
     setNotice(`Pasted ${count} node${count === 1 ? "" : "s"}`);
     return true;
@@ -727,71 +717,39 @@ export default function App() {
   }
   /** Add what a library row stands for, at a drop position or in free space. */
   function addFromLibrary(item: LibraryItem, position?: Point) {
-    switch (item.kind) {
-      case "type":
-        addNode(createData(item.type), position);
+    const materialized = materializeLibraryItem(item, library, {
+      preferRetarget: !position,
+    });
+    if (!materialized) return;
+    if (materialized.retarget) {
+      if (pointNodeAt(materialized.retarget.type, materialized.retarget.name))
         return;
-      case "kind":
-        addNode(undefined, position, { name: item.name, color: item.color });
-        return;
-      case "agent": {
-        const agent = library?.agents.find((entry) => entry.name === item.name);
-        if (agent)
-          addNode({ type: "agent", ...agent.config }, position, {
-            name: agent.name,
-            color: NODE_COLORS.agent,
-          });
-        return;
-      }
-      case "database": {
-        const database = library?.databases.find(
-          (entry) => entry.name === item.name,
-        );
-        if (database)
-          addNode({ type: "database", ...database.config }, position, {
-            name: database.name,
-            color: nodeColor({
-              id: "",
-              x: 0,
-              y: 0,
-              data: { type: "database", ...database.config },
-            }),
-          });
-        return;
-      }
-      case "script":
-        if (!position && pointNodeAt("script", item.name)) return;
-        addNode(
-          {
-            type: "script",
-            runtime: scriptRuntimeFor(item.name),
-            path: item.name,
-            args: [],
-            timeout_secs: 60,
-          },
-          position,
-        );
-        return;
-      case "data":
-        if (!position && pointNodeAt("data", item.name)) return;
-        addNode(
-          { type: "data", path: item.name, format: dataFormatFor(item.name) },
-          position,
-        );
-        return;
+      addNode(
+        scriptOrDataFromLibrary(
+          materialized.retarget.type,
+          materialized.retarget.name,
+        ),
+        position,
+      );
+      return;
     }
+    addNode(materialized.data, position, materialized.kind);
   }
   /** Point the selected script or data node at a library file instead of adding one. */
   function pointNodeAt(type: "script" | "data", name: string) {
     if (readOnly || !activeNode) return false;
     const config = typedData(activeNode);
-    let data: NodeData | undefined;
-    if (type === "script" && config?.type === "script")
-      data = { ...config, path: name, runtime: scriptRuntimeFor(name) };
-    if (type === "data" && config?.type === "data")
-      data = { ...config, path: name, format: dataFormatFor(name) };
-    if (!data) return false;
-    updateNode({ ...activeNode, data });
+    if (config?.type !== type) return false;
+    const next = scriptOrDataFromLibrary(type, name);
+    updateNode({
+      ...activeNode,
+      data:
+        config.type === "script" && next.type === "script"
+          ? { ...config, path: next.path, runtime: next.runtime }
+          : config.type === "data" && next.type === "data"
+            ? { ...config, path: next.path, format: next.format }
+            : config,
+    });
     setNotice(`${nodeLabel(activeNode)} now reads ${name}`);
     return true;
   }
@@ -1414,7 +1372,7 @@ export default function App() {
     save,
     prepareRun,
     newGraph,
-    add: () => addNode(createData(addType)),
+    add: () => addNode(createNodeData(addType)),
     undo,
     redo,
     copy: () => copyNodes(),
@@ -1485,230 +1443,206 @@ export default function App() {
 
   const matches = (category: string, name: string) =>
     `${category} ${name}`.toLowerCase().includes(query.toLowerCase().trim());
-  const libraryRow = (
-    rowKey: string,
-    label: string,
-    onClick: () => void,
-    color?: string,
-    onDelete?: () => void,
-    disabled = readOnly,
-    trailing: "add" | "open" = "add",
-    drag?: LibraryItem,
-    actions?: { label: string; icon: ReactNode; run: () => void }[],
-    // Workflow open stays available during an in-flight save; rename/delete/
-    // duplicate must wait so the landing write cannot resurrect the old name.
-    mutateDisabled = disabled,
-  ) => (
-    <LibraryRow
-      key={rowKey}
-      label={label}
-      onClick={onClick}
-      color={color}
-      onDelete={onDelete}
-      disabled={disabled}
-      trailing={trailing}
-      drag={drag}
-      actions={actions}
-      mutateDisabled={mutateDisabled}
-    />
+  // Workflow open stays available during an in-flight save; rename/delete/
+  // duplicate must wait so the landing write cannot resurrect the old name.
+  const libraryRow = ({
+    key: rowKey,
+    ...props
+  }: LibraryRowProps & { key: string }) => (
+    <LibraryRow key={rowKey} {...props} />
   );
-  const groups: LibraryGroup[] =
-    library
-      ? [
-          {
-            label: "Workflows",
-            open: true,
-            items: library.graphs
-              .filter((name) => matches("workflows", name))
-              .map((name) =>
-                libraryRow(
-                  `graph:${name}`,
-                  name,
-                  () => void action(() => openGraph(name)),
-                  undefined,
-                  () => void action(() => deleteGraph(name)),
-                  occupied || readOnly,
-                  "open",
-                  undefined,
-                  [
-                    {
-                      label: `Rename ${name}`,
-                      icon: <Pencil size={13} />,
-                      run: () => void action(() => renameGraph(name)),
-                    },
-                    {
-                      label: `Duplicate ${name}`,
-                      icon: <Files size={13} />,
-                      run: () => void action(() => duplicateGraph(name)),
-                    },
-                  ],
-                  occupied || readOnly || saving,
-                ),
+  const groups: LibraryGroup[] = library
+    ? [
+        {
+          label: "Workflows",
+          open: true,
+          items: library.graphs
+            .filter((name) => matches("workflows", name))
+            .map((name) =>
+              libraryRow({
+                key: `graph:${name}`,
+                label: name,
+                onClick: () => void action(() => openGraph(name)),
+                onDelete: () => void action(() => deleteGraph(name)),
+                disabled: occupied || readOnly,
+                trailing: "open",
+                actions: [
+                  {
+                    label: `Rename ${name}`,
+                    icon: <Pencil size={13} />,
+                    run: () => void action(() => renameGraph(name)),
+                  },
+                  {
+                    label: `Duplicate ${name}`,
+                    icon: <Files size={13} />,
+                    run: () => void action(() => duplicateGraph(name)),
+                  },
+                ],
+                mutateDisabled: occupied || readOnly || saving,
+              }),
+            ),
+        },
+        {
+          label: "Nodes",
+          open: true,
+          items: (
+            [...Object.keys(NODE_LABELS), "database-write"] as Exclude<
+              CreateType,
+              "blank"
+            >[]
+          )
+            .filter((type) =>
+              matches(
+                "nodes",
+                type === "database-write"
+                  ? "Database (write)"
+                  : NODE_LABELS[type],
               ),
-          },
-          {
-            label: "Nodes",
-            open: true,
-            items: (
-              [...Object.keys(NODE_LABELS), "database-write"] as Exclude<
-                CreateType,
-                "blank"
-              >[]
             )
-              .filter((type) =>
-                matches(
-                  "nodes",
+            .map((type) =>
+              libraryRow({
+                key: type,
+                label:
                   type === "database-write"
                     ? "Database (write)"
                     : NODE_LABELS[type],
-                ),
-              )
-              .map((type) =>
-                libraryRow(
-                  type,
-                  type === "database-write"
-                    ? "Database (write)"
-                    : NODE_LABELS[type],
-                  () => addFromLibrary({ kind: "type", type }),
-                  nodeColor({ id: "", x: 0, y: 0, data: createData(type) }),
-                  undefined,
-                  undefined,
-                  "add",
-                  { kind: "type", type },
-                ),
-              ),
-          },
-          {
-            label: "Custom nodes",
-            items: library.kinds
-              .filter((kind) => matches("custom nodes", kind.name))
-              .map((kind) =>
-                libraryRow(
-                  `kind:${kind.name}`,
-                  kind.name,
-                  () => addFromLibrary({ kind: "kind", ...kind }),
-                  kind.color,
-                  () =>
-                    void action(() =>
-                      removeLibrary(
-                        "delete_kind",
-                        { name: kind.name },
-                        kind.name,
-                      ),
+                onClick: () => addFromLibrary({ kind: "type", type }),
+                color: nodeColor({
+                  id: "",
+                  x: 0,
+                  y: 0,
+                  data: createNodeData(type),
+                }),
+                trailing: "add",
+                drag: { kind: "type", type },
+              }),
+            ),
+        },
+        {
+          label: "Custom nodes",
+          items: library.kinds
+            .filter((kind) => matches("custom nodes", kind.name))
+            .map((kind) =>
+              libraryRow({
+                key: `kind:${kind.name}`,
+                label: kind.name,
+                onClick: () => addFromLibrary({ kind: "kind", ...kind }),
+                color: kind.color,
+                onDelete: () =>
+                  void action(() =>
+                    removeLibrary(
+                      "delete_kind",
+                      { name: kind.name },
+                      kind.name,
                     ),
-                  undefined,
-                  "add",
-                  { kind: "kind", name: kind.name, color: kind.color },
-                ),
-              ),
-          },
-          {
-            label: "Agents",
-            items: library.agents
-              .filter((agent) => matches("agents", agent.name))
-              .map((agent) =>
-                libraryRow(
-                  `agent:${agent.name}`,
-                  agent.name,
-                  () => addFromLibrary({ kind: "agent", name: agent.name }),
-                  NODE_COLORS.agent,
-                  () =>
-                    void action(() =>
-                      removeLibrary(
-                        "delete_preset",
-                        { type: "agent", name: agent.name },
-                        agent.name,
-                      ),
+                  ),
+                trailing: "add",
+                drag: { kind: "kind", name: kind.name, color: kind.color },
+              }),
+            ),
+        },
+        {
+          label: "Agents",
+          items: library.agents
+            .filter((agent) => matches("agents", agent.name))
+            .map((agent) =>
+              libraryRow({
+                key: `agent:${agent.name}`,
+                label: agent.name,
+                onClick: () =>
+                  addFromLibrary({ kind: "agent", name: agent.name }),
+                color: NODE_COLORS.agent,
+                onDelete: () =>
+                  void action(() =>
+                    removeLibrary(
+                      "delete_preset",
+                      { type: "agent", name: agent.name },
+                      agent.name,
                     ),
-                  undefined,
-                  "add",
-                  { kind: "agent", name: agent.name },
-                ),
-              ),
-          },
-          {
-            label: "Prompts",
-            items: library.prompts
-              .filter((name) => matches("prompts", name))
-              .map((name) =>
-                libraryRow(
-                  `prompt:${name}`,
-                  name,
-                  () => void action(() => usePrompt(name)),
-                  "#a78bfa",
-                  () =>
-                    void action(() =>
-                      removeLibrary("delete_prompt", { name }, name),
+                  ),
+                trailing: "add",
+                drag: { kind: "agent", name: agent.name },
+              }),
+            ),
+        },
+        {
+          label: "Prompts",
+          items: library.prompts
+            .filter((name) => matches("prompts", name))
+            .map((name) =>
+              libraryRow({
+                key: `prompt:${name}`,
+                label: name,
+                onClick: () => void action(() => usePrompt(name)),
+                color: "#a78bfa",
+                onDelete: () =>
+                  void action(() =>
+                    removeLibrary("delete_prompt", { name }, name),
+                  ),
+              }),
+            ),
+        },
+        {
+          label: "Databases",
+          items: library.databases
+            .filter((database) => matches("databases", database.name))
+            .map((database) =>
+              libraryRow({
+                key: `database:${database.name}`,
+                label: database.name,
+                onClick: () =>
+                  addFromLibrary({ kind: "database", name: database.name }),
+                color: nodeColor({
+                  id: "",
+                  x: 0,
+                  y: 0,
+                  data: { type: "database", ...database.config },
+                }),
+                onDelete: () =>
+                  void action(() =>
+                    removeLibrary(
+                      "delete_preset",
+                      { type: "database", name: database.name },
+                      database.name,
                     ),
-                ),
-              ),
-          },
-          {
-            label: "Databases",
-            items: library.databases
-              .filter((database) => matches("databases", database.name))
-              .map((database) =>
-                libraryRow(
-                  `database:${database.name}`,
-                  database.name,
-                  () =>
-                    addFromLibrary({ kind: "database", name: database.name }),
-                  nodeColor({
-                    id: "",
-                    x: 0,
-                    y: 0,
-                    data: { type: "database", ...database.config },
-                  }),
-                  () =>
-                    void action(() =>
-                      removeLibrary(
-                        "delete_preset",
-                        { type: "database", name: database.name },
-                        database.name,
-                      ),
-                    ),
-                  undefined,
-                  "add",
-                  { kind: "database", name: database.name },
-                ),
-              ),
-          },
-          {
-            label: "Scripts",
-            items: library.scripts
-              .filter((name) => matches("scripts", name))
-              .map((name) =>
-                libraryRow(
-                  `script:${name}`,
-                  name,
-                  () => addFromLibrary({ kind: "script", name }),
-                  NODE_COLORS.script,
-                  undefined,
-                  undefined,
-                  "add",
-                  { kind: "script", name },
-                ),
-              ),
-          },
-          {
-            label: "Data",
-            items: library.data
-              .filter((name) => matches("data", name))
-              .map((name) =>
-                libraryRow(
-                  `data:${name}`,
-                  name,
-                  () => addFromLibrary({ kind: "data", name }),
-                  NODE_COLORS.data,
-                  undefined,
-                  undefined,
-                  "add",
-                  { kind: "data", name },
-                ),
-              ),
-          },
-        ]
-      : [];
+                  ),
+                trailing: "add",
+                drag: { kind: "database", name: database.name },
+              }),
+            ),
+        },
+        {
+          label: "Scripts",
+          items: library.scripts
+            .filter((name) => matches("scripts", name))
+            .map((name) =>
+              libraryRow({
+                key: `script:${name}`,
+                label: name,
+                onClick: () => addFromLibrary({ kind: "script", name }),
+                color: NODE_COLORS.script,
+                trailing: "add",
+                drag: { kind: "script", name },
+              }),
+            ),
+        },
+        {
+          label: "Data",
+          items: library.data
+            .filter((name) => matches("data", name))
+            .map((name) =>
+              libraryRow({
+                key: `data:${name}`,
+                label: name,
+                onClick: () => addFromLibrary({ kind: "data", name }),
+                color: NODE_COLORS.data,
+                trailing: "add",
+                drag: { kind: "data", name },
+              }),
+            ),
+        },
+      ]
+    : [];
 
   return (
     <div
@@ -1922,7 +1856,7 @@ export default function App() {
                     ))}
                     <option value="database-write">Database (write)</option>
                   </select>
-                  <button onClick={() => addNode(createData(addType))}>
+                  <button onClick={() => addNode(createNodeData(addType))}>
                     <Plus size={14} />
                     Add node
                   </button>
@@ -1995,7 +1929,7 @@ export default function App() {
                 else setGraph((current) => ({ ...current, view }));
               }}
               onOpenWorkflow={(id) => void action(() => openChild(id))}
-              onAdd={(position) => addNode(createData(addType), position)}
+              onAdd={(position) => addNode(createNodeData(addType), position)}
               onDropLibrary={(payload, position) => {
                 const item = parseLibraryItem(payload);
                 if (item) addFromLibrary(item, position);
@@ -2151,9 +2085,14 @@ export default function App() {
               workflowGraphs={workflowGraphs}
               library={library || undefined}
               issues={
-                !readOnly && validation?.key === validationKey
-                  ? validation.issues
-                  : undefined
+                // Root graph validation is App-owned; [] suppresses a second
+                // validate_node round-trip while the graph result is in flight.
+                // Child/snapshot inspection still falls back to local checks.
+                readOnly
+                  ? undefined
+                  : validation?.key === validationKey
+                    ? validation.issues
+                    : []
               }
               results={
                 readOnly || historical ? childRun?.nodes : remembered.nodes

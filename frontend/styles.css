@@ -857,57 +857,7 @@ button.primary:hover:not(:disabled) {
   margin-top: 24px;
 }
 
-/* The light theme follows the system unless the footer forces one. */
-@media (prefers-color-scheme: light) {
-  :root:not([data-theme="dark"]) {
-    color-scheme: light;
-    --bg: #eceef3;
-    --bg-panel: #f7f8fa;
-    --bg-raised: #ffffff;
-    --bg-button: #ffffff;
-    --bg-hover: #e4e7ee;
-    --bg-input: #ffffff;
-    --bg-accent-soft: #eceefb;
-    --overlay: #f7f8fae6;
-    --raise-tint: #0000000a;
-    --raise-tint-faint: #00000006;
-    --shadow: #0002;
-    --dots: #c3c8d2;
-    --border: #d8dce4;
-    --border-strong: #b5bbc7;
-    --border-accent: #c5c8ee;
-    --text: #1c2130;
-    --text-soft: #3a4254;
-    --text-muted: #5d6576;
-    --text-faint: #7b8394;
-    --accent: #4b52cc;
-    --accent-strong: #5b61d6;
-    --accent-fill: #4b52cc;
-    --accent-fill-hover: #3d44b8;
-    --on-accent: #ffffff;
-    --accent-tint: #6366f11a;
-    --olive: #5f7a3a;
-    --olive-text: #4a6628;
-    --olive-border: #a8bf8a;
-    --olive-tint: #6f8a4414;
-    --olive-tint-strong: #6f8a4433;
-    --olive-ring: #6f8a4466;
-    --success: #2e9e6b;
-    --info: #2f7fc1;
-    --alias: #2f7d62;
-    --warning: #b86f12;
-    --warning-text: #8a5508;
-    --warning-border: #e3c78f;
-    --warning-bg: #fff3df;
-    --warning-tint: #b86f1212;
-    --warning-tint-strong: #b86f1233;
-    --on-warning: #ffffff;
-    --danger: #c62828;
-    --danger-text: #b3261e;
-    --danger-border: #e8b7b3;
-    --danger-bg: #fdecea;
-  }
-}
+/* System preference is resolved onto data-theme in App, so light tokens live once. */
 :root[data-theme="light"] {
   color-scheme: light;
   --bg: #eceef3;
@@ -970,52 +920,4 @@ button.primary:hover:not(:disabled) {
 }
 .status-bar button.status-help {
   margin-left: 0;
-}
-.combo {
-  position: relative;
-  min-width: 0;
-}
-.combo input {
-  padding-right: 30px;
-}
-.combo-toggle {
-  position: absolute;
-  top: 50%;
-  right: 4px;
-  transform: translateY(-50%);
-  padding: 4px;
-  border: 0;
-  background: transparent;
-  color: var(--text-muted);
-}
-.combo.is-open .combo-toggle {
-  color: var(--text);
-}
-.combo-list {
-  position: fixed;
-  z-index: 40;
-  box-sizing: border-box;
-  max-height: 240px;
-  overflow-y: auto;
-  margin: 4px 0 0;
-  padding: 4px;
-  list-style: none;
-  background: var(--bg-raised);
-  border: 1px solid var(--border-strong);
-  border-radius: 6px;
-  box-shadow: 0 12px 36px #0006;
-}
-.combo-option {
-  padding: 7px 9px;
-  border-radius: 4px;
-  font-size: 12px;
-  cursor: pointer;
-  overflow-wrap: anywhere;
-}
-.combo-option.is-active,
-.combo-option:hover {
-  background: var(--bg-hover);
-}
-.combo-option[aria-selected="true"] {
-  color: var(--accent);
 }

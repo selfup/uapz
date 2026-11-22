@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { ChevronDown } from "lucide-react";
+import "./combo.css";
 
 /** A text field with a list of known values: every value is one click away, and
  * typing narrows the list without preventing an id the list does not know. */

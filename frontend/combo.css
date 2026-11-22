@@ -1,0 +1,48 @@
+.combo {
+  position: relative;
+  min-width: 0;
+}
+.combo input {
+  padding-right: 30px;
+}
+.combo-toggle {
+  position: absolute;
+  top: 50%;
+  right: 4px;
+  transform: translateY(-50%);
+  padding: 4px;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+}
+.combo.is-open .combo-toggle {
+  color: var(--text);
+}
+.combo-list {
+  position: fixed;
+  z-index: 40;
+  box-sizing: border-box;
+  max-height: 240px;
+  overflow-y: auto;
+  margin: 4px 0 0;
+  padding: 4px;
+  list-style: none;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  box-shadow: 0 12px 36px #0006;
+}
+.combo-option {
+  padding: 7px 9px;
+  border-radius: 4px;
+  font-size: 12px;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+.combo-option.is-active,
+.combo-option:hover {
+  background: var(--bg-hover);
+}
+.combo-option[aria-selected="true"] {
+  color: var(--accent);
+}

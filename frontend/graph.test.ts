@@ -18,6 +18,7 @@ import {
   publishOutput,
   scriptRuntimeFor,
   sinkIds,
+  isNodeData,
   typedData,
   uniqueName,
   visibleEdgeHandle,
@@ -275,11 +276,13 @@ describe("runtime node data", () => {
       Object.create({ type: "agent" }),
     ]) {
       const node = withData(data);
+      expect(isNodeData(data)).toBe(false);
       expect(typedData(node)).toBeUndefined();
       expect(nodeLabel(node)).toBe("Blank node");
       expect(nodeColor(node)).toBe("#9ca3af");
       expect(typeof nodeSummary(node)).toBe("string");
     }
+    expect(isNodeData(defaultNodeData("agent"))).toBe(true);
   });
 
   it("renders partial known configurations without crashing before validation", () => {

@@ -15,14 +15,12 @@ export default function Publication({
   graph,
   node,
   workflowGraphs = {},
-  onPublish,
   onGraphChange,
 }: {
   graph: GraphDoc;
   node: NodeDoc;
   workflowGraphs?: WorkflowGraphs;
-  onPublish?: (handle: string, name: string) => void;
-  onGraphChange?: (graph: GraphDoc) => void;
+  onGraphChange: (graph: GraphDoc) => void;
 }) {
   const named = isNamedWorkflow(node);
   const ports = named
@@ -54,9 +52,7 @@ export default function Publication({
   }, [handle, existing]);
   function apply(next: string[]) {
     try {
-      const doc = publishOutput(graph, handle, next, workflowGraphs);
-      if (onGraphChange) onGraphChange(doc);
-      else onPublish?.(handle, next[0] || "");
+      onGraphChange(publishOutput(graph, handle, next, workflowGraphs));
       setError("");
     } catch (error) {
       setError(errorMessage(error));
