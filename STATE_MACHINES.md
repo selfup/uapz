@@ -2,8 +2,8 @@
 
 This file names every state machine the app relies on, the invariants each one keeps, and
 the transitions that move it. Some are explicit Rust enums; most are implicit in a handful
-of flags, refs and `Option`s. Where the code could reach a state the machine should not
-allow, the finding is recorded in section 5 with the evidence and the fix.
+of flags, refs and `Option`s. Unfixed gaps live in section 5 until resolved; accepted edge
+cases live in section 5.1.
 
 References name types, functions and methods in the source (for example `AppService::start`,
 `Session::finish`, `prepareRun`). When a cited symbol is renamed or removed, update the
@@ -29,8 +29,8 @@ Legend for the tables:
 | 2.7 | Child process | `run_process` (`src/exec.rs`) | local variables `exited`, `timed_out`, `cancelled` | worker thread |
 | 2.8 | Provider stream | `generate_streaming` (`src/providers.rs`) | `Stream { stopped, error, text }` | worker thread |
 | 2.9 | Desktop shell exit | `on_window_event` / `ExitRequested` (`src-tauri/src/main.rs`) | Tauri events | main thread |
-| 3.1 | Document | `App.tsx` state `graph`, `dirty`, refs `documentEpoch`, `savedKey`, undo stacks, `children` | React state and refs | renderer |
-| 3.2 | Run (client view) | `App.tsx` state `runtime`, `attachedRun`, `pendingRunId`, `form`, `shownRun`, `historical`; refs `preparingRun`, `startingRun`, `pendingRun`, `decidingReview` | React state and refs | renderer |
+| 3.1 | Document | `frontend/App.tsx` state `graph`, `dirty`, refs `documentEpoch`, `savedKey`, undo stacks, `children` | React state and refs | renderer |
+| 3.2 | Run (client view) | `frontend/App.tsx` state `runtime`, `attachedRun`, `pendingRunId`, `form`, `shownRun`, `historical`; refs `preparingRun`, `startingRun`, `pendingRun`, `decidingReview` | React state and refs | renderer |
 | 3.3 | Runtime polling | `readRuntime` and `poll` (`frontend/App.tsx`) | monotonic request counters | renderer |
 | 3.4 | Output retrieval | `RunOutput` (`frontend/RunPanel.tsx`); `Output` (`frontend/Inspector.tsx`) | `loaded`, `failure`, `attempt` | renderer |
 | 3.5 | Quit | `closeRequested` (`frontend/App.tsx`) | `closePrompt` ref plus the dialog | renderer |
@@ -109,14 +109,13 @@ finished states even though the flag stays set.
 Invariants:
 
 - R1. `review.is_some()` implies `running && !cancel`. Kept by `publish_review`, `finish`
-  and `cancel` (see finding K).
+  and `cancel`.
 - R2. `cancelling` implies `running`, by construction of the derived value.
 - R3. Once `running` is false, no mark is `pending` or `running`. Kept by `finish` on both
-  the recorded and the crashed path (before this change, only on the recorded path; see
-  finding C).
+  the recorded and the crashed path.
 - R4. `run.is_some()` implies `!running`.
 - R5. `error.is_some() && run.is_none() && !running` identifies a crashed worker. The
-  renderer treats it as terminal (see 3.2 and finding C).
+  renderer treats it as terminal (see 3.2).
 - R6. Feed event `seq` is strictly increasing; the renderer rejects anything else
   (`frontend/responses.ts`, the `runtime` schema).
 - R7. A completed output replaces every earlier `text` event for the same node and clears
@@ -185,8 +184,7 @@ Invariants:
   every step).
 - N2. `Failed` is emitted at most once per node and never for `CANCELLED`.
 - N3. The set of ids in `Report.failures` equals the set of nodes for which `Failed` was
-  emitted, and `failed` is `failures[0]` (`Runner::record_failure`). Before this change the
-  report carried only `failed`; see finding B.
+  emitted, and `failed` is `failures[0]` (`Runner::record_failure`).
 - N4. Nothing is cached or saved after cancellation is observed: `run_agent` checks the
   flag after the reply and before `write_agent_output`; `run_process` returns `CANCELLED`
   before returning any bytes.
@@ -219,10 +217,10 @@ Invariants:
 - H2. `Outcome::Failed` implies at least one `Failed` node once execution reaches a node
   step. Pre-execution failures (`Report::failure` on `workflow::fields`/`workflow::resolve`,
   empty targets, or a child workflow's dynamic input mapping error) carry no `Failed` nodes.
-- H3. `Outcome::Cancelled` may carry `Failed` nodes: an earlier target's own failure is kept
-  (see finding B). Nodes stopped by the cancel itself are absent.
+- H3. `Outcome::Cancelled` may carry `Failed` nodes: an earlier target's own failure is
+  kept. Nodes stopped by the cancel itself are absent.
 - H4. The `graph` field of a listed record equals the directory it was listed from
-  (`history::list`). The stored field can be stale after a rename; see finding A.
+  (`history::list` overrides the stored field, which can be stale after a rename).
 - H5. A record's node states match the session's final marks: `Ran`, `Reused` and `Failed`
   carry over one to one, and nodes without a final state are absent from both (R3).
 - H6. `Run.failed` is the node that failed first, matching the outcome's error when
@@ -308,8 +306,8 @@ In smoke mode the window closes without asking.
 | any | `updateGraph` / `updateNode` | not read only; same epoch | Dirty | undo entry pushed; redo cleared |
 | any | `save` | not read only; `saveInFlight` false | Clean if no edit landed during the request, else Dirty | `savedKey` set only when the document is unchanged; library refreshed |
 | any | `newGraph` / `openGraph` | not `occupied`; no run is being prepared, started, pending or running; `discardDraft` agreed; navigation counter unchanged | Clean | epoch incremented; history, selection, children, shown run, `historical` and attached run reset |
-| any | `deleteGraph` of the open graph | not `occupied`; no save in flight | Dirty | `savedKey = null`; `history`, `shownRun`, `attachedRun`, `historical` and `remembered` cleared (finding J) |
-| any | `renameGraph` of the open graph | not `occupied`; no save in flight | *Self* | name replaced; `savedKey` follows only when clean; the shown run, the history list and the remembered per-node runs are re-keyed to the new name (finding A) |
+| any | `deleteGraph` of the open graph | not `occupied`; no save in flight | Dirty | `savedKey = null`; `history`, `shownRun`, `attachedRun`, `historical` and `remembered` cleared |
+| any | `renameGraph` of the open graph | not `occupied`; no save in flight | *Self* | name replaced; `savedKey` follows only when clean; `shownRun`, `history` and `remembered.origins` are re-keyed to the new name |
 | any | `duplicateGraph` | not `occupied`; no save in flight | *Self* | copy written under the new name |
 | any | undo / redo | not read only | Dirty or Clean by comparison with `savedKey` | view kept |
 | any | `openChild` | depth under 8; navigation counters unchanged | child pushed | snapshot when a run is shown, saved graph otherwise |
@@ -360,7 +358,7 @@ is `shownRun`, else the attached runtime's record.
 | Running, Awaiting review, Cancelling, Pending | poll sees `!running` with a record or an error (`poll` completion check) | `run_id === attachedRun` and not yet completed | Completed | record remembered per node; history refreshed; notice shown unless Historical; a service error is shown whichever run is on display |
 | Completed, Idle or Historical | Inspect this run (`onOpenHistory`) | not `occupied` | Historical | run panel shows the chosen record |
 | Historical | a new run starts, or `newGraph` / `openGraph` | | Idle then Pending, or Idle | `historical` cleared |
-| Completed or Historical | Clear history | not `occupied`; same epoch | Idle | `attachedRun`, `shownRun`, `historical`, `history`, remembered outputs cleared (finding I) |
+| Completed or Historical | Clear history | not `occupied`; same epoch | Idle | `attachedRun`, `shownRun`, `historical`, `history`, remembered outputs cleared |
 
 Invariants:
 
@@ -368,15 +366,15 @@ Invariants:
   block a second entry, and a failed first status read keeps `pendingRun` so the same run
   cannot be resubmitted. A lost `start_run` reply still attaches via the live runtime or
   the next poll so the run is not left unowned.
-- F2. One decision per review: `decidingReview` blocks the second click (finding D).
+- F2. One decision per review: `decidingReview` blocks the second click while a decision
+  is in flight.
 - F3. Navigation, rename, delete, duplicate, Clear cache and Clear history are disabled
   while `occupied` (the service's `idle()` guard protects `clear_cache`, `clear_history`,
-  `delete_graph` and `rename_graph`; see finding I). Rename, delete and duplicate are also
-  disabled while a save is in flight so a landing write cannot resurrect the old name;
-  opening another graph during that save stays allowed. Save is allowed during a run on
-  purpose: the run uses the document captured at start.
-- F4. Completion is detected once per attached run, whether or not a record exists
-  (finding C).
+  `delete_graph` and `rename_graph`). Rename, delete and duplicate are also disabled while
+  a save is in flight so a landing write cannot resurrect the old name; opening another
+  graph during that save stays allowed. Save is allowed during a run on purpose: the run
+  uses the document captured at start.
+- F4. Completion is detected once per attached run, whether or not a record exists.
 
 ### 3.3 Runtime polling
 
@@ -409,7 +407,7 @@ for another run or node is never shown.
 ### 3.5 Quit
 
 `closeRequested` answers the shell's `close-requested` event. Here "run active" covers
-`runtime.running || pendingRun || startingRun` (finding L).
+`runtime.running || pendingRun || startingRun`.
 
 | `dirty` | run active | Behaviour |
 | --- | --- | --- |
@@ -419,9 +417,8 @@ for another run or node is never shown.
 | true | true | ask: unsaved changes and a run in progress, with **Save and quit** unless read only |
 
 If **Save and quit** is chosen while `saveInFlight` is already true, `closeRequested`
-refuses to quit early and shows `Wait for the current save to finish before quitting.`
-(finding L). `closePrompt` ignores further close requests while the question is open.
-Before finding E, the clean-and-running row quit silently.
+refuses to quit early and shows `Wait for the current save to finish before quitting.`.
+`closePrompt` ignores further close requests while the question is open.
 
 ### 3.6 Confirmation dialog
 
@@ -439,187 +436,15 @@ side-effect free until the dialog answers.
 | X1 | The renderer's `running` is never true for a run the service has finished for longer than one poll interval. | 2.2 R4 and 3.2 F4 |
 | X2 | A review panel is shown only for a review the service still holds (up to the post-decision status read, while decision buttons stay disabled). | R1 plus the status read after every decision |
 | X3 | Live marks and the finished record agree on every node's final state. | N3, H5 and R3 |
-| X4 | A record is reachable by the graph name it reports. | H4 and finding J |
+| X4 | A record is reachable by the graph name it reports. | H4, `renameGraph` and `deleteGraph` |
 | X5 | Nothing is written to disk by a reviewed file node (`review: true`) without a decision for exactly that batch and an unchanged-file check after it. | V1 and V2 |
 | X6 | A cancel reaches every blocking point within 50 ms (review wait) or 25 ms (process poll), and in-flight provider streams at the next chunk. | 2.3, 2.7, 2.8 |
 | X7 | Quitting never cancels a run without the person agreeing. | 3.5 and 2.9 |
 
-## 5. Findings
+## 5. Open findings
 
-Each finding names the invalid state or transition, how the code reached it, the evidence,
-and the fix. Issues are ordered by impact. All below are fixed and pinned by the tests
-named.
-
-### A. Renamed graph: records unreachable by the name they carry (high)
-
-- **Invalid state**: a listed `Run` whose `graph` field names a directory that no longer
-  exists (violates H4, X4).
-- **Reached by**: `rename_graph` moves `runs/<old>/*.json` to `runs/<new>/` without
-  rewriting the files. `history::list` returned the stored `graph`. The renderer uses that
-  field for every `output` request (`RunPanel.tsx`, `Inspector.tsx` history tab), and
-  `AppService::output` looks the run up under it, so after a rename every truncated output
-  of every earlier run answered `the run or completed live output is no longer stored`.
-  Once a later run replaced the live session the error was permanent.
-- **Fix**: `history::list` sets `run.graph` to the directory it listed. Existing
-  workspaces are repaired on read; `rename` needs no change. The renderer keeps its own
-  copies of runs (`shownRun`, `history`, `remembered.origins`), all belonging to the open
-  document, and re-keys them when that document is renamed (`renameGraph`); otherwise the
-  inspector would keep asking under the old name once a later run had replaced the live
-  session.
-- **Tests**: `history::tests::renamed_records_report_the_directory_they_are_listed_from`,
-  `app::tests::history_outputs_stay_reachable_under_a_renamed_graph`,
-  `tests/run-lifecycle.spec.ts` "renaming the open workflow re-keys its remembered runs".
-  The Rust tests fail without the fix.
-
-### B. Record under-reports failures (medium)
-
-- **Invalid state**: a node shown as `failed` on the canvas during the run that has no
-  entry in the record afterwards (violates X3, H5).
-- **Reached by**: two paths. Run all with two independent failing targets: `Report.failed`
-  held only the first, so `history::record` wrote one `Failed` node; the second node's
-  live `failed` mark disappeared when the run ended. And a cancel after a target had
-  failed: the outcome became `Cancelled` and the failed node was dropped altogether
-  (`exec::tests::independent_failures_each_get_a_failed_state` already proved both
-  `Failed` events were emitted).
-- **Fix**: `Report.failures` records every own-step failure with its error
-  (`Runner::record_failure`); `history::record` writes each as a `Failed` node regardless
-  of outcome and stores `Report.failed` as `Run.failed`, so the headline and `Run::report`
-  name the node that failed first rather than the first by id (`history::record` and
-  `Run::first_failed`). Records written before `failed` existed fall back to the first
-  failed node by id.
-- **Tests**: `exec::tests::independent_failures_each_get_a_failed_state` and
-  `exec::tests::cancellation_takes_precedence_over_an_earlier_target_failure` now assert
-  the record; the history `report()` helper derives `failures` the way the executor does.
-
-### C. Crashed worker leaves the run half finished (medium)
-
-- **Invalid states**: service side, `running == false` with marks still `pending` or
-  `running` (violates R3). Renderer side, the attached run never reaches Completed: the
-  status bar kept `Workflow is running`, the error was never shown, history was not
-  refreshed (violates F4, X1).
-- **Reached by**: the worker's `catch_unwind` path set `running = false` and `error` but
-  skipped the clean-up that lived in the success closure; the renderer's completion check
-  required `state.run`, which a crashed worker never produces.
-- **Fix**: `Session::finish(Option<..>)` is the single exit for both paths; the poll treats
-  `!running && (run || error)` as terminal (`poll` completion check) and reports
-  `Run failed` with the error. The error is shown even while a history run is on display:
-  it belongs to the run that ended, not to the one shown.
-- **Tests**: `app::tests::a_crashed_worker_leaves_no_pending_or_running_marks`;
-  `tests/run-lifecycle.spec.ts`, "a run whose worker stopped without a record".
-
-### D. A review decision could be sent twice (medium)
-
-- **Invalid transition**: Awaiting review -> Deciding -> Deciding again for the same review.
-- **Reached by**: the panel stayed enabled until the status read after the first decision
-  returned. A second click in that interval sent a second `review` request, which the
-  service refused with `there is no pending review`, and the renderer showed that as an
-  error although the decision had been applied. The interval grows with the size of the
-  status payload the poll is serialising at the time.
-- **Fix**: `decidingReview` and the `deciding` state disable Apply and Reject while a
-  decision is in flight (`reviewDecision`); Cancel run stays available.
-- **Tests**: `tests/run-lifecycle.spec.ts`, "a review decision is sent once however often its button is pressed while it is in flight"; the
-  service's own refusal of a duplicate was already pinned by
-  `app::tests::pending_review_blocks_second_run_and_rejects_stale_decisions`.
-
-### E. Quit during a run with a clean document cancelled it silently (medium)
-
-- **Invalid transition**: Open -> Exited with a run in progress and no confirmation
-  (violates X7). The existing dialog text already said quitting cancels the run, but the
-  question was only asked when the document was dirty.
-- **Reached by**: Cmd+Q or the close button after saving while an agent run was still going.
-- **Fix**: the prompt now covers the clean-and-running case (`closeRequested`).
-- **Tests**: `tests/run-lifecycle.spec.ts`, "a saved, idle workflow quits at once" and
-  "quitting while a run is in progress asks first, even with nothing unsaved". The Playwright fixture now emulates
-  the shell's event listener registration and the `quit` command
-  (`tests/support/workspace.ts`), so `__testState.emit("close-requested")` reaches the
-  renderer.
-
-### F. Save in flight could resurrect a renamed or deleted graph (medium)
-
-- **Invalid transition**: Dirty -> save submitted -> rename/delete/duplicate of that name ->
-  save lands and writes the old name again (violates the library's one-file-per-name
-  expectation).
-- **Reached by**: rename, delete and duplicate stayed enabled while `saveInFlight` was
-  true. Opening another graph during a save is intentional and must stay available; a
-  blanket library lock would have removed that.
-- **Fix**: rename, delete and duplicate take the same `saveInFlight` guard as their
-  buttons (`mutateDisabled` while `saving`); open stays enabled. Invariant F3.
-- **Tests**: `tests/async-workspace.spec.ts`, "rename, delete and duplicate wait for an in-flight
-  save, while open stays available".
-
-### G. Spawn failure dropped the previous finished session (medium)
-
-- **Invalid state**: after `start_run` fails to spawn a worker, the slot is Empty even
-  though a finished session with live outputs was present (violates the 2.1 rule that a
-  finished session stays until the next run replaces it).
-- **Reached by**: `AppService::start` wrote the new session into the slot before spawn, then
-  cleared the slot to `None` on spawn failure.
-- **Fix**: keep the previous slot value and restore it when spawn fails; the never-started
-  session is discarded.
-- **Tests**: `app::tests::a_spawn_failure_keeps_the_previous_finished_session`.
-
-### H. Lost `start_run` reply left the service session unattached (medium)
-
-- **Invalid state**: service `Occupied, running` while the renderer has no `attachedRun`
-  for that id: Cancel and the review panel still work from `runtime_state`, but the run
-  panel stays empty and completion is never announced (violates F1's ownership and X1).
-- **Reached by**: the service accepted `start_run` and spawned the worker, then the IPC
-  reply failed or never arrived, so `startRun` never set `attachedRun` / `pendingRun`.
-- **Fix**: when `start_run` errors but `runtime_state` already shows this graph running,
-  `startRun` attaches to that session; the poll also attaches any orphan running session
-  whose graph matches the open document.
-- **Tests**: `tests/async-actions.spec.ts`, "a lost start_run reply still attaches to the service
-  session that accepted it".
-
-### I. Clear history ignored `occupied`, left `historical` set and lacked an epoch guard (medium)
-
-- **Invalid states**: Clear history and Clear cache stayed enabled while `form` or `busy`
-  made `occupied` true (violates F3); clearing history from `Historical` left
-  `historical == true` with `shownRun == null` instead of reaching `Idle`; navigating while
-  `clear_history` was in flight could wipe the newly opened graph's state (violates D1).
-- **Reached by**: opening the run inputs form while history existed, or inspecting an
-  earlier run and clicking Clear history.
-- **Fix**: both buttons guard on `occupied`; Clear history captures `documentEpoch`, skips
-  state updates if the epoch changed, and resets `historical` and `historicalRef`.
-- **Tests**: `tests/run-lifecycle.spec.ts`, "clearing history waits while occupied and exits historical view cleanly".
-
-### J. Deleting the open workflow left stale history and remembered outputs (medium)
-
-- **Invalid state**: the Inspector still listed deleted runs and remembered outputs whose
-  `output` requests fail after `delete_graph` removed their files on disk (violates X4 for
-  retained client copies).
-- **Reached by**: deleting the currently open workflow. `deleteGraph` kept `graph.name`
-  unchanged, so the history-refresh effect did not re-run.
-- **Fix**: when `deleteGraph` deletes the open graph, it clears `history`, `shownRun`,
-  `attachedRun`, `historical` and `remembered`.
-- **Tests**: `tests/run-lifecycle.spec.ts`, "deleting the open workflow clears its history and remembered outputs".
-
-### K. Cancelling during `Batch::prepare` could briefly publish a review (low)
-
-- **Invalid state**: `Session` with `running == true`, `cancel == true` and `review == Some`
-  (outside the 2.2 state table, violates R1).
-- **Reached by**: `cancel_run` arriving after `review_writes`'s initial `check_cancel` and
-  before `review::wait` published `Pending`. `review::wait` published before checking
-  `cancel`, and the publish callback wrote `state.review` unconditionally.
-- **Fix**: `review::wait` checks `cancel` before publishing, and `Session::publish_review`
-  checks `running && !cancel` under the session mutex.
-- **Tests**: `review::tests::cancelled_wait_does_not_publish_a_pending_review`,
-  `app::tests::a_cancelled_session_never_publishes_a_review`.
-
-### L. Quit during `start_run` or an in-flight save bypassed confirmation or quit mid-save (medium)
-
-- **Invalid transitions**: quitting with a clean document while `start_run` was in flight
-  cancelled the starting run without prompting (violates X7); clicking **Save and quit**
-  while another save was already in flight returned immediately from `save()` and quit
-  before the save finished; an in-flight `installExamples` could replace an open quit dialog
-  and leave `closePrompt` stuck `true`.
-- **Reached by**: Cmd+Q while `start_run` or `save_graph` was pending, or while
-  `install_examples` was completing.
-- **Fix**: `closeRequested` treats `startingRun` as active and refuses to quit early if
-  `saveInFlight` is true when **Save and quit** is chosen; `installExamples` sets `busy` and
-  checks `documentEpoch`, `rootNavigation` and `closePrompt` before opening a graph.
-- **Tests**: `tests/run-lifecycle.spec.ts`, "quitting while start_run is in flight asks before cancelling",
-  "save and quit refuses to quit while another save is already in flight".
+None. Resolved issues are reflected in the tables and invariants above and pinned by
+regression tests in section 6.
 
 ### 5.1 Reachable but left as is
 
@@ -629,9 +454,13 @@ is listed so a later change does not mistake them for oversights.
 | Situation | What happens | Why unchanged |
 | --- | --- | --- |
 | Live outputs over 4 MB in total while a run is still going | `output` answers `no longer stored` for the evicted node until the record exists; **Retry output** then works. | Bound is deliberate; the record recovers the output. |
-| A history run is inspected in the gap between a review decision and the completion poll | The completion notice is suppressed to keep the chosen run on screen; results and history are still recorded, and a service error is still shown. | Intended, pinned by `run-history.spec.ts`. |
+| A history run is inspected in the gap between a review decision and the completion poll | The completion notice is suppressed to keep the chosen run on screen; results and history are still recorded, and a service error is still shown. | Intended, pinned by `tests/run-history.spec.ts`. |
 | Undo after renaming the open graph | The old name comes back; saving recreates the old file. | Undo restores documents, and the name is part of the document. |
 | Two targets fail; the record is reopened | `Run.failed` names the first to fail; the order of the others is not stored. | Only the first matters to the outcome's error and the headline. |
+| Finished `Session` still in `AppService.current` after `clear_history`, `delete_graph` or `rename_graph` | A direct `output` request for that last run id under the old name still hits memory until the next run replaces the slot; after `rename_graph`, if `history::save` had failed so no file exists on disk, lookups under the new name miss the in-memory session. | The renderer clears or re-keys its own state; disk records stay reachable under the new name via `history::list`. |
+| Lost `start_run` reply for a run that finishes before `runtime_state` is read | `startRun` only attaches when `runtime_state` still shows `running: true`; a sub-millisecond run that already finished falls through to the `start_run` error. | Without the returned `run_id`, the renderer cannot distinguish a newly finished run from an earlier finished session. |
+| `updateNode` called in the same tick as `save` or `prepareRun` resolving | `updateNode` relies on the next render to update `graphRef`, unlike `updateGraph`, `restore` and `renameGraph`. | Single-microtask window before React commits; normal edits commit before IPC settles. |
+| Replacing one text-input `ConfirmDialog` directly with another | `ConfirmDialog` has no `key`, so its local input `value` would not reset to the new `input.initial`. | Modal `<dialog>` prevents opening a second text-input dialog while one is open; only `closeRequested` (no input) can replace it. |
 
 ### 5.2 Checked and sound
 
@@ -640,8 +469,8 @@ Paths that looked suspicious and held up, so they need not be re-derived:
 - Cancel racing a decision: `Session::cancel` sets the flag before answering `Reject`;
   `wait` rechecks the flag after receipt, so cancel always wins.
 - Stale status reads: a poll result numbered below the last applied read is dropped, so
-  a finished run never shows as awaiting review again (`async-actions.spec.ts`, "a late
-  runtime poll").
+  a finished run never shows as awaiting review again (`tests/async-actions.spec.ts`,
+  "a late runtime poll snapshot/failure cannot override a newer completed status").
 - Lock order: slot before session everywhere; the cache lock is never nested inside a
   session lock, and the worker takes only the session lock.
 - `Create` mode write: `create_new` at open time, so a file created between review and
@@ -657,26 +486,26 @@ Paths that looked suspicious and held up, so they need not be re-derived:
 | Cancel wakes a review; `Cancelled` record | `app::tests::cancellation_wakes_review_and_retains_cancelled_history`, `review::tests::cancellation_wakes_a_waiting_review_and_wins_over_approval` |
 | R1 cancelled session never publishes review | `review::tests::cancelled_wait_does_not_publish_a_pending_review`, `app::tests::a_cancelled_session_never_publishes_a_review` |
 | R3 and R5 on the crashed path | `app::tests::a_crashed_worker_leaves_no_pending_or_running_marks` |
-| H4, X4 | `history::tests::renamed_records_report_the_directory_they_are_listed_from`, `app::tests::history_outputs_stay_reachable_under_a_renamed_graph`, `run-lifecycle.spec.ts` "renaming the open workflow re-keys its remembered runs so outputs are requested under the new name", "deleting the open workflow clears its history and remembered outputs" |
+| H4, X4 | `history::tests::renamed_records_report_the_directory_they_are_listed_from`, `app::tests::history_outputs_stay_reachable_under_a_renamed_graph`, `tests/run-lifecycle.spec.ts` "renaming the open workflow re-keys its remembered runs so outputs are requested under the new name", "deleting the open workflow clears its history and remembered outputs" |
 | N3, H3, H5 | `exec::tests::independent_failures_each_get_a_failed_state`, `exec::tests::cancellation_takes_precedence_over_an_earlier_target_failure` |
 | N4 | `exec::tests::cancellation_after_a_whole_reply_prevents_saving_and_caching`, `exec::tests::agents_stream_text_into_progress_and_stop_on_cancel` |
 | P1 | `exec::tests::process_timeout_covers_pipes_inherited_by_grandchildren`, `exec::tests::cancellation_covers_pipes_inherited_by_grandchildren` |
 | V2 | `exec::tests::a_stale_file_stops_an_approved_batch_before_its_first_write` |
 | R6, R7 feed bounds | `app::tests::feed_preserves_order_coalesces_text_and_replaces_completed_streams`, `app::tests::feed_retention_is_bounded_and_flags_utf8_truncation_and_real_evictions` |
-| F1 | `async-actions.spec.ts` "preparing a run blocks repeated execution and root navigation until its inputs are ready", "an accepted run cannot be resubmitted when its first status response is ...", "a lost start_run reply still attaches to the service session that accepted it" |
-| F2 | `run-lifecycle.spec.ts` "a review decision is sent once however often its button is pressed while it is in flight" |
-| F3 save-vs-mutate and clear history | `async-workspace.spec.ts` "rename, delete and duplicate wait for an in-flight save, while open stays available"; `run-lifecycle.spec.ts` "clearing history waits while occupied and exits historical view cleanly" |
-| F4, X1 | `run-lifecycle.spec.ts` "a run whose worker stopped without a record is reported as failed and releases the editor" |
+| F1 | `tests/async-actions.spec.ts` "preparing a run blocks repeated execution and root navigation until its inputs are ready", "an accepted run cannot be resubmitted when its first status response is error/null", "a lost start_run reply still attaches to the service session that accepted it" |
+| F2 | `tests/run-lifecycle.spec.ts` "a review decision is sent once however often its button is pressed while it is in flight" |
+| F3 save-vs-mutate and clear history | `tests/async-workspace.spec.ts` "rename, delete and duplicate wait for an in-flight save, while open stays available"; `tests/run-lifecycle.spec.ts` "clearing history waits while occupied and exits historical view cleanly" |
+| F4, X1 | `tests/run-lifecycle.spec.ts` "a run whose worker stopped without a record is reported as failed and releases the editor" |
 | 2.1 spawn failure restores previous | `app::tests::a_spawn_failure_keeps_the_previous_finished_session` |
-| 3.3 stale poll | `async-actions.spec.ts` "a late runtime poll ... cannot override a newer completed status" |
-| 3.5, X7 | `run-lifecycle.spec.ts` "a saved, idle workflow quits at once", "quitting while a run is in progress asks first, even with nothing unsaved", "quitting while start_run is in flight asks before cancelling", "save and quit refuses to quit while another save is already in flight"; `session.spec.ts` "leaving unsaved changes offers to save them first" |
-| D1 | `async-workspace.spec.ts`, `async-actions.spec.ts` prompt and save tests |
-| 3.4 | `run-panel.spec.ts` "historical runs expose all results and failed full-output loads can be retried" |
+| 3.3 stale poll | `tests/async-actions.spec.ts` "a late runtime poll snapshot/failure cannot override a newer completed status" |
+| 3.5, X7 | `tests/run-lifecycle.spec.ts` "a saved, idle workflow quits at once", "quitting while a run is in progress asks first, even with nothing unsaved", "quitting while start_run is in flight asks before cancelling", "save and quit refuses to quit while another save is already in flight"; `tests/session.spec.ts` "leaving unsaved changes offers to save them first" |
+| D1 | `tests/async-workspace.spec.ts`, `tests/async-actions.spec.ts` prompt and save tests |
+| 3.4 | `tests/run-panel.spec.ts` "historical runs expose all results and failed full-output loads can be retried" |
 
 ## 7. Keeping this file current
 
 When a change adds a flag, an `Option`, a ref that gates an action, or a new error string
 on an IPC request, it has changed one of these machines. Add the row, state the invariant
 it protects, and point the regression test at it here. Cite symbols by name, not by line.
-A fixed finding stays recorded in section 5 with a pointer to its test and its fix
-reflected in the tables above; a finding that is accepted goes into 5.1 with the reason.
+A finding that is fixed moves out of section 5 into the tables above with its regression
+test in section 6; a finding that is accepted goes into 5.1 with the reason.
