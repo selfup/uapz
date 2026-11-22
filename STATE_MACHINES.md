@@ -5,8 +5,9 @@ the transitions that move it. Some are explicit Rust enums; most are implicit in
 of flags, refs and `Option`s. Where the code could reach a state the machine should not
 allow, the finding is recorded in section 5 with the evidence and the fix.
 
-Line numbers refer to the tree at the commit that last touched this file. When a cited
-function moves, update the reference here in the same change.
+References name types, functions and methods in the source (for example `AppService::start`,
+`Session::finish`, `prepareRun`). When a cited symbol is renamed or removed, update the
+reference here in the same change.
 
 Legend for the tables:
 
@@ -19,21 +20,21 @@ Legend for the tables:
 
 | # | Machine | Lives in | Form | Thread or owner |
 | --- | --- | --- | --- | --- |
-| 2.1 | Service session slot | `AppService.current`, `src/app.rs:90` | `Option<Arc<Mutex<Session>>>` | any IPC request |
-| 2.2 | Session (one run) | `Session`, `src/app.rs:110` | flags `running`, `cancel`, `review`, `run`, `error` | worker thread + IPC requests |
-| 2.3 | Review decision | `review::Pending` and `wait`, `src/review.rs:41` | one-shot channel | worker waits, IPC decides |
-| 2.4 | Executor node | `Runner`, `src/exec.rs:749` | `done`, `errors`, `failed`, `failures`, `reused` maps plus `NodeState` events | worker thread |
-| 2.5 | Run record | `history::Run`, `src/history.rs:37` | `Outcome` and per-node `State` enums | written by the worker, read by anyone |
-| 2.6 | Output cache entry | `exec::Cache`, `src/exec.rs:253` | in-memory map plus `.json`/`.bin` pair | behind one mutex |
-| 2.7 | Child process | `run_process`, `src/exec.rs:2739` | local variables `exited`, `timed_out`, `cancelled` | worker thread |
-| 2.8 | Provider stream | `generate_streaming`, `src/providers.rs:228` | `Stream { stopped, error, text }` | worker thread |
-| 2.9 | Desktop shell exit | `src-tauri/src/main.rs:97` | Tauri events | main thread |
+| 2.1 | Service session slot | `AppService.current` (`src/app.rs`) | `Option<Arc<Mutex<Session>>>` | any IPC request |
+| 2.2 | Session (one run) | `Session` (`src/app.rs`) | flags `running`, `cancel`, `review`, `run`, `error` | worker thread + IPC requests |
+| 2.3 | Review decision | `review::Pending` and `review::wait` (`src/review.rs`) | one-shot channel | worker waits, IPC decides |
+| 2.4 | Executor node | `Runner` (`src/exec.rs`) | `done`, `errors`, `failed`, `failures`, `reused` maps plus `NodeState` events | worker thread |
+| 2.5 | Run record | `history::Run` (`src/history.rs`) | `Outcome` and per-node `State` enums | written by the worker, read by anyone |
+| 2.6 | Output cache entry | `exec::Cache` (`src/exec.rs`) | in-memory map plus `.json`/`.bin` pair | behind one mutex |
+| 2.7 | Child process | `run_process` (`src/exec.rs`) | local variables `exited`, `timed_out`, `cancelled` | worker thread |
+| 2.8 | Provider stream | `generate_streaming` (`src/providers.rs`) | `Stream { stopped, error, text }` | worker thread |
+| 2.9 | Desktop shell exit | `on_window_event` / `ExitRequested` (`src-tauri/src/main.rs`) | Tauri events | main thread |
 | 3.1 | Document | `App.tsx` state `graph`, `dirty`, refs `documentEpoch`, `savedKey`, undo stacks, `children` | React state and refs | renderer |
 | 3.2 | Run (client view) | `App.tsx` state `runtime`, `attachedRun`, `pendingRunId`, `form`, `shownRun`, `historical`; refs `preparingRun`, `startingRun`, `pendingRun`, `decidingReview` | React state and refs | renderer |
-| 3.3 | Runtime polling | `readRuntime` and `poll`, `frontend/App.tsx:410` | monotonic request counters | renderer |
-| 3.4 | Output retrieval | `RunOutput`, `frontend/RunPanel.tsx:287`; `Output`, `frontend/Inspector.tsx:2144` | `loaded`, `failure`, `attempt` | renderer |
-| 3.5 | Quit | `closeRequested`, `frontend/App.tsx:1379` | `closePrompt` ref plus the dialog | renderer |
-| 3.6 | Confirmation dialog | `confirmation` state, `frontend/App.tsx:228` | single slot | renderer |
+| 3.3 | Runtime polling | `readRuntime` and `poll` (`frontend/App.tsx`) | monotonic request counters | renderer |
+| 3.4 | Output retrieval | `RunOutput` (`frontend/RunPanel.tsx`); `Output` (`frontend/Inspector.tsx`) | `loaded`, `failure`, `attempt` | renderer |
+| 3.5 | Quit | `closeRequested` (`frontend/App.tsx`) | `closePrompt` ref plus the dialog | renderer |
+| 3.6 | Confirmation dialog | `confirmation` state (`frontend/App.tsx`) | single slot | renderer |
 
 ## 2. Backend
 
@@ -55,13 +56,13 @@ Transitions:
 
 | From | Trigger | Guard | To | Effect |
 | --- | --- | --- | --- | --- |
-| any | `start_run` (`app.rs:780`) | no session is running (`app.rs:789`), otherwise `a run is already active` | Occupied, running | New `Session` with every member node marked `pending`; worker thread spawned; the previous session is dropped, which sets its (already finished) cancel flag. |
-| Occupied, running | spawn fails (`app.rs:863`) | | Empty | The new session is discarded; the previous finished session is lost with it. |
+| any | `start_run` (`AppService::start`) | no session is running (`AppService::start` running check), otherwise `a run is already active` | Occupied, running | New `Session` with every member node marked `pending`; worker thread spawned; the previous session is dropped, which sets its (already finished) cancel flag. |
+| Occupied, running | spawn fails (`AppService::start`) | | Empty | The new session is discarded; the previous finished session is lost with it. |
 | Occupied, running | worker ends (`Session::finish`) | | Occupied, finished | See 2.2. |
-| Occupied, finished or Empty | `clear_cache`, `clear_history`, `delete_graph`, `rename_graph` | `idle()` (`app.rs:663`) holds the slot lock for the whole operation, so no run can start meanwhile | *Self* | |
+| Occupied, finished or Empty | `clear_cache`, `clear_history`, `delete_graph`, `rename_graph` | `AppService::idle` holds the slot lock for the whole operation, so no run can start meanwhile | *Self* | |
 | Occupied, running | the same four requests | | *Self* | Error `wait for the active run to finish`. |
 | any | `runtime_state` | | *Self* | Serialises the session, or `null` when Empty. |
-| any | the last `AppService` clone drops (`app.rs:102`) | | *Self* | `cancel()` on the current session. |
+| any | the last `AppService` clone drops (`ServiceLifetime::drop`) | | *Self* | `cancel()` on the current session. |
 
 Invariants:
 
@@ -71,7 +72,7 @@ Invariants:
   `cancel_active`). The worker and the progress callback take only the session lock.
   Nothing takes the cache lock while holding a session lock.
 - S3. An `output` request never holds a session lock while reading the cache
-  (`app.rs:672` onwards clones what it needs first).
+  (`AppService::output` clones what it needs first).
 
 ### 2.2 Session
 
@@ -92,17 +93,17 @@ Transitions:
 
 | From | Trigger | Guard | To | Effect |
 | --- | --- | --- | --- | --- |
-| Running | file node needs review (`exec.rs:1784`, handler at `app.rs:831`) | | Awaiting review | `review_seq += 1`; `review = Some((id, pending))`. |
-| Awaiting review | `review` request (`app.rs:544`) | running and not cancelling; id matches; channel accepts | Running | `review = None`; worker resumes with the decision. Errors: `this run is no longer awaiting review`, `this review is stale`, `this review has already been answered`, `there is no pending review`. |
-| Awaiting review | worker returns from `wait` (`app.rs:840`) | | Running or Cancelling | `review = None` (the request handler usually did this already). |
-| Running or Awaiting review | `cancel_run` (`app.rs:535`) or `cancel_active` or `Session`/`ServiceLifetime` drop | `running`, otherwise `this run has already finished` | Cancelling | `cancel` flag set; a pending review is taken and answered `Reject` so the waiter wakes (`app.rs:276`). |
+| Running | file node needs review (`Runner::review_writes`, review callback in `AppService::start`) | | Awaiting review | `review_seq += 1`; `review = Some((id, pending))`. |
+| Awaiting review | `review` request (`AppService::request` `"review"`) | running and not cancelling; id matches; channel accepts | Running | `review = None`; worker resumes with the decision. Errors: `this run is no longer awaiting review`, `this review is stale`, `this review has already been answered`, `there is no pending review`. |
+| Awaiting review | worker returns from `wait` (review callback in `AppService::start`) | | Running or Cancelling | `review = None` (the request handler usually did this already). |
+| Running or Awaiting review | `cancel_run` (`AppService::request` `"cancel_run"`) or `cancel_active` or `Session`/`ServiceLifetime` drop | `running`, otherwise `this run has already finished` | Cancelling | `cancel` flag set; a pending review is taken and answered `Reject` so the waiter wakes (`Session::cancel`). |
 | Cancelling | `review` request | | *Self* | Error `this run is no longer awaiting review`. |
-| any running state | worker ends normally | | Finished, recorded | `finish(Some)` (`app.rs:245`): marks lose `pending` and `running`; `log`, `workflows`, `run`, `error = save error`; `review = None`; `stream = None`. |
-| any running state | worker panics | | Finished, crashed | `finish(None)`: the same clean-up with `run = None` and the fixed error. |
+| any running state | worker ends normally | | Finished, recorded | `Session::finish(Some)`: marks lose `pending` and `running`; `log`, `workflows`, `run`, `error = save error`; `review = None`; `stream = None`. |
+| any running state | worker panics | | Finished, crashed | `Session::finish(None)`: the same clean-up with `run = None` and the fixed error. |
 | any finished state | `cancel_run` | | *Self* | Error `this run has already finished`. |
-| any | `Progress::Node/Log/Text/Output/Workflow` (`app.rs:286`) | only the worker sends these, so only while running | *Self* | Marks, bounded feed events, bounded log, stream tail, bounded live outputs. |
+| any | `Progress::Node/Log/Text/Output/Workflow` (`Session::progress`) | only the worker sends these, so only while running | *Self* | Marks, bounded feed events, bounded log, stream tail, bounded live outputs. |
 
-Derived value `cancelling` is `running && cancel` (`app.rs:331`), so it is false in both
+Derived value `cancelling` is `running && cancel` (`Session::value`), so it is false in both
 finished states even though the flag stays set.
 
 Invariants:
@@ -118,17 +119,17 @@ Invariants:
 - R6. Feed event `seq` is strictly increasing; the renderer rejects anything else
   (`frontend/responses.ts`, the `runtime` schema).
 - R7. A completed output replaces every earlier `text` event for the same node and clears
-  `stream` when it was that node's (`app.rs:194` onwards).
+  `stream` when it was that node's (`Session::completed_output`).
 
 ### 2.3 Review decision
 
-`review::wait` (`src/review.rs:52`) publishes a `Pending` holding the sender of a
-`sync_channel(1)` and polls the receiver every 50 ms while watching the cancel flag.
+`review::wait` publishes a `Pending` holding the sender of a `sync_channel(1)` and polls
+the receiver every 50 ms while watching the cancel flag.
 
 | From | Trigger | To | Result for the worker |
 | --- | --- | --- | --- |
-| Published | `decide(Apply)` succeeds (`review.rs:47`) and cancel is clear on receipt | Decided | `Ok(Apply)`; then `Batch::verify` (`review.rs:159`) must find every file unchanged, or the batch fails before the first write. |
-| Published | `decide(Reject)` | Decided | `Ok(Reject)`, turned into `review::REJECTED`. |
+| Published | `Pending::decide(Apply)` succeeds and cancel is clear on receipt | Decided | `Ok(Apply)`; then `Batch::verify` must find every file unchanged, or the batch fails before the first write. |
+| Published | `Pending::decide(Reject)` | Decided | `Ok(Reject)`, turned into `review::REJECTED`. |
 | Published | cancel flag set (by `Session::cancel`, which also sends `Reject`) | Cancelled | `Err(CANCELLED)`, checked before and after receipt, so cancel wins over a decision already in the channel. |
 | Published | every `Pending` clone dropped without a decision | Closed | `Err("the file review was closed")`. |
 | Decided | a second `decide` | *Self* | `try_send` fails on the full channel: `false`, surfaced as `this review has already been answered`. |
@@ -138,19 +139,19 @@ Invariants:
 - V1. Exactly one decision is ever delivered for one review; the channel capacity is one and
   the sender never blocks.
 - V2. Nothing is written before `verify` passes, and `verify` runs after the decision, so a
-  file changed during the wait stops the whole batch (`exec.rs:1784` onwards).
+  file changed during the wait stops the whole batch (`Runner::review_writes`).
 - V3. Review ids are unique within a session (`{run_id}-review-{seq}`), so a decision for
   an earlier review cannot be applied to a later one.
 
 ### 2.4 Executor node
 
-Per run, each node moves through the states below. `NodeState` (`exec.rs:233`) is what
-the progress sink sees; the `Runner` maps are the source of truth.
+Per run, each node moves through the states below. `NodeState` is what the progress sink
+sees; the `Runner` maps are the source of truth.
 
 | State | In the runner | Progress event |
 | --- | --- | --- |
 | Unvisited | in none of the maps | none |
-| Ordered | appears in a target's `execution_order` (`exec.rs:1195`) after `validate_node` | none |
+| Ordered | appears in a target's `Runner::execution_order` after `validate_node` | none |
 | Reused | `done[id]`, `reused` contains id | `Reused` then `Output` |
 | Running | own step started | `Running` |
 | Done | `done[id]` | `Done` then `Output` |
@@ -163,17 +164,17 @@ Transitions:
 | --- | --- | --- | --- |
 | Unvisited | a target's walk reaches it | `validate_node` passes; `check_cancel` | Ordered |
 | Unvisited | `validate_node` fails or the walk finds a cycle | | Failed (for the node the error names) and Blocked (for the target) |
-| Ordered | cache has the key and `fresh` is false (`exec.rs:1338`) | agent or script node only; other kinds always run | Reused |
+| Ordered | cache has the key and `fresh` is false (`Runner::run_fresh`) | agent or script node only; other kinds always run | Reused |
 | Ordered | otherwise | `check_cancel` | Running |
 | Running | step returns `Ok` | | Done; the output is stored in the cache when it has a key |
 | Running | step returns `Err(e)`, `e != CANCELLED` | first failure of this node | Failed |
-| Running | step returns `Err(CANCELLED)` | | Blocked (no `Failed` event; `record_failure`, `exec.rs:1183`) |
+| Running | step returns `Err(CANCELLED)` | | Blocked (no `Failed` event; `Runner::record_failure`) |
 | any | a later target asks for the node | `done` hit returns the earlier result; `errors` hit returns the earlier error | *Self* |
 | Ordered or Unvisited | an earlier step in the same order failed | | Blocked (the target inherits the error) |
 
-Run-level outcome (`run_prepared`, `exec.rs:658`): the result is the last target's output
-unless any target failed, in which case it is the first error; a `CANCELLED` error stops
-the loop and becomes the result (`exec.rs:711`).
+Run-level outcome (`run_prepared`): the result is the last target's output unless any
+target failed, in which case it is the first error; a `CANCELLED` error stops the loop and
+becomes the result (`run_prepared` cancel break).
 
 Invariants:
 
@@ -181,8 +182,8 @@ Invariants:
   every step).
 - N2. `Failed` is emitted at most once per node and never for `CANCELLED`.
 - N3. The set of ids in `Report.failures` equals the set of nodes for which `Failed` was
-  emitted, and `failed` is `failures[0]` (`exec.rs:1183`). Before this change the report
-  carried only `failed`; see finding B.
+  emitted, and `failed` is `failures[0]` (`Runner::record_failure`). Before this change the
+  report carried only `failed`; see finding B.
 - N4. Nothing is cached or saved after cancellation is observed: `run_agent` checks the
   flag after the reply and before `write_agent_output`; `run_process` returns `CANCELLED`
   before returning any bytes.
@@ -191,7 +192,7 @@ Invariants:
 
 ### 2.5 Run record
 
-`history::record` (`history.rs:225`) turns a `Report` into a `Run`.
+`history::record` turns a `Report` into a `Run`.
 
 | Report | Record |
 | --- | --- |
@@ -200,12 +201,12 @@ Invariants:
 | `result: Err(other)` | `Outcome::Failed { error }` |
 | `outputs[id]`, id in `reused` | `nodes[id].state = Reused` |
 | `outputs[id]`, otherwise | `nodes[id].state = Ran` |
-| `(id, error)` in `failures` | `nodes[id].state = Failed`, `error` kept (`history.rs:263`) |
+| `(id, error)` in `failures` | `nodes[id].state = Failed`, `error` kept (`history::record` failures loop) |
 | `failed` | `Run.failed`: the node that failed first, named by the headline and leading `Run::report().failures` |
 
 File lifecycle: written once by the worker as `runs/<graph>/<id>.json` with a unique
 suffix on collision; the oldest beyond 200 per graph are removed on the next save; moved
-by `rename` (`history.rs:518`); removed by `clear` and by `delete_graph`.
+by `history::rename`; removed by `clear` and by `delete_graph`.
 
 Invariants:
 
@@ -215,7 +216,7 @@ Invariants:
 - H3. `Outcome::Cancelled` may carry `Failed` nodes: an earlier target's own failure is kept
   (see finding B). Nodes stopped by the cancel itself are absent.
 - H4. The `graph` field of a listed record equals the directory it was listed from
-  (`history.rs:496`). The stored field can be stale after a rename; see finding A.
+  (`history::list`). The stored field can be stale after a rename; see finding A.
 - H5. A record's node states match the session's final marks: `Ran`, `Reused` and `Failed`
   carry over one to one, and nodes without a final state are absent from both (R3).
 - H6. `Run.failed` is the node that failed first and matches the outcome's error; the
@@ -232,12 +233,12 @@ Invariants:
 
 | From | Trigger | To |
 | --- | --- | --- |
-| Absent | `store` after a step (`exec.rs:351`) | In memory and On disk (disk failure costs persistence only) |
-| Absent | `keep` from `record_node` for outputs up to 8 MB (`exec.rs:363`) | On disk |
+| Absent | `Cache::store` after a step | In memory and On disk (disk failure costs persistence only) |
+| Absent | `Cache::keep` from `record_node` for outputs up to 8 MB | On disk |
 | On disk | `keep` again | *Self*, modification time touched so pruning treats it as recent |
-| On disk | `lookup` with a matching key (`exec.rs:331`) | In memory and On disk |
-| On disk | `prune` while the directory exceeds 1 GB, oldest first (`exec.rs:447`) | Absent on disk; memory entries stay valid |
-| any | `clear` (`exec.rs:312`) | Absent |
+| On disk | `Cache::lookup` with a matching key | In memory and On disk |
+| On disk | `Cache::prune` while the directory exceeds 1 GB, oldest first | Absent on disk; memory entries stay valid |
+| any | `Cache::clear` | Absent |
 | On disk | a read finds a size or checksum mismatch | treated as Absent |
 
 Invariants:
@@ -249,13 +250,13 @@ Invariants:
 
 ### 2.7 Child process
 
-`run_process` (`exec.rs:2739`) owns one child and three pipe threads.
+`run_process` owns one child and three pipe threads.
 
 | From | Trigger | To | Result |
 | --- | --- | --- | --- |
 | Spawned | `spawn` fails | | `Err` naming the program |
 | Running | child exits and all three pipe threads finish | Finished | `Ok(Finished { timed_out: false })` |
-| Running or Exited with open pipes | cancel flag set | Killed | process group killed; `Err(CANCELLED)` (`exec.rs:2795` onwards) |
+| Running or Exited with open pipes | cancel flag set | Killed | process group killed; `Err(CANCELLED)` (`run_process` cancel path) |
 | Running or Exited with open pipes | deadline passes | Killed | process group killed; `Ok(Finished { timed_out: true })`, which the caller turns into a timeout error |
 | any | a stream passes 64 MB | Finished | `Err` naming the cap |
 
@@ -266,7 +267,7 @@ so a grandchild holding the pipe cannot keep the run alive.
 
 | From | Trigger | To | Result |
 | --- | --- | --- | --- |
-| Streaming | `on_text` returns false (`providers.rs:443`) | Stopped | `Err(STOPPED)`; `run_agent` maps it to `CANCELLED` because the callback returns false only when the cancel flag is set |
+| Streaming | `on_text` returns false (`Stream::feed`) | Stopped | `Err(STOPPED)`; `run_agent` maps it to `CANCELLED` because the callback returns false only when the cancel flag is set |
 | Streaming | an event carries an error | Error | `Err(message)` |
 | Streaming | the reply ends with no streamed text or with status 400 or above | Fallback | parsed as one whole reply |
 | Streaming | the reply ends | Finished | text validated for the output type |
@@ -275,10 +276,10 @@ so a grandchild holding the pipe cannot keep the run alive.
 
 | From | Trigger | To | Effect |
 | --- | --- | --- | --- |
-| Open | window close button (`main.rs:100`) | Close requested | `prevent_close`; `close-requested` emitted to the renderer |
-| Open | quit from the menu or dock, `code == None` (`main.rs:119`) | Close requested | `prevent_exit`; `close-requested` emitted |
-| Close requested | renderer calls `quit` (`main.rs:34`) | Exiting | `exit(0)` carries a code, so the handler lets it through |
-| Exiting | `ExitRequested` with a code | Exited | `cancel_active`; wait up to 2 s for `running` to clear so child processes die (`main.rs:127`) |
+| Open | window close button (`on_window_event` `CloseRequested`) | Close requested | `prevent_close`; `close-requested` emitted to the renderer |
+| Open | quit from the menu or dock, `code == None` (`ExitRequested`) | Close requested | `prevent_exit`; `close-requested` emitted |
+| Close requested | renderer calls `quit` | Exiting | `exit(0)` carries a code, so the handler lets it through |
+| Exiting | `ExitRequested` with a code | Exited | `cancel_active`; wait up to 2 s for `running` to clear so child processes die |
 
 In smoke mode the window closes without asking.
 
@@ -297,7 +298,7 @@ In smoke mode the window closes without asking.
 | From | Trigger | Guard | To | Effect |
 | --- | --- | --- | --- | --- |
 | any | `updateGraph` / `updateNode` | not read only; same epoch | Dirty | undo entry pushed; redo cleared |
-| Dirty | `save` (`App.tsx:1000`) | `saveInFlight` false | Clean if no edit landed during the request, else Dirty | `savedKey` set only when the document is unchanged; library refreshed |
+| Dirty | `save` | `saveInFlight` false | Clean if no edit landed during the request, else Dirty | `savedKey` set only when the document is unchanged; library refreshed |
 | any | `newGraph` / `openGraph` | not `occupied`; no run is being prepared or started; `discardDraft` agreed; navigation counter unchanged | Clean | epoch incremented; history, selection, children, shown run and attached run reset |
 | Clean | `deleteGraph` of the open graph | | Dirty | `savedKey = null` |
 | any | `renameGraph` of the open graph | not `occupied` | *Self* | name replaced; `savedKey` follows only when clean; the shown run, the history list and the remembered per-node runs are re-keyed to the new name (finding A) |
@@ -313,9 +314,9 @@ Invariants:
 
 ### 3.2 Run, as the renderer sees it
 
-Derived values (`App.tsx:319` onwards): `running` is `runtime.running || pendingRunId`,
-`occupied` is `running || form || busy`, `runMatches` is `runtime.run_id === attachedRun`,
-`currentRun` is `shownRun`, else the attached runtime's record.
+Derived values in `App`: `running` is `runtime.running || pendingRunId`, `occupied` is
+`running || form || busy`, `runMatches` is `runtime.run_id === attachedRun`, `currentRun`
+is `shownRun`, else the attached runtime's record.
 
 | State | Signals |
 | --- | --- |
@@ -333,18 +334,18 @@ Derived values (`App.tsx:319` onwards): `running` is `runtime.running || pending
 
 | From | Trigger | Guard | To | Effect |
 | --- | --- | --- | --- | --- |
-| Idle | Run button, ⌘↵, node Run (`prepareRun`, `App.tsx:1116`) | not read only, not `occupied`, none of the three run refs set | Preparing | root navigation counter bumped so an in-flight open cannot land |
+| Idle | Run button, ⌘↵, node Run (`prepareRun`) | not read only, not `occupied`, none of the three run refs set | Preparing | root navigation counter bumped so an in-flight open cannot land |
 | Preparing | `prepare_run` returns | same epoch; document unchanged, else error `The workflow changed while preparing` | Form when fields exist, else Starting | last run's inputs prefilled by field name |
-| Form | Start run (`startRun`, `App.tsx:1075`) | `startingRun`, `pendingRun`, `runtime.running` all clear | Starting | |
+| Form | Start run (`startRun`) | `startingRun`, `pendingRun`, `runtime.running` all clear | Starting | |
 | Starting | `start_run` fails | | Form with error when fields exist, else Idle with the error | |
 | Starting | `start_run` returns an id | | Pending | `attachedRun`, panel, notice set; form cleared; one status read follows |
-| Pending | a status read returns that id (`readRuntime`, `App.tsx:426`) | | Running | `pendingRun` cleared |
+| Pending | a status read returns that id (`readRuntime`) | | Running | `pendingRun` cleared |
 | Running | poll sees `review` | | Awaiting review | |
-| Awaiting review | Apply or Reject (`reviewDecision`, `App.tsx:1173`) | `decidingReview` false | Deciding | buttons disabled until the service's answer is read |
+| Awaiting review | Apply or Reject (`reviewDecision`) | `decidingReview` false | Deciding | buttons disabled until the service's answer is read |
 | Deciding | request settles | | Running (or Completed when the read shows it) | `decidingReview` cleared |
 | Running or Awaiting review | Cancel run | | Cancelling | notice `Cancelling…` |
-| Running, Awaiting review, Cancelling, Pending | poll sees `!running` with a record or an error (`App.tsx:505`) | `run_id === attachedRun` and not yet completed | Completed | record remembered per node; history refreshed; notice shown unless Historical; a service error is shown whichever run is on display |
-| Completed or Idle | Inspect this run (`App.tsx:2383`) | not `occupied` | Historical | run panel shows the chosen record |
+| Running, Awaiting review, Cancelling, Pending | poll sees `!running` with a record or an error (`poll` completion check) | `run_id === attachedRun` and not yet completed | Completed | record remembered per node; history refreshed; notice shown unless Historical; a service error is shown whichever run is on display |
+| Completed or Idle | Inspect this run (`onOpenHistory`) | not `occupied` | Historical | run panel shows the chosen record |
 | Historical | a new run starts, or `newGraph` / `openGraph` | | Idle then Pending, or Idle | `historical` cleared |
 | Completed or Historical | Clear history | not running | Idle | `attachedRun`, `shownRun`, remembered outputs cleared |
 
@@ -362,10 +363,10 @@ Invariants:
 
 ### 3.3 Runtime polling
 
-`readRuntime` (`App.tsx:410`) numbers every status read. A result is applied only when its
-number is not below the last applied one and the caller's `isCurrent` still holds; an
-error from an older read is swallowed. The poll runs every 150 ms while running, every
-second otherwise, and every 150 ms after a result it could not apply.
+`readRuntime` numbers every status read. A result is applied only when its number is not
+below the last applied one and the caller's `isCurrent` still holds; an error from an
+older read is swallowed. The poll runs every 150 ms while running, every second otherwise,
+and every 150 ms after a result it could not apply.
 
 | Situation | Outcome |
 | --- | --- |
@@ -377,20 +378,20 @@ second otherwise, and every 150 ms after a result it could not apply.
 
 ### 3.4 Output retrieval
 
-`RunOutput` (`RunPanel.tsx:287`) fetches the full output when the record's preview is
-incomplete or missing. Its identity covers the context (graph, run id, node path), the
-output name, the key, the preview and the completeness; a change in any resets the
-loaded state. States: idle, loading, loaded, failed; **Retry output** increments `attempt`
-and re-issues the request; **Load full output** drops the 256 KB limit. The inspector's
-`Output` (`Inspector.tsx:2144`) is the manual counterpart: **View full output** loads on
-request and a changed identity discards the result.
+`RunOutput` fetches the full output when the record's preview is incomplete or missing.
+Its identity covers the context (graph, run id, node path), the output name, the key, the
+preview and the completeness; a change in any resets the loaded state. States: idle,
+loading, loaded, failed; **Retry output** increments `attempt` and re-issues the request;
+**Load full output** drops the 256 KB limit. The inspector's `Output` is the manual
+counterpart: **View full output** loads on request and a changed identity discards the
+result.
 
 Invariant O1: a response is kept only when its request identity still matches, so a result
 for another run or node is never shown.
 
 ### 3.5 Quit
 
-`closeRequested` (`App.tsx:1379`) answers the shell's `close-requested` event.
+`closeRequested` answers the shell's `close-requested` event.
 
 | `dirty` | run active | Behaviour |
 | --- | --- | --- |
@@ -437,12 +438,12 @@ pinned by the tests named.
   `AppService::output` looks the run up under it, so after a rename every truncated output
   of every earlier run answered `the run or completed live output is no longer stored`.
   Once a later run replaced the live session the error was permanent.
-- **Fix**: `history::list` sets `run.graph` to the directory it listed (`history.rs:496`).
-  Existing workspaces are repaired on read; `rename` needs no change. The renderer keeps
-  its own copies of runs (`shownRun`, `history`, `remembered.origins`), all belonging to
-  the open document, and re-keys them when that document is renamed (`App.tsx:1291`);
-  otherwise the inspector would keep asking under the old name once a later run had
-  replaced the live session.
+- **Fix**: `history::list` sets `run.graph` to the directory it listed. Existing
+  workspaces are repaired on read; `rename` needs no change. The renderer keeps its own
+  copies of runs (`shownRun`, `history`, `remembered.origins`), all belonging to the open
+  document, and re-keys them when that document is renamed (`renameGraph`); otherwise the
+  inspector would keep asking under the old name once a later run had replaced the live
+  session.
 - **Tests**: `history::tests::renamed_records_report_the_directory_they_are_listed_from`,
   `app::tests::history_outputs_stay_reachable_under_a_renamed_graph`,
   `tests/run-lifecycle.spec.ts` "renaming the open workflow re-keys its remembered runs".
@@ -459,11 +460,11 @@ pinned by the tests named.
   (`exec::tests::independent_failures_each_get_a_failed_state` already proved both
   `Failed` events were emitted).
 - **Fix**: `Report.failures` records every own-step failure with its error
-  (`exec.rs:182`, `exec.rs:1183`); `history::record` writes each as a `Failed` node
-  regardless of outcome and stores `Report.failed` as `Run.failed`, so the headline and
-  `Run::report` name the node that failed first rather than the first by id (`history.rs`,
-  `record` and `first_failed`). Records written before `failed` existed fall back to the
-  first failed node by id.
+  (`Runner::record_failure`); `history::record` writes each as a `Failed` node regardless
+  of outcome and stores `Report.failed` as `Run.failed`, so the headline and `Run::report`
+  name the node that failed first rather than the first by id (`history::record` and
+  `Run::first_failed`). Records written before `failed` existed fall back to the first
+  failed node by id.
 - **Tests**: the two executor tests above now assert the record; the history `report()`
   helper derives `failures` the way the executor does.
 
@@ -476,10 +477,10 @@ pinned by the tests named.
 - **Reached by**: the worker's `catch_unwind` path set `running = false` and `error` but
   skipped the clean-up that lived in the success closure; the renderer's completion check
   required `state.run`, which a crashed worker never produces.
-- **Fix**: `Session::finish(Option<..>)` is the single exit for both paths
-  (`app.rs:245`); the poll treats `!running && (run || error)` as terminal
-  (`App.tsx:505`) and reports `Run failed` with the error. The error is shown even while
-  a history run is on display: it belongs to the run that ended, not to the one shown.
+- **Fix**: `Session::finish(Option<..>)` is the single exit for both paths; the poll treats
+  `!running && (run || error)` as terminal (`poll` completion check) and reports
+  `Run failed` with the error. The error is shown even while a history run is on display:
+  it belongs to the run that ended, not to the one shown.
 - **Tests**: `app::tests::a_crashed_worker_leaves_no_pending_or_running_marks`;
   `tests/run-lifecycle.spec.ts`, "a run whose worker stopped without a record".
 
@@ -492,7 +493,7 @@ pinned by the tests named.
   error although the decision had been applied. The interval grows with the size of the
   status payload the poll is serialising at the time.
 - **Fix**: `decidingReview` and the `deciding` state disable Apply and Reject while a
-  decision is in flight (`App.tsx:1173`); Cancel run stays available.
+  decision is in flight (`reviewDecision`); Cancel run stays available.
 - **Tests**: `tests/run-lifecycle.spec.ts`, "a review decision is sent once"; the
   service's own refusal of a duplicate was already pinned by
   `app::tests::pending_review_blocks_second_run_and_rejects_stale_decisions`.
@@ -503,7 +504,7 @@ pinned by the tests named.
   (violates X7). The existing dialog text already said quitting cancels the run, but the
   question was only asked when the document was dirty.
 - **Reached by**: ⌘Q or the close button after saving while an agent run was still going.
-- **Fix**: the prompt now covers the clean-and-running case (`App.tsx:1379`).
+- **Fix**: the prompt now covers the clean-and-running case (`closeRequested`).
 - **Tests**: `tests/run-lifecycle.spec.ts`, "a saved, idle workflow quits at once" and
   "quitting while a run is in progress asks first". The Playwright fixture now emulates
   the shell's event listener registration and the `quit` command
@@ -566,6 +567,6 @@ Paths that looked suspicious and held up, so they need not be re-derived:
 
 When a change adds a flag, an `Option`, a ref that gates an action, or a new error string
 on an IPC request, it has changed one of these machines. Add the row, state the invariant
-it protects, and point the regression test at it here. A finding that is fixed moves from
-section 5 into the tables above with a pointer to its test; a finding that is accepted
-goes into 5.1 with the reason.
+it protects, and point the regression test at it here. Cite symbols by name, not by line.
+A finding that is fixed moves from section 5 into the tables above with a pointer to its
+test; a finding that is accepted goes into 5.1 with the reason.
