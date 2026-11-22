@@ -339,7 +339,9 @@ is `shownRun`, else the attached runtime's record.
 | Preparing | `prepare_run` returns | same epoch; document unchanged, else error `The workflow changed while preparing` | Form when fields exist, else Starting | last run's inputs prefilled by field name |
 | Form | Start run (`startRun`) | `startingRun`, `pendingRun`, `runtime.running` all clear | Starting | |
 | Starting | `start_run` fails | | Form with error when fields exist, else Idle with the error | |
+| Starting | `start_run` fails but `runtime_state` already shows this graph running | | Pending / Running | attach to that session (lost reply); form cleared |
 | Starting | `start_run` returns an id | | Pending | `attachedRun`, panel, notice set; form cleared; one status read follows |
+| Idle or Completed | poll sees a running session for the open graph (`poll` orphan attach) | not already attached; no `pendingRun` or `startingRun` | Running | `attachedRun` set; form cleared; run panel shown |
 | Pending | a status read returns that id (`readRuntime`) | | Running | `pendingRun` cleared |
 | Running | poll sees `review` | | Awaiting review | |
 | Awaiting review | Apply or Reject (`reviewDecision`) | `decidingReview` false | Deciding | buttons disabled until the service's answer is read |
@@ -354,7 +356,8 @@ Invariants:
 
 - F1. One `start_run` per user intent: `preparingRun`, `startingRun` and `pendingRun` each
   block a second entry, and a failed first status read keeps `pendingRun` so the same run
-  cannot be resubmitted.
+  cannot be resubmitted. A lost `start_run` reply still attaches via the live runtime or
+  the next poll so the run is not left unowned.
 - F2. One decision per review: `decidingReview` blocks the second click (finding D).
 - F3. Navigation, rename, delete, duplicate and Clear history are disabled while
   `occupied`, matching the service's `idle()` guard. Rename, delete and duplicate are
@@ -538,6 +541,19 @@ named.
   session is discarded.
 - **Tests**: `app::tests::a_spawn_failure_keeps_the_previous_finished_session`.
 
+### H. Lost `start_run` reply left the service session unattached (medium)
+
+- **Invalid state**: service `Occupied, running` while the renderer has no `attachedRun`
+  for that id: Cancel and the review panel still work from `runtime_state`, but the run
+  panel stays empty and completion is never announced (violates F1's ownership and X1).
+- **Reached by**: the service accepted `start_run` and spawned the worker, then the IPC
+  reply failed or never arrived, so `startRun` never set `attachedRun` / `pendingRun`.
+- **Fix**: when `start_run` errors but `runtime_state` already shows this graph running,
+  `startRun` attaches to that session; the poll also attaches any orphan running session
+  whose graph matches the open document.
+- **Tests**: `async-actions.spec.ts` "a lost start_run reply still attaches to the service
+  session that accepted it".
+
 ### 5.1 Reachable but left as is
 
 These are real but low impact, or the alternative would cost an intended behaviour. Each
@@ -545,7 +561,6 @@ is listed so a later change does not mistake them for oversights.
 
 | Situation | What happens | Why unchanged |
 | --- | --- | --- |
-| `start_run` accepted but its reply never reaches the renderer | The service runs an unattached session: Cancel works, the review panel shows, but the run panel is empty and completion is not announced. | Only a transport failure between the webview and the shell produces this. A restart attaches to a running session (3.3). |
 | Live outputs over 4 MB in total while a run is still going | `output` answers `no longer stored` for the evicted node until the record exists; **Retry output** then works. | Bound is deliberate; the record recovers the output. |
 | A history run is inspected in the gap between a review decision and the completion poll | The completion notice is suppressed to keep the chosen run on screen; results and history are still recorded, and a service error is still shown. | Intended, pinned by `run-history.spec.ts`. |
 | Undo after renaming the open graph | The old name comes back; saving recreates the old file. | Undo restores documents, and the name is part of the document. |
@@ -580,7 +595,7 @@ Paths that looked suspicious and held up, so they need not be re-derived:
 | P1 | `exec::tests::process_timeout_covers_pipes_inherited_by_grandchildren`, `exec::tests::cancellation_covers_pipes_inherited_by_grandchildren` |
 | V2 | `exec::tests::a_stale_file_stops_an_approved_batch_before_its_first_write` |
 | R6, R7 feed bounds | `app::tests::feed_preserves_order_coalesces_text_and_replaces_completed_streams`, `app::tests::feed_retention_is_bounded_and_flags_utf8_truncation_and_real_evictions` |
-| F1 | `async-actions.spec.ts` "preparing a run blocks repeated execution", "an accepted run cannot be resubmitted" |
+| F1 | `async-actions.spec.ts` "preparing a run blocks repeated execution", "an accepted run cannot be resubmitted", "a lost start_run reply still attaches to the service session that accepted it" |
 | F2 | `run-lifecycle.spec.ts` "a review decision is sent once" |
 | F3 save-vs-mutate | `async-workspace.spec.ts` "rename, delete and duplicate wait for an in-flight save, while open stays available" |
 | F4, X1 | `run-lifecycle.spec.ts` "a run whose worker stopped without a record" |

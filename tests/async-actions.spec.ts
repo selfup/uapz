@@ -147,6 +147,63 @@ test("a graph load started before Run cannot replace its pending input document"
   expect((await callsFor(page, "start_run"))[0]?.args.doc).toEqual(parent);
 });
 
+test("a lost start_run reply still attaches to the service session that accepted it", async ({
+  page,
+}) => {
+  await page.getByRole("button", { name: "Run workflow", exact: true }).click();
+  await queueReply(page, {
+    method: "start_run",
+    gate: "lost-start-reply",
+    error: "IPC reply lost",
+  });
+  await page.getByRole("button", { name: "Start run", exact: true }).click();
+  await pending(page, "lost-start-reply");
+  // The service accepted the run before the reply failed; mirror that here.
+  await page.evaluate((doc) => {
+    const state = (window as any).__testState;
+    state.runtime = {
+      run_id: "live-1",
+      running: true,
+      cancelling: false,
+      graph: structuredClone(doc),
+      targets: ["n2"],
+      marks: { n0: "ran", n1: "ran", n2: "running", "n1/n4": "ran" },
+      log: ["n1/n4: completed"],
+      stream: null,
+      workflows: {},
+      review: {
+        id: "review-1",
+        node: "n2",
+        files: [
+          {
+            path: "heading.md",
+            before_bytes: null,
+            after_bytes: 8,
+            diff: "+ Example\n",
+          },
+        ],
+      },
+      run: null,
+      error: null,
+    };
+  }, parent);
+  await releaseReply(page, "lost-start-reply");
+  await expect(
+    page.getByRole("region", { name: "Review file changes" }),
+  ).toBeVisible();
+  await expect(page.getByRole("status")).toContainText("Waiting for review");
+  await expect(
+    page.getByRole("button", { name: "Start run", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("banner").getByRole("button", { name: "Cancel run" }),
+  ).toBeVisible();
+  // Completion only announces when the renderer attached to this run_id.
+  await page.getByRole("button", { name: "Apply changes", exact: true }).click();
+  await expect(page.getByRole("status")).toContainText("Completed");
+  expect(await callsFor(page, "start_run")).toHaveLength(1);
+});
+
 for (const unavailable of ["error", "null"] as const) {
   test(`an accepted run cannot be resubmitted when its first status response is ${unavailable}`, async ({
     page,

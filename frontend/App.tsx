@@ -491,6 +491,24 @@ export default function App() {
               void action(() => openGraph(last.name));
           }
         }
+        // The service may have accepted start_run while the reply never landed.
+        // Attach so the run panel, completion notice and F1 guards still work.
+        if (
+          state?.running &&
+          state.run_id !== attachedRun &&
+          !pendingRun.current &&
+          !startingRun.current &&
+          safeGraphName(state.graph.name) ===
+            safeGraphName(graphRef.current.name)
+        ) {
+          setAttachedRun(state.run_id);
+          setPendingRunId(null);
+          setForm(null);
+          setShownRun(null);
+          setHistorical(false);
+          setPanel("run");
+          setNotice("Workflow is running");
+        }
         if (state?.running) delay = 150;
         // A run ends with a record, or with only an error when its worker
         // stopped before writing one. Both are terminal: the editor comes
@@ -1091,6 +1109,33 @@ export default function App() {
           fresh: prepared.fresh,
         });
       } catch (error) {
+        // The worker may already be running when the reply is lost. Attach to
+        // that session instead of offering the form again (which would look
+        // like the run never started).
+        let live = runtimeRef.current;
+        if (!live?.running) {
+          try {
+            const { state } = await readRuntime(() => true);
+            live = state;
+          } catch {
+            // Status may be unavailable too; fall through to the form error.
+          }
+        }
+        if (
+          live?.running &&
+          live.run_id &&
+          safeGraphName(live.graph.name) === safeGraphName(prepared.graph.name)
+        ) {
+          pendingRun.current = live.run_id;
+          setPendingRunId(live.run_id);
+          setAttachedRun(live.run_id);
+          setForm(null);
+          setShownRun(null);
+          setHistorical(false);
+          setPanel("run");
+          setNotice("Workflow is running");
+          return;
+        }
         if (prepared.fields.length) {
           setForm({ ...prepared, error: messageOf(error) });
           return;
