@@ -11,7 +11,7 @@ export type WorkflowGraphs = Record<string, GraphDoc>;
 export type Port = { id: string; missing: boolean };
 export type Point = { x: number; y: number };
 
-const labels: Record<NodeType, string> = {
+export const NODE_LABELS: Record<NodeType, string> = {
   input: "Run input",
   workflow: "Workflow",
   agent: "Agent",
@@ -32,7 +32,7 @@ export function typedData(node: NodeDoc): NodeData | undefined {
   )
     return undefined;
   const type = (data as Record<string, unknown>).type;
-  return typeof type === "string" && Object.hasOwn(labels, type)
+  return typeof type === "string" && Object.hasOwn(NODE_LABELS, type)
     ? (data as NodeData)
     : undefined;
 }
@@ -56,7 +56,7 @@ export function nodeLabel(node: NodeDoc): string {
     (data
       ? data.type === "database" && !data.read_only
         ? "Database (write)"
-        : labels[data.type]
+        : NODE_LABELS[data.type]
       : "Blank node")
   );
 }

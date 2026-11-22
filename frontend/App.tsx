@@ -8,30 +8,34 @@ import {
 } from "react";
 import {
   ArrowLeft,
-  ArrowUpRight,
   Boxes,
   ChevronRight,
   CircleHelp,
   Files,
-  FolderOpen,
   PanelLeft,
   PanelRight,
   Pencil,
   Play,
   Plus,
   Redo2,
-  RefreshCw,
   Save,
-  Search,
   Square,
-  Trash2,
   Undo2,
   X,
 } from "lucide-react";
-import Canvas, { LIBRARY_DRAG_TYPE } from "./Canvas";
-import ComboInput from "./ComboInput";
+import Canvas from "./Canvas";
 import Inspector from "./Inspector";
 import RunPanel from "./RunPanel";
+import { ConfirmDialog, ShortcutsDialog, type Choice } from "./dialogs";
+import { clamp, readLayout, writeLayout, type Theme } from "./layout";
+import LibraryPanel, { LibraryRow, type LibraryGroup } from "./LibraryPanel";
+import {
+  parseLibraryItem,
+  type CreateType,
+  type LibraryItem,
+} from "./library";
+import ReviewPanel from "./ReviewPanel";
+import RunInputForm from "./RunInputForm";
 import { onHostEvent, quitApp, request } from "./api";
 import {
   CARD_SIZE,
@@ -43,6 +47,8 @@ import {
   freePosition,
   graphToFlowPoint,
   nextNodeId,
+  NODE_COLORS,
+  NODE_LABELS,
   nodeColor,
   nodeLabel,
   scriptRuntimeFor,
@@ -50,14 +56,13 @@ import {
   type Placement,
   type Point,
 } from "./graph";
+import { deriveRunView } from "./runView";
 import {
   callAt,
   childInterfaces,
   emptyGraph,
   firstSelection,
-  localMarks,
   normalizeGraph,
-  runMarks,
   safeGraphName,
 } from "./workspace";
 import type {
@@ -81,19 +86,8 @@ interface ChildView {
   selected: string | null;
   snapshot: boolean;
 }
-const labels: Record<NodeType, string> = {
-  input: "Run input",
-  workflow: "Workflow",
-  agent: "Agent",
-  database: "Database",
-  script: "Script",
-  data: "Data",
-  directory: "Directory",
-  file: "Write file",
-};
 const messageOf = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
-type CreateType = NodeType | "blank" | "database-write";
 function createData(type: CreateType): NodeData | undefined {
   if (type === "blank") return undefined;
   if (type === "database-write") {
@@ -102,42 +96,6 @@ function createData(type: CreateType): NodeData | undefined {
   }
   return defaultNodeData(type as NodeType);
 }
-const LAYOUT_KEY = "uapz.layout";
-type Theme = "system" | "dark" | "light";
-interface Layout {
-  leftWidth?: number;
-  rightWidth?: number;
-  libraryOpen?: boolean;
-  inspectorOpen?: boolean;
-  theme?: Theme;
-  lastGraph?: { workspace: string; name: string };
-}
-/** Per-user conveniences only. Storage can be missing, blocked or cleared, and
- * the app must behave the same without it. */
-function readLayout(): Layout {
-  try {
-    const raw = window.localStorage.getItem(LAYOUT_KEY);
-    const value: unknown = raw ? JSON.parse(raw) : null;
-    return value && typeof value === "object" ? (value as Layout) : {};
-  } catch {
-    return {};
-  }
-}
-function writeLayout(patch: Layout) {
-  try {
-    window.localStorage.setItem(
-      LAYOUT_KEY,
-      JSON.stringify({ ...readLayout(), ...patch }),
-    );
-  } catch {
-    // The layout memory is optional.
-  }
-}
-const clamp = (value: unknown, low: number, high: number, fallback: number) =>
-  typeof value === "number" && Number.isFinite(value)
-    ? Math.min(high, Math.max(low, value))
-    : fallback;
-type Choice = "cancel" | "confirm" | "alternative";
 /** The workflows the service can install from its bundled examples. */
 const EXAMPLE_NAMES = [
   "reviewed-note",
@@ -145,60 +103,6 @@ const EXAMPLE_NAMES = [
   "note-parts",
   "use-note-parts",
 ];
-const SHORTCUTS: [string, string][] = [
-  ["⌘S", "Save the workflow"],
-  ["⌘↵", "Run the workflow"],
-  ["⌘⇧↵", "Run the workflow without cached outputs"],
-  ["⌘N", "Add a node of the selected type"],
-  ["⌘⇧N", "New workflow"],
-  ["⌘Z · ⌘⇧Z", "Undo · redo"],
-  ["⌘C · ⌘V · ⌘D", "Copy · paste · duplicate the selected nodes"],
-  ["⌫", "Delete the selected nodes or wire"],
-  ["Esc", "Clear the selection"],
-  ["⇧ drag", "Select every node in a box"],
-  ["⌘ click", "Add a node to the selection"],
-  ["Double-click", "Add a node on the canvas · open a child workflow"],
-  ["Right-click", "Actions for a node, wire or the canvas"],
-  ["⌘B · ⌘J", "Show or hide the library · the inspector"],
-  ["?", "This list"],
-];
-/** What a library row adds, carried on a drag so the canvas can place it at the drop. */
-type LibraryItem =
-  | { kind: "type"; type: CreateType }
-  | { kind: "kind"; name: string; color: string }
-  | { kind: "agent"; name: string }
-  | { kind: "database"; name: string }
-  | { kind: "script"; name: string }
-  | { kind: "data"; name: string };
-function parseLibraryItem(payload: string): LibraryItem | null {
-  let value: unknown;
-  try {
-    value = JSON.parse(payload);
-  } catch {
-    return null;
-  }
-  if (!value || typeof value !== "object") return null;
-  const item = value as Record<string, unknown>;
-  if (
-    item.kind === "type" &&
-    typeof item.type === "string" &&
-    (item.type === "blank" ||
-      item.type === "database-write" ||
-      Object.hasOwn(labels, item.type))
-  )
-    return { kind: "type", type: item.type as CreateType };
-  if (typeof item.name !== "string") return null;
-  if (item.kind === "kind" && typeof item.color === "string")
-    return { kind: "kind", name: item.name, color: item.color };
-  if (
-    item.kind === "agent" ||
-    item.kind === "database" ||
-    item.kind === "script" ||
-    item.kind === "data"
-  )
-    return { kind: item.kind, name: item.name };
-  return null;
-}
 
 export default function App() {
   const [library, setLibrary] = useState<Library | null>(null);
@@ -318,19 +222,28 @@ export default function App() {
   const readOnly = !!activeChild;
   const running = !!runtime?.running || pendingRunId !== null;
   const occupied = running || !!form || busy;
-  const runMatches = !!runtime && runtime.run_id === attachedRun;
-  const currentRun = shownRun || (runMatches ? runtime?.run : null) || null;
-  const snapshotContext = (runMatches && running) || !!currentRun;
-  const captured =
-    runMatches && running ? runtime.workflows : currentRun?.workflows || {};
-  const childRun = activeChild
-    ? callAt(currentRun, activeChild.path)?.run || null
-    : currentRun;
-  const outputRun =
-    !readOnly && !historical && activeSelected
-      ? remembered.origins[activeSelected] || currentRun
-      : currentRun;
-  const childPath = activeChild?.path || "";
+  const {
+    runMatches,
+    currentRun,
+    snapshotContext,
+    captured,
+    childPath,
+    childRun,
+    marks,
+    liveLog,
+    liveStream,
+    outputContext,
+  } = deriveRunView({
+    runtime,
+    attachedRun,
+    shownRun,
+    historical,
+    running,
+    activeChild,
+    activeSelected,
+    readOnly,
+    remembered,
+  });
   const promptSelection = useRef({
     epoch,
     childPath,
@@ -363,24 +276,6 @@ export default function App() {
     : savedInterfaces?.key === interfaceKey
       ? savedInterfaces.graphs
       : {};
-  const marks =
-    runMatches && running
-      ? localMarks(runtime.marks, childPath)
-      : runMarks(childRun);
-  const prefix = childPath ? `${childPath}/` : "";
-  const liveLog =
-    (runMatches && running
-      ? runtime.log
-          .filter((line) => !prefix || line.startsWith(prefix))
-          .map((line) => (prefix ? line.slice(prefix.length) : line))
-      : childRun?.log) || [];
-  const liveStream =
-    runMatches && running && runtime.stream?.id.startsWith(prefix)
-      ? {
-          id: runtime.stream.id.slice(prefix.length),
-          text: runtime.stream.text,
-        }
-      : null;
 
   const refreshLibrary = useCallback(async () => {
     const data = await request("bootstrap");
@@ -844,7 +739,7 @@ export default function App() {
         if (agent)
           addNode({ type: "agent", ...agent.config }, position, {
             name: agent.name,
-            color: "#8b5cf6",
+            color: NODE_COLORS.agent,
           });
         return;
       }
@@ -855,7 +750,12 @@ export default function App() {
         if (database)
           addNode({ type: "database", ...database.config }, position, {
             name: database.name,
-            color: database.config.read_only ? "#0ea5e9" : "#ef4444",
+            color: nodeColor({
+              id: "",
+              x: 0,
+              y: 0,
+              data: { type: "database", ...database.config },
+            }),
           });
         return;
       }
@@ -1586,7 +1486,7 @@ export default function App() {
   const matches = (category: string, name: string) =>
     `${category} ${name}`.toLowerCase().includes(query.toLowerCase().trim());
   const libraryRow = (
-    key: string,
+    rowKey: string,
     label: string,
     onClick: () => void,
     color?: string,
@@ -1599,57 +1499,20 @@ export default function App() {
     // duplicate must wait so the landing write cannot resurrect the old name.
     mutateDisabled = disabled,
   ) => (
-    <div className="library-row" key={key}>
-      <button
-        className="library-item"
-        onClick={onClick}
-        disabled={disabled}
-        title={drag ? `${label} · drag onto the canvas` : label}
-        draggable={!!drag && !disabled}
-        onDragStart={(event) => {
-          if (!drag) return;
-          event.dataTransfer.setData(LIBRARY_DRAG_TYPE, JSON.stringify(drag));
-          event.dataTransfer.effectAllowed = "copy";
-        }}
-      >
-        {color ? <i style={{ background: color }} /> : <FolderOpen size={15} />}
-        <span>{label}</span>
-        {trailing === "open" ? (
-          <ArrowUpRight size={12} className="row-action" />
-        ) : (
-          <Plus size={12} className="row-action" />
-        )}
-      </button>
-      {(onDelete || actions?.length) && (
-        <span className="row-actions">
-          {actions?.map((item) => (
-            <button
-              key={item.label}
-              className="icon-button"
-              aria-label={item.label}
-              title={item.label}
-              onClick={item.run}
-              disabled={mutateDisabled}
-            >
-              {item.icon}
-            </button>
-          ))}
-          {onDelete && (
-            <button
-              className="icon-button delete-library"
-              aria-label={`Delete ${label}`}
-              title={`Delete ${label}`}
-              onClick={onDelete}
-              disabled={mutateDisabled}
-            >
-              <Trash2 size={13} />
-            </button>
-          )}
-        </span>
-      )}
-    </div>
+    <LibraryRow
+      key={rowKey}
+      label={label}
+      onClick={onClick}
+      color={color}
+      onDelete={onDelete}
+      disabled={disabled}
+      trailing={trailing}
+      drag={drag}
+      actions={actions}
+      mutateDisabled={mutateDisabled}
+    />
   );
-  const groups: { label: string; items: ReactNode[]; open?: boolean }[] =
+  const groups: LibraryGroup[] =
     library
       ? [
           {
@@ -1687,7 +1550,7 @@ export default function App() {
             label: "Nodes",
             open: true,
             items: (
-              [...Object.keys(labels), "database-write"] as Exclude<
+              [...Object.keys(NODE_LABELS), "database-write"] as Exclude<
                 CreateType,
                 "blank"
               >[]
@@ -1695,13 +1558,17 @@ export default function App() {
               .filter((type) =>
                 matches(
                   "nodes",
-                  type === "database-write" ? "Database (write)" : labels[type],
+                  type === "database-write"
+                    ? "Database (write)"
+                    : NODE_LABELS[type],
                 ),
               )
               .map((type) =>
                 libraryRow(
                   type,
-                  type === "database-write" ? "Database (write)" : labels[type],
+                  type === "database-write"
+                    ? "Database (write)"
+                    : NODE_LABELS[type],
                   () => addFromLibrary({ kind: "type", type }),
                   nodeColor({ id: "", x: 0, y: 0, data: createData(type) }),
                   undefined,
@@ -1744,7 +1611,7 @@ export default function App() {
                   `agent:${agent.name}`,
                   agent.name,
                   () => addFromLibrary({ kind: "agent", name: agent.name }),
-                  "#8b5cf6",
+                  NODE_COLORS.agent,
                   () =>
                     void action(() =>
                       removeLibrary(
@@ -1786,7 +1653,12 @@ export default function App() {
                   database.name,
                   () =>
                     addFromLibrary({ kind: "database", name: database.name }),
-                  database.config.read_only ? "#0ea5e9" : "#ef4444",
+                  nodeColor({
+                    id: "",
+                    x: 0,
+                    y: 0,
+                    data: { type: "database", ...database.config },
+                  }),
                   () =>
                     void action(() =>
                       removeLibrary(
@@ -1810,7 +1682,7 @@ export default function App() {
                   `script:${name}`,
                   name,
                   () => addFromLibrary({ kind: "script", name }),
-                  "#f59e0b",
+                  NODE_COLORS.script,
                   undefined,
                   undefined,
                   "add",
@@ -1827,7 +1699,7 @@ export default function App() {
                   `data:${name}`,
                   name,
                   () => addFromLibrary({ kind: "data", name }),
-                  "#22c55e",
+                  NODE_COLORS.data,
                   undefined,
                   undefined,
                   "add",
@@ -1963,117 +1835,38 @@ export default function App() {
         </div>
       )}
       <main className="workspace-body">
-        <aside className="library" hidden={!libraryOpen}>
-          <div className="library-heading">
-            <strong>Library</strong>
-            <button
-              className="icon-button"
-              aria-label="Refresh library"
-              onClick={() =>
-                void action(async () => {
-                  await refreshLibrary();
-                  setNotice("Library refreshed");
-                })
-              }
-            >
-              <RefreshCw size={15} />
-            </button>
-          </div>
-          <label className="search">
-            <Search size={15} />
-            <input
-              aria-label="Search library"
-              placeholder="Search library…"
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-            />
-            {query && (
-              <button aria-label="Clear search" onClick={() => setQuery("")}>
-                <X size={13} />
-              </button>
-            )}
-          </label>
-          {readOnly && (
-            <p className="library-hint">Return to the parent to add nodes.</p>
-          )}
-          <div className="library-sections">
-            {!library && <p className="muted">Connecting to your workspace…</p>}
-            {groups
-              .filter((group) => !query || group.items.length)
-              .map((group) => (
-                <details
-                  key={`${group.label}:${!!query}`}
-                  open={!!query || group.open}
-                >
-                  <summary>
-                    {group.label}
-                    <span>{group.items.length}</span>
-                  </summary>
-                  {group.items.length ? (
-                    group.items
-                  ) : (
-                    <div className="library-empty">
-                      <p>No {group.label.toLowerCase()} saved yet.</p>
-                      {group.label === "Workflows" && !readOnly && (
-                        <button
-                          type="button"
-                          onClick={() => void action(installExamples)}
-                        >
-                          Install example workflows
-                        </button>
-                      )}
-                    </div>
-                  )}
-                </details>
-              ))}
-            {query && groups.every((group) => !group.items.length) && (
-              <p className="library-empty">No matching library items.</p>
-            )}
-          </div>
-          <button
-            className="kind-button"
-            onClick={() => setKindEditor((value) => !value)}
-            disabled={readOnly}
-          >
-            <Plus size={14} />
-            Custom node kind
-          </button>
-          {kindEditor && (
-            <form
-              className="kind-form"
-              onSubmit={(event) => {
-                event.preventDefault();
-                void action(async () => {
-                  await request("save_kind", {
-                    kind: { name: kindName, color: kindColor },
-                  });
-                  setKindEditor(false);
-                  setKindName("");
-                  await refreshLibrary();
-                });
-              }}
-            >
-              <input
-                aria-label="Kind name"
-                placeholder="Kind name"
-                value={kindName}
-                onChange={(event) => setKindName(event.target.value)}
-                required
-              />
-              <input
-                aria-label="Kind color"
-                type="color"
-                value={kindColor}
-                onChange={(event) => setKindColor(event.target.value)}
-              />
-              <button type="submit">Save kind</button>
-            </form>
-          )}
-          <div className="workspace-path" title={library?.workspace}>
-            <FolderOpen size={13} />
-            <span>{library?.workspace || "Local workspace"}</span>
-          </div>
-        </aside>
+        <LibraryPanel
+          hidden={!libraryOpen}
+          query={query}
+          onQueryChange={setQuery}
+          readOnly={readOnly}
+          connecting={!library}
+          groups={groups}
+          workspace={library?.workspace}
+          kindEditor={kindEditor}
+          kindName={kindName}
+          kindColor={kindColor}
+          onRefresh={() =>
+            void action(async () => {
+              await refreshLibrary();
+              setNotice("Library refreshed");
+            })
+          }
+          onInstallExamples={() => void action(installExamples)}
+          onToggleKindEditor={() => setKindEditor((value) => !value)}
+          onKindNameChange={setKindName}
+          onKindColorChange={setKindColor}
+          onSaveKind={() =>
+            void action(async () => {
+              await request("save_kind", {
+                kind: { name: kindName, color: kindColor },
+              });
+              setKindEditor(false);
+              setKindName("");
+              await refreshLibrary();
+            })
+          }
+        />
         <div
           className="panel-divider"
           role="separator"
@@ -2122,7 +1915,7 @@ export default function App() {
                     }
                   >
                     <option value="blank">Blank</option>
-                    {Object.entries(labels).map(([type, label]) => (
+                    {Object.entries(NODE_LABELS).map(([type, label]) => (
                       <option value={type} key={type}>
                         {label}
                       </option>
@@ -2308,97 +2101,14 @@ export default function App() {
             ))}
           </div>
           {!readOnly && form && (
-            <section className="run-form" aria-label="Run inputs">
-              <div className="section-title">
-                <strong>Run inputs</strong>
-                <button
-                  className="icon-button"
-                  aria-label="Close run inputs"
-                  onClick={() => setForm(null)}
-                >
-                  <X size={15} />
-                </button>
-              </div>
-              <p>Values for this execution</p>
-              <form
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  void action(() => startRun(form));
-                }}
-              >
-                {form.fields.map((field) => (
-                  <label key={field.name}>
-                    {field.name}
-                    <small>
-                      {field.config.kind}
-                      {field.config.required ? " · required" : " · optional"}
-                    </small>
-                    {field.config.kind === "boolean" ? (
-                      <select
-                        aria-label={`Run input ${field.name}`}
-                        value={form.inputs[field.name] || ""}
-                        onChange={(event) =>
-                          setForm({
-                            ...form,
-                            inputs: {
-                              ...form.inputs,
-                              [field.name]: event.target.value,
-                            },
-                          })
-                        }
-                      >
-                        <option value="">Choose…</option>
-                        <option value="true">true</option>
-                        <option value="false">false</option>
-                      </select>
-                    ) : field.config.kind === "file" ? (
-                      <ComboInput
-                        id={`run-input-${field.name}`}
-                        label={`Run input ${field.name}`}
-                        value={form.inputs[field.name] || ""}
-                        choices={library?.data || []}
-                        placeholder="Choose or type a path inside data/"
-                        onChange={(value) =>
-                          setForm({
-                            ...form,
-                            inputs: { ...form.inputs, [field.name]: value },
-                          })
-                        }
-                      />
-                    ) : (
-                      <textarea
-                        aria-label={`Run input ${field.name}`}
-                        value={form.inputs[field.name] || ""}
-                        rows={
-                          field.config.kind === "text" ||
-                          field.config.kind === "json"
-                            ? 3
-                            : 1
-                        }
-                        placeholder={field.config.default}
-                        onChange={(event) =>
-                          setForm({
-                            ...form,
-                            inputs: {
-                              ...form.inputs,
-                              [field.name]: event.target.value,
-                            },
-                          })
-                        }
-                      />
-                    )}
-                  </label>
-                ))}
-                {form.error && (
-                  <p className="field-error" role="alert">
-                    {form.error}
-                  </p>
-                )}
-                <button className="primary" type="submit" disabled={busy}>
-                  {busy ? "Starting…" : "Start run"}
-                </button>
-              </form>
-            </section>
+            <RunInputForm
+              form={form}
+              busy={busy}
+              dataChoices={library?.data || []}
+              onClose={() => setForm(null)}
+              onChange={setForm}
+              onSubmit={(next) => void action(() => startRun(next))}
+            />
           )}
           {!readOnly && runtime?.review && (
             <ReviewPanel
@@ -2480,15 +2190,7 @@ export default function App() {
                   await refreshLibrary();
                 })
               }
-              outputContext={
-                outputRun
-                  ? {
-                      graph: outputRun.graph,
-                      runId: outputRun.id,
-                      ...(childPath ? { callPath: childPath } : {}),
-                    }
-                  : undefined
-              }
+              outputContext={outputContext}
             />
             {!readOnly && library && (
               <div className="history-tools">
@@ -2595,219 +2297,5 @@ export default function App() {
         </button>
       </footer>
     </div>
-  );
-}
-
-function ConfirmDialog({
-  title,
-  message,
-  confirm,
-  alternative,
-  input,
-  onDecision,
-}: {
-  title: string;
-  message: string;
-  confirm: string;
-  alternative?: string;
-  input?: { label: string; initial: string };
-  onDecision: (choice: Choice, value: string) => void;
-}) {
-  const dialog = useRef<HTMLDialogElement>(null);
-  const [value, setValue] = useState(input?.initial ?? "");
-  useEffect(() => {
-    dialog.current?.showModal();
-  }, []);
-  return (
-    <dialog
-      ref={dialog}
-      className="confirm-dialog"
-      aria-labelledby="confirm-title"
-      aria-describedby="confirm-message"
-      onCancel={(event) => {
-        event.preventDefault();
-        onDecision("cancel", value);
-      }}
-    >
-      <form
-        onSubmit={(event) => {
-          event.preventDefault();
-          onDecision("confirm", value);
-        }}
-      >
-        <h2 id="confirm-title">{title}</h2>
-        <p id="confirm-message">{message}</p>
-        {input && (
-          <input
-            aria-label={input.label}
-            value={value}
-            autoFocus
-            onChange={(event) => setValue(event.target.value)}
-          />
-        )}
-        <div>
-          <button
-            type="button"
-            autoFocus={!input}
-            onClick={() => onDecision("cancel", value)}
-          >
-            Cancel
-          </button>
-          <button
-            type="submit"
-            className={alternative ? "danger-button" : "primary"}
-            disabled={!!input && !value.trim()}
-          >
-            {confirm}
-          </button>
-          {alternative && (
-            <button
-              type="button"
-              className="primary"
-              onClick={() => onDecision("alternative", value)}
-            >
-              {alternative}
-            </button>
-          )}
-        </div>
-      </form>
-    </dialog>
-  );
-}
-
-function ShortcutsDialog({ onClose }: { onClose: () => void }) {
-  const dialog = useRef<HTMLDialogElement>(null);
-  useEffect(() => {
-    dialog.current?.showModal();
-  }, []);
-  return (
-    <dialog
-      ref={dialog}
-      className="confirm-dialog shortcuts-dialog"
-      aria-labelledby="shortcuts-title"
-      onCancel={(event) => {
-        event.preventDefault();
-        onClose();
-      }}
-    >
-      <h2 id="shortcuts-title">Keyboard shortcuts</h2>
-      <dl>
-        {SHORTCUTS.map(([keys, what]) => (
-          <div key={keys}>
-            <dt>
-              <kbd>{keys}</kbd>
-            </dt>
-            <dd>{what}</dd>
-          </div>
-        ))}
-      </dl>
-      <div>
-        <button className="primary" autoFocus onClick={onClose}>
-          Close
-        </button>
-      </div>
-    </dialog>
-  );
-}
-
-function ReviewPanel({
-  runtime,
-  deciding,
-  onDecision,
-  onCancel,
-}: {
-  runtime: RuntimeState;
-  /** A decision is on its way to the service; the buttons wait for its answer. */
-  deciding: boolean;
-  onDecision: (decision: "apply" | "reject") => void;
-  onCancel: () => void;
-}) {
-  const [fileIndex, setFileIndex] = useState(0);
-  const review = runtime.review!;
-  useEffect(() => setFileIndex(0), [review.id]);
-  const index = Math.max(0, Math.min(fileIndex, review.files.length - 1));
-  const file = review.files[index];
-  return (
-    <section className="review-panel" aria-label="Review file changes">
-      <div className="section-title">
-        <strong>Review changes</strong>
-        <span>
-          {review.files.length} file{review.files.length === 1 ? "" : "s"}
-        </span>
-      </div>
-      <p>{review.node}</p>
-      {file && (
-        <>
-          <div className="review-files">
-            <button
-              type="button"
-              aria-label="Previous file"
-              disabled={index === 0}
-              onClick={() => setFileIndex(index - 1)}
-            >
-              ‹
-            </button>
-            <select
-              aria-label="Review file"
-              value={index}
-              onChange={(event) => setFileIndex(Number(event.target.value))}
-            >
-              {review.files.map((file, position) => (
-                <option value={position} key={file.path}>
-                  {file.path}
-                </option>
-              ))}
-            </select>
-            <button
-              type="button"
-              aria-label="Next file"
-              disabled={index >= review.files.length - 1}
-              onClick={() => setFileIndex(index + 1)}
-            >
-              ›
-            </button>
-          </div>
-          <p>
-            File {index + 1} of {review.files.length} ·{" "}
-            {file.before_bytes ?? "New file"} → {file.after_bytes} bytes
-          </p>
-          <pre className="review-diff">
-            {file.diff.split("\n").map((line, index) => (
-              <span
-                key={index}
-                className={
-                  line.startsWith("+")
-                    ? "diff-add"
-                    : line.startsWith("-")
-                      ? "diff-remove"
-                      : ""
-                }
-              >
-                {line}
-                {"\n"}
-              </span>
-            ))}
-          </pre>
-        </>
-      )}
-      <div className="review-actions">
-        <button
-          className="primary"
-          disabled={runtime.cancelling || deciding}
-          onClick={() => onDecision("apply")}
-        >
-          Apply changes
-        </button>
-        <button
-          disabled={runtime.cancelling || deciding}
-          onClick={() => onDecision("reject")}
-        >
-          Reject
-        </button>
-        <button disabled={runtime.cancelling} onClick={onCancel}>
-          Cancel run
-        </button>
-      </div>
-    </section>
   );
 }
