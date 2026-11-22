@@ -273,6 +273,16 @@ impl Session {
         self.error = save_error;
     }
 
+    fn publish_review(&mut self, pending: review::Pending) -> bool {
+        if !self.running || self.cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.review_seq += 1;
+        let id = format!("{}-review-{}", self.id, self.review_seq);
+        self.review = Some((id, pending));
+        true
+    }
+
     fn cancel(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
         if let Some((_, pending)) = self.review.take() {
@@ -832,10 +842,7 @@ impl AppService {
             progress: Some(Arc::new(move |p| lock(&progress_session).progress(p))),
             review: Some(Arc::new(move |request| {
                 let result = review::wait(request, &review_cancel, |pending| {
-                    let mut state = lock(&review_session);
-                    state.review_seq += 1;
-                    let id = format!("{}-review-{}", state.id, state.review_seq);
-                    state.review = Some((id, pending));
+                    lock(&review_session).publish_review(pending);
                 });
                 lock(&review_session).review = None;
                 result
@@ -1547,6 +1554,33 @@ mod tests {
         workspace.service.cancel_active();
         workspace.until(|s| !s["run"].is_null());
         drop(pending);
+    }
+
+    #[test]
+    fn a_cancelled_session_never_publishes_a_review() {
+        let workspace = Workspace::new();
+        let started = workspace
+            .service
+            .request("start_run", json!({"doc":review_doc()}))
+            .unwrap();
+        let state = workspace.until(|s| s["review"].is_object());
+        let session = workspace
+            .service
+            .session(started["run_id"].as_str().unwrap())
+            .unwrap();
+        let pending = lock(&session).review.clone().unwrap().1;
+        workspace
+            .service
+            .request("cancel_run", json!({"run_id":state["run_id"]}))
+            .unwrap();
+        {
+            let mut guard = lock(&session);
+            let seq_before = guard.review_seq;
+            assert!(!guard.publish_review(pending));
+            assert!(guard.review.is_none());
+            assert_eq!(guard.review_seq, seq_before);
+        }
+        workspace.until(|s| s["running"] == false);
     }
 
     #[test]

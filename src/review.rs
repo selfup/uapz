@@ -54,6 +54,9 @@ pub fn wait(
     cancel: &AtomicBool,
     publish: impl FnOnce(Pending),
 ) -> Result<Decision, String> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(crate::exec::CANCELLED.into());
+    }
     let (reply, rx) = mpsc::sync_channel(1);
     publish(Pending { request, reply });
     loop {
@@ -455,5 +458,21 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(error, crate::exec::CANCELLED);
+    }
+
+    #[test]
+    fn cancelled_wait_does_not_publish_a_pending_review() {
+        let request = Arc::new(Request {
+            node: "n1".into(),
+            files: Vec::new(),
+        });
+        let cancel = AtomicBool::new(true);
+        let mut published = false;
+        let error = wait(request, &cancel, |_| {
+            published = true;
+        })
+        .unwrap_err();
+        assert_eq!(error, crate::exec::CANCELLED);
+        assert!(!published);
     }
 }

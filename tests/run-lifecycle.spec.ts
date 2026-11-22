@@ -189,3 +189,163 @@ test("renaming the open workflow re-keys its remembered runs so outputs are requ
     node: "n0",
   });
 });
+
+test("clearing history waits while occupied and exits historical view cleanly", async ({
+  page,
+}) => {
+  await page.evaluate(() => {
+    (window as any).__testState.history = [
+      {
+        id: "older-run",
+        graph: "Demo",
+        targets: ["n2"],
+        elapsed_ms: 20,
+        nodes: {
+          n0: {
+            state: "ran",
+            preview: "Earlier output",
+            label: "Text",
+            complete: true,
+          },
+        },
+        log: ["Earlier execution"],
+        outcome: { kind: "ok" },
+      },
+    ];
+  });
+  for (const name of ["Parts", "Demo"]) {
+    await page
+      .locator(".library")
+      .getByRole("button", { name, exact: true })
+      .click();
+    await expect(page.getByLabel("Workflow name", { exact: true })).toHaveValue(
+      name,
+    );
+  }
+
+  await page.getByRole("tab", { name: "History", exact: true }).click();
+  await page.locator(".ins-run > summary").click();
+  await page
+    .getByRole("button", { name: "Inspect this run", exact: true })
+    .click();
+  await expect(page.getByRole("status")).toHaveText("Showing run older-run");
+
+  // Opening the run inputs form makes the editor occupied; Clear cache and Clear history stay disabled.
+  await page.getByRole("button", { name: "Run workflow", exact: true }).click();
+  await expect(
+    page.getByRole("region", { name: "Run inputs" }),
+  ).toBeVisible();
+  await page.getByRole("tab", { name: "Node inspector", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "Clear cache", exact: true }),
+  ).toBeDisabled();
+  await expect(
+    page.getByRole("button", { name: "Clear history", exact: true }),
+  ).toBeDisabled();
+  await page
+    .getByRole("button", { name: "Close run inputs", exact: true })
+    .click();
+
+  await page
+    .getByRole("button", { name: "Clear history", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", { name: "Clear history" });
+  await dialog.getByRole("button", { name: "Clear", exact: true }).click();
+  await expect(page.locator(".ins-run")).toHaveCount(0);
+  await expect(page.getByRole("status")).toHaveText("History cleared");
+  await page.getByRole("tab", { name: "Run output", exact: true }).click();
+  await expect(page.getByText("No run yet", { exact: true })).toBeVisible();
+
+  // Starting and completing a run after clearing history announces completion cleanly.
+  const review = await startRun(page);
+  await review
+    .getByRole("button", { name: "Apply changes", exact: true })
+    .click();
+  await expect(page.getByRole("status")).toHaveText("Completed in 0.1s");
+});
+
+test("deleting the open workflow clears its history and remembered outputs", async ({
+  page,
+}) => {
+  const review = await startRun(page);
+  await review
+    .getByRole("button", { name: "Apply changes", exact: true })
+    .click();
+  await expect(page.getByRole("status")).toHaveText("Completed in 0.1s");
+
+  await page.locator('[data-id="n0"]').click();
+  await page.getByRole("tab", { name: "Node inspector", exact: true }).click();
+  await page.getByRole("tab", { name: "Results", exact: true }).click();
+  await expect(page.locator(".ins-result .ins-output")).toContainText(
+    "Example",
+  );
+  await page.getByRole("tab", { name: "History", exact: true }).click();
+  await expect(page.locator(".ins-run")).toHaveCount(1);
+
+  await queueReply(page, { method: "delete_graph", value: null });
+  const row = page.locator(".library-row").filter({ hasText: "Demo" }).first();
+  await row.hover();
+  await row.getByLabel("Delete Demo", { exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Delete workflow" });
+  await page.evaluate(() => {
+    const state = (window as any).__testState;
+    delete state.graphs.Demo;
+    state.history = [];
+  });
+  await dialog.getByRole("button", { name: "Delete", exact: true }).click();
+  await expect(page.getByText("Unsaved changes")).toBeVisible();
+  await expect(page.locator(".ins-run")).toHaveCount(0);
+  await page.getByRole("tab", { name: "Results", exact: true }).click();
+  await expect(
+    page.getByText("No result for this node yet", { exact: true }),
+  ).toBeVisible();
+});
+
+test("quitting while start_run is in flight asks before cancelling", async ({
+  page,
+}) => {
+  await page.getByRole("button", { name: "Run workflow", exact: true }).click();
+  await queueReply(page, { method: "start_run", gate: "starting" });
+  await page.getByRole("button", { name: "Start run", exact: true }).click();
+  await pending(page, "starting");
+  await expect(page.locator(".save-state")).toHaveText("Saved workflow");
+
+  await page.evaluate(() =>
+    (window as any).__testState.emit("close-requested"),
+  );
+  const dialog = page.getByRole("dialog", { name: "Quit uapz?" });
+  await expect(dialog).toContainText(
+    "A run is in progress. Quitting cancels it.",
+  );
+  expect(await page.evaluate(() => (window as any).__testState.quits)).toBe(0);
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  await releaseReply(page, "starting");
+  await expect(
+    page.getByRole("region", { name: "Review file changes" }),
+  ).toBeVisible();
+  expect(await page.evaluate(() => (window as any).__testState.quits)).toBe(0);
+});
+
+test("save and quit refuses to quit while another save is already in flight", async ({
+  page,
+}) => {
+  await page.locator('[data-id="n0"]').click();
+  await page.getByLabel("Name", { exact: true }).fill("editedBeforeQuit");
+  await queueReply(page, { method: "save_graph", gate: "in-flight-save" });
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await pending(page, "in-flight-save");
+
+  await page.evaluate(() =>
+    (window as any).__testState.emit("close-requested"),
+  );
+  const dialog = page.getByRole("dialog", { name: "Quit uapz?" });
+  await dialog
+    .getByRole("button", { name: "Save and quit", exact: true })
+    .click();
+  await expect(page.locator(".error-banner")).toContainText(
+    "Wait for the current save to finish before quitting.",
+  );
+  expect(await page.evaluate(() => (window as any).__testState.quits)).toBe(0);
+  await releaseReply(page, "in-flight-save");
+  await expect(page.locator(".save-state")).toHaveText("Saved workflow");
+});

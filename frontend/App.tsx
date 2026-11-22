@@ -959,7 +959,8 @@ export default function App() {
       occupied ||
       preparingRun.current ||
       startingRun.current ||
-      pendingRun.current
+      pendingRun.current ||
+      runtimeRef.current?.running
     )
       return;
     const navigation = ++rootNavigation.current;
@@ -967,6 +968,7 @@ export default function App() {
       return;
     documentEpoch.current += 1;
     setRemembered({ nodes: {}, origins: {} });
+    historicalRef.current = false;
     setHistorical(false);
     const fresh = emptyGraph();
     setGraph(fresh);
@@ -985,7 +987,8 @@ export default function App() {
       occupied ||
       preparingRun.current ||
       startingRun.current ||
-      pendingRun.current
+      pendingRun.current ||
+      runtimeRef.current?.running
     )
       return;
     const navigation = ++rootNavigation.current;
@@ -1001,6 +1004,7 @@ export default function App() {
     if (navigation !== rootNavigation.current) return;
     documentEpoch.current += 1;
     setRemembered({ nodes: {}, origins: {} });
+    historicalRef.current = false;
     setHistorical(false);
     setGraph(loaded);
     resetHistory(loaded);
@@ -1305,8 +1309,15 @@ export default function App() {
     await refreshLibrary();
     if (graphRef.current.name === name) {
       // The open document outlives its file; saving writes it again.
+      // Its history was deleted on disk, so drop the stale client copies too.
       savedKey.current = null;
       setDirty(true);
+      historicalRef.current = false;
+      setHistorical(false);
+      setHistory([]);
+      setShownRun(null);
+      setAttachedRun(null);
+      setRemembered({ nodes: {}, origins: {} });
       setNotice(`Deleted ${name}; the open copy is unsaved`);
     } else setNotice(`Deleted ${name}`);
   }
@@ -1368,14 +1379,29 @@ export default function App() {
   }
   async function installExamples() {
     if (occupied || readOnly) return;
-    const result = await request("install_examples");
-    await refreshLibrary();
-    setNotice(
-      result.installed.length
-        ? `Installed ${result.installed.length} example workflow${result.installed.length === 1 ? "" : "s"}`
-        : "The example workflows were already installed",
-    );
-    await openGraph(result.installed[0] ?? EXAMPLE_NAMES[0] ?? "");
+    const requestEpoch = documentEpoch.current;
+    const navigation = rootNavigation.current;
+    setBusy(true);
+    let target = "";
+    try {
+      const result = await request("install_examples");
+      await refreshLibrary();
+      if (
+        requestEpoch !== documentEpoch.current ||
+        navigation !== rootNavigation.current ||
+        closePrompt.current
+      )
+        return;
+      setNotice(
+        result.installed.length
+          ? `Installed ${result.installed.length} example workflow${result.installed.length === 1 ? "" : "s"}`
+          : "The example workflows were already installed",
+      );
+      target = result.installed[0] ?? EXAMPLE_NAMES[0] ?? "";
+    } finally {
+      setBusy(false);
+    }
+    if (target) await openGraph(target);
   }
   /** Select the root node a run feed entry belongs to and bring it into view. */
   function showOnCanvas(path: string) {
@@ -1429,7 +1455,9 @@ export default function App() {
     // in progress needs the same confirmation as unsaved work.
     const unsaved = dirtyRef.current;
     const running =
-      !!runtimeRef.current?.running || pendingRun.current !== null;
+      !!runtimeRef.current?.running ||
+      pendingRun.current !== null ||
+      startingRun.current;
     if (!unsaved && !running) {
       void quitApp();
       return;
@@ -1453,6 +1481,10 @@ export default function App() {
         );
         if (choice === "cancel") return;
         if (choice === "alternative") {
+          if (saveInFlight.current) {
+            setError("Wait for the current save to finish before quitting.");
+            return;
+          }
           try {
             await save();
           } catch (error) {
@@ -2461,9 +2493,10 @@ export default function App() {
             {!readOnly && library && (
               <div className="history-tools">
                 <button
-                  disabled={running}
+                  disabled={occupied}
                   onClick={() =>
                     void action(async () => {
+                      if (occupied) return;
                       const count = await request("clear_cache");
                       setNotice(`Cleared ${count} cached outputs`);
                     })
@@ -2472,17 +2505,23 @@ export default function App() {
                   Clear cache
                 </button>
                 <button
-                  disabled={running || !history.length}
+                  disabled={occupied || !history.length}
                   onClick={() =>
                     void action(async () => {
+                      if (occupied) return;
+                      const requestEpoch = documentEpoch.current;
                       if (
                         !(await confirmAction(
                           `Clear run history for ${graph.name}?`,
                           { title: "Clear history", confirm: "Clear" },
-                        ))
+                        )) ||
+                        requestEpoch !== documentEpoch.current
                       )
                         return;
                       await request("clear_history", { graph: graph.name });
+                      if (requestEpoch !== documentEpoch.current) return;
+                      historicalRef.current = false;
+                      setHistorical(false);
                       setHistory([]);
                       setShownRun(null);
                       setAttachedRun(null);
