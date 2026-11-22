@@ -1447,9 +1447,10 @@ export default function App() {
   // duplicate must wait so the landing write cannot resurrect the old name.
   const libraryRow = ({
     key: rowKey,
+    disabled = readOnly,
     ...props
   }: LibraryRowProps & { key: string }) => (
-    <LibraryRow key={rowKey} {...props} />
+    <LibraryRow key={rowKey} disabled={disabled} {...props} />
   );
   const groups: LibraryGroup[] = library
     ? [

@@ -133,6 +133,11 @@ test("read-only child graphs ignore deletion, node drags and canvas double-click
   await expect(
     page.getByRole("button", { name: "Save", exact: true }),
   ).toBeDisabled();
+  const agentRow = page
+    .locator(".library")
+    .getByRole("button", { name: "Agent", exact: true });
+  await expect(agentRow).toBeDisabled();
+  await expect(agentRow).toHaveAttribute("draggable", "false");
   expect(await callsFor(page, "save_graph")).toHaveLength(0);
   await page
     .getByRole("navigation", { name: "Workflow breadcrumbs" })

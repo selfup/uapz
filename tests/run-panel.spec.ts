@@ -463,3 +463,41 @@ test("switching historical runs discards a late RunOutput response from the prev
   await expect(feed).toContainText("Complete B");
   await expect(feed).not.toContainText("STALE OUTPUT A");
 });
+
+test("live runtime polls keep a failed output alert and Retry button mounted without flicker", async ({
+  page,
+}) => {
+  await start(page);
+  await queueReply(page, {
+    method: "output",
+    error: "Cache read failed",
+  });
+  await publish(page, [
+    {
+      seq: 1,
+      kind: "output",
+      id: "n0",
+      result: {
+        state: "ran",
+        preview: "Retained preview",
+        label: "Text",
+        complete: false,
+        key: "poll-stable",
+      },
+    },
+  ]);
+  const feed = page.getByLabel("Run output feed", { exact: true });
+  const retry = feed.getByRole("button", { name: "Retry output", exact: true });
+  await expect(retry).toBeVisible();
+  // Tag the DOM button so any unmount/remount across subsequent polls is detected.
+  await retry.evaluate((element) => {
+    (element as HTMLElement).dataset.stable = "kept";
+  });
+  const pollsBefore = (await callsFor(page, "runtime_state")).length;
+  await expect
+    .poll(async () => (await callsFor(page, "runtime_state")).length)
+    .toBeGreaterThanOrEqual(pollsBefore + 3);
+  await expect(retry).toHaveAttribute("data-stable", "kept");
+  await retry.click();
+  await expect(feed).toContainText("Example full output");
+});

@@ -81,11 +81,16 @@ export default function NodeOutputView({
     attempt: number;
     promise: Promise<FullOutput>;
   } | null>(null);
+  const manualRequest = useRef(0);
+  const ctxGraph = context?.graph;
+  const ctxRunId = context?.runId;
+  const ctxCallPath = context?.callPath;
+  const ctxNode = context?.node;
   const identity = JSON.stringify([
-    context?.graph,
-    context?.runId,
-    context?.callPath,
-    context?.node,
+    ctxGraph,
+    ctxRunId,
+    ctxCallPath,
+    ctxNode,
     outputName,
     result.key,
     result.preview,
@@ -98,7 +103,7 @@ export default function NodeOutputView({
   const needsFull =
     loadMode === "auto" &&
     !result.error &&
-    !!context?.runId &&
+    !!ctxRunId &&
     (!result.complete || result.preview === undefined);
   const unlimited = fullChoice === identity;
   const requestIdentity = JSON.stringify([identity, unlimited]);
@@ -116,6 +121,7 @@ export default function NodeOutputView({
 
   useEffect(() => {
     if (loadMode !== "manual") return;
+    manualRequest.current += 1;
     setLoaded(null);
     setBusy(false);
     setFailure(null);
@@ -123,7 +129,8 @@ export default function NodeOutputView({
   }, [identity, loadMode]);
 
   useEffect(() => {
-    if (loadMode !== "auto" || !needsFull || !context) return;
+    if (loadMode !== "auto" || !needsFull || !ctxGraph || !ctxRunId || !ctxNode)
+      return;
     let active = true;
     setFailure(null);
     // Strict Mode replays effects; both subscribers share one retrieval.
@@ -135,10 +142,10 @@ export default function NodeOutputView({
         identity: requestIdentity,
         attempt,
         promise: request("output", {
-          graph: context.graph,
-          run_id: context.runId,
-          node: context.node,
-          ...(context.callPath ? { call_path: context.callPath } : {}),
+          graph: ctxGraph,
+          run_id: ctxRunId,
+          node: ctxNode,
+          ...(ctxCallPath ? { call_path: ctxCallPath } : {}),
           ...(outputName ? { output: outputName } : {}),
           ...(!unlimited ? { max_bytes: AUTOMATIC_OUTPUT_BYTES } : {}),
         }),
@@ -162,31 +169,36 @@ export default function NodeOutputView({
     needsFull,
     attempt,
     loadMode,
-    context,
+    ctxGraph,
+    ctxRunId,
+    ctxNode,
+    ctxCallPath,
     outputName,
     identity,
     unlimited,
   ]);
 
   async function loadManual() {
-    if (!context) return;
+    if (!ctxGraph || !ctxRunId || !ctxNode) return;
+    const requestId = ++manualRequest.current;
+    const isCurrent = () =>
+      manualRequest.current === requestId && identityRef.current === identity;
     setBusy(true);
     setFailure(null);
     try {
       const data = await request("output", {
-        graph: context.graph,
-        run_id: context.runId,
-        node: context.node,
-        ...(context.callPath ? { call_path: context.callPath } : {}),
+        graph: ctxGraph,
+        run_id: ctxRunId,
+        node: ctxNode,
+        ...(ctxCallPath ? { call_path: ctxCallPath } : {}),
         ...(outputName ? { output: outputName } : {}),
       });
-      if (identityRef.current === identity)
+      if (isCurrent())
         setLoaded({ identity, requestIdentity: identity, data });
     } catch (cause) {
-      if (identityRef.current === identity)
-        setFailure({ identity, error: errorText(cause) });
+      if (isCurrent()) setFailure({ identity, error: errorText(cause) });
     } finally {
-      if (identityRef.current === identity) setBusy(false);
+      if (isCurrent()) setBusy(false);
     }
   }
 
@@ -289,7 +301,7 @@ export default function NodeOutputView({
                 : "Only a saved preview is available. The full output is no longer in the cache."}
             </p>
           )}
-          {loadMode === "manual" && context && !result.complete && !full && (
+          {loadMode === "manual" && ctxNode && !result.complete && !full && (
             <button
               type="button"
               disabled={busy}

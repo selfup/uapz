@@ -30,11 +30,11 @@ Legend for the tables:
 | 2.8 | Provider stream | `generate_streaming` (`src/providers.rs`) | `Stream { stopped, error, text }` | worker thread |
 | 2.9 | Desktop shell exit | `on_window_event` / `ExitRequested` (`src-tauri/src/main.rs`) | Tauri events | main thread |
 | 3.1 | Document | `frontend/App.tsx` state `graph`, `dirty`, refs `documentEpoch`, `savedKey`, undo stacks, `children` | React state and refs | renderer |
-| 3.2 | Run (client view) | `frontend/App.tsx` state `runtime`, `attachedRun`, `pendingRunId`, `form`, `shownRun`, `historical`; refs `preparingRun`, `startingRun`, `pendingRun`, `decidingReview` | React state and refs | renderer |
+| 3.2 | Run (client view) | `frontend/App.tsx` state `runtime`, `attachedRun`, `pendingRunId`, `form`, `shownRun`, `historical`; refs `preparingRun`, `startingRun`, `pendingRun`, `decidingReview`; `deriveRunView` (`frontend/runView.ts`); `RunInputForm` (`frontend/RunInputForm.tsx`); `ReviewPanel` (`frontend/ReviewPanel.tsx`) | React state, refs, and derived view | renderer |
 | 3.3 | Runtime polling | `readRuntime` and `poll` (`frontend/App.tsx`) | monotonic request counters | renderer |
-| 3.4 | Output retrieval | `RunOutput` (`frontend/RunPanel.tsx`); `Output` (`frontend/Inspector.tsx`) | `loaded`, `failure`, `attempt` | renderer |
-| 3.5 | Quit | `closeRequested` (`frontend/App.tsx`) | `closePrompt` ref plus the dialog | renderer |
-| 3.6 | Confirmation dialog | `confirmation` state (`frontend/App.tsx`) | single slot | renderer |
+| 3.4 | Output retrieval | `NodeOutputView` (`frontend/NodeOutputView.tsx`), used in `auto` mode by `RunPanel` (`frontend/RunPanel.tsx`) and `manual` mode by `Inspector` (`frontend/Inspector.tsx`) and `PreviousOutput` (`frontend/inspector/PreviousOutput.tsx`) | `loaded`, `failure`, `attempt`, `fullChoice`, `busy`, `retrieval`, `identityRef`, `manualRequest` | renderer |
+| 3.5 | Quit | `closeRequested` (`frontend/App.tsx`) | `closePrompt` ref plus `ConfirmDialog` (`frontend/dialogs.tsx`) | renderer |
+| 3.6 | Confirmation dialog | `confirmation` state (`frontend/App.tsx`) and `ConfirmDialog` (`frontend/dialogs.tsx`) | single slot | renderer |
 
 ## 2. Backend
 
@@ -322,9 +322,13 @@ Invariants:
 
 ### 3.2 Run, as the renderer sees it
 
-Derived values in `App`: `running` is `runtime.running || pendingRunId`, `occupied` is
-`running || form || busy`, `runMatches` is `runtime.run_id === attachedRun`, `currentRun`
-is `shownRun`, else the attached runtime's record.
+Derived values: in `App`, `running` is `runtime.running || pendingRunId` and `occupied` is
+`running || form || busy`; `deriveRunView` (`frontend/runView.ts`) derives `runMatches`
+(`runtime.run_id === attachedRun`), `currentRun` (`shownRun`, else the attached runtime's
+record), `snapshotContext`, `captured`, `childRun`, `outputRun`, `marks`, `liveLog`,
+`liveStream` and `outputContext`. `RunInputForm` (`frontend/RunInputForm.tsx`) renders
+`form`, and `ReviewPanel` (`frontend/ReviewPanel.tsx`) renders `runtime.review` (resetting
+its `fileIndex` whenever `review.id` changes).
 
 | State | Signals |
 | --- | --- |
@@ -371,9 +375,10 @@ Invariants:
 - F3. Navigation, rename, delete, duplicate, Clear cache and Clear history are disabled
   while `occupied` (the service's `idle()` guard protects `clear_cache`, `clear_history`,
   `delete_graph` and `rename_graph`). Rename, delete and duplicate are also disabled while
-  a save is in flight so a landing write cannot resurrect the old name; opening another
-  graph during that save stays allowed. Save is allowed during a run on purpose: the run
-  uses the document captured at start.
+  a save is in flight (`mutateDisabled` on `LibraryRow` in `frontend/LibraryPanel.tsx`) so a
+  landing write cannot resurrect the old name; opening another graph during that save stays
+  allowed. Save is allowed during a run on purpose: the run uses the document captured at
+  start.
 - F4. Completion is detected once per attached run, whether or not a record exists.
 
 ### 3.3 Runtime polling
@@ -389,20 +394,30 @@ and every 150 ms after a result it could not apply.
 | Poll fails before any read applied | error shown, poll continues |
 | Poll fails after a later read applied | ignored |
 | First result of the session shows a run in progress with no document opened | the run's graph is loaded as a dirty document and the run attached |
-| First result of the session shows nothing running | the last opened graph is restored from local storage |
+| First result of the session shows nothing running | the last opened graph is restored from local storage (`readLayout` in `frontend/layout.ts`) |
 
 ### 3.4 Output retrieval
 
-`RunOutput` fetches the full output when the record's preview is incomplete or missing.
-Its identity covers the context (graph, run id, node path), the output name, the key, the
-preview and the completeness; a change in any resets the loaded state. States: idle,
-loading, loaded, failed; **Retry output** increments `attempt` and re-issues the request;
-**Load full output** drops the 256 KB limit. The inspector's `Output` is the manual
-counterpart: **View full output** loads on request and a changed identity discards the
-result.
+`NodeOutputView` (`frontend/NodeOutputView.tsx`) handles output retrieval for both the run
+panel (`RunPanel` in `frontend/RunPanel.tsx`, `loadMode="auto"`) and the inspector
+(`Inspector` in `frontend/Inspector.tsx` and `PreviousOutput` in
+`frontend/inspector/PreviousOutput.tsx`, `loadMode="manual"`). Its `identity` covers
+`context` (`graph`, `runId`, `callPath`, `node`), `outputName`, `result.key`,
+`result.preview`, `result.label`, `result.error` and `result.complete`.
 
-Invariant O1: a response is kept only when its request identity still matches, so a result
-for another run or node is never shown.
+- `auto` mode fetches the output when `!result.error && context.runId` and the preview is
+  incomplete or missing, capped at `AUTOMATIC_OUTPUT_BYTES` (256 KB); `retrieval` shares
+  one in-flight promise across Strict Mode effect replays. States: idle, loading, loaded,
+  failed; **Retry output** increments `attempt` and re-issues the request; **Load full
+  output** sets `fullChoice` to `identity` and drops the 256 KB limit.
+- `manual` mode loads on request via **View full output** (`loadManual`, without a byte
+  cap) while tracking `busy`; an identity change clears `loaded`, `busy`, `failure` and
+  `note`.
+
+Invariant O1: a response is kept only when its request identity still matches (effect
+cleanup `active` flag plus `loaded`/`failure` identity matching in `auto` mode;
+`manualRequest` counter and `identityRef` check in `manual` mode), so a result for another
+run, node, or superseded request is never shown.
 
 ### 3.5 Quit
 
@@ -460,7 +475,7 @@ is listed so a later change does not mistake them for oversights.
 | Finished `Session` still in `AppService.current` after `clear_history`, `delete_graph` or `rename_graph` | A direct `output` request for that last run id under the old name still hits memory until the next run replaces the slot; after `rename_graph`, if `history::save` had failed so no file exists on disk, lookups under the new name miss the in-memory session. | The renderer clears or re-keys its own state; disk records stay reachable under the new name via `history::list`. |
 | Lost `start_run` reply for a run that finishes before `runtime_state` is read | `startRun` only attaches when `runtime_state` still shows `running: true`; a sub-millisecond run that already finished falls through to the `start_run` error. | Without the returned `run_id`, the renderer cannot distinguish a newly finished run from an earlier finished session. |
 | `updateNode` called in the same tick as `save` or `prepareRun` resolving | `updateNode` relies on the next render to update `graphRef`, unlike `updateGraph`, `restore` and `renameGraph`. | Single-microtask window before React commits; normal edits commit before IPC settles. |
-| Replacing one text-input `ConfirmDialog` directly with another | `ConfirmDialog` has no `key`, so its local input `value` would not reset to the new `input.initial`. | Modal `<dialog>` prevents opening a second text-input dialog while one is open; only `closeRequested` (no input) can replace it. |
+| Replacing one text-input `ConfirmDialog` (`frontend/dialogs.tsx`) directly with another | `ConfirmDialog` has no `key`, so its local input `value` would not reset to the new `input.initial`. | Modal `<dialog>` prevents opening a second text-input dialog while one is open; only `closeRequested` (no input) can replace it. |
 
 ### 5.2 Checked and sound
 
@@ -499,6 +514,7 @@ Paths that looked suspicious and held up, so they need not be re-derived:
 | V2, `Create` mode | `exec::tests::a_stale_file_stops_an_approved_batch_before_its_first_write`, `review::tests::create_mode_rejects_existing_file_during_prepare` |
 | R6, R7 feed bounds and multi-node stream preservation | `app::tests::feed_preserves_order_coalesces_text_and_replaces_completed_streams`, `app::tests::feed_retention_is_bounded_and_flags_utf8_truncation_and_real_evictions`, `app::tests::completed_output_preserves_other_nodes_stream_and_text_events` |
 | 3.1 rename dirty vs clean, 8-level child depth | `tests/async-workspace.spec.ts` "renaming a dirty open workflow keeps it unsaved while renaming a clean one stays saved", "nested workflow navigation stops at 8 levels" |
+| 3.2 derived run view (`deriveRunView`) | `frontend/runView.test.ts` |
 | F1, no-fields start, orphan attach | `tests/async-actions.spec.ts` "preparing a run blocks repeated execution and root navigation until its inputs are ready", "an accepted run cannot be resubmitted when its first status response is error/null", "a lost start_run reply still attaches to the service session that accepted it"; `tests/run-lifecycle.spec.ts` "workflows without input fields start immediately and return to idle on start failure", "polling attaches to an unowned active run for the open graph" |
 | F2 | `tests/run-lifecycle.spec.ts` "a review decision is sent once however often its button is pressed while it is in flight" |
 | F3 save-during-run, save-vs-mutate and clear history | `tests/async-workspace.spec.ts` "rename, delete and duplicate wait for an in-flight save, while open stays available"; `tests/run-lifecycle.spec.ts` "save stays available during a run while navigation and destructive actions wait", "clearing history waits while occupied and exits historical view cleanly" |
@@ -506,7 +522,7 @@ Paths that looked suspicious and held up, so they need not be re-derived:
 | 3.3 stale poll, active session on launch | `tests/async-actions.spec.ts` "a late runtime poll snapshot/failure cannot override a newer completed status"; `tests/run-lifecycle.spec.ts` "launching with an active service session loads its graph as dirty and attaches" |
 | 3.5, 3.6, X7 | `tests/run-lifecycle.spec.ts` "a saved, idle workflow quits at once", "quitting while a run is in progress asks first, even with nothing unsaved", "quitting while start_run is in flight asks before cancelling", "quitting while an accepted run is still pending asks before cancelling", "quitting handles unsaved idle, unsaved active, read-only child, and save failures", "save and quit refuses to quit while another save is already in flight", "an in-flight install_examples completion does not replace an open quit dialog"; `tests/session.spec.ts` "leaving unsaved changes offers to save them first" |
 | D1 | `tests/async-workspace.spec.ts`, `tests/async-actions.spec.ts` prompt and save tests |
-| 3.4, O1 | `tests/run-panel.spec.ts` "historical runs expose all results and failed full-output loads can be retried", "switching historical runs discards a late RunOutput response from the previous run"; `tests/outputs.spec.ts` "late output responses cannot appear under the next selected node" |
+| 3.4, O1 | `tests/run-panel.spec.ts` "historical runs expose all results and failed full-output loads can be retried", "switching historical runs discards a late RunOutput response from the previous run", "live runtime polls keep a failed output alert and Retry button mounted without flicker"; `tests/outputs.spec.ts` "late output responses cannot appear under the next selected node", "returning to a node discards an earlier in-flight manual output request" |
 
 ## 7. Keeping this file current
 

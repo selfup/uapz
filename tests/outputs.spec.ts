@@ -122,3 +122,64 @@ test("late output responses cannot appear under the next selected node", async (
     page.getByRole("button", { name: "View full output" }),
   ).toBeEnabled();
 });
+
+test("returning to a node discards an earlier in-flight manual output request", async ({
+  page,
+}) => {
+  await completedRun(page);
+  await queueReply(page, {
+    method: "output",
+    args: { node: "n0" },
+    gate: "first-manual",
+    value: {
+      label: "Text",
+      text: "STALE FIRST RESPONSE",
+      base64: null,
+      saved: null,
+      complete: true,
+    },
+  });
+  await page.getByRole("button", { name: "View full output" }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        Boolean((window as any).__testState.pending["first-manual"]),
+      ),
+    )
+    .toBe(true);
+
+  // Switch away and return to the same node, then issue a second request.
+  await page.locator('[data-id="n1"]').click();
+  await expect(page.locator(".ins-output")).toHaveText("Summary preview");
+  await page.locator('[data-id="n0"]').click();
+  await expect(page.locator(".ins-output")).toHaveText("Input preview");
+
+  await queueReply(page, {
+    method: "output",
+    args: { node: "n0" },
+    gate: "second-manual",
+    value: {
+      label: "Text",
+      text: "CURRENT SECOND RESPONSE",
+      base64: null,
+      saved: null,
+      complete: true,
+    },
+  });
+  await page.getByRole("button", { name: "View full output" }).click();
+  await expect(
+    page.getByRole("button", { name: "Loading…", exact: true }),
+  ).toBeDisabled();
+
+  // Releasing the first request must not clear Loading or overwrite the second.
+  await releaseReply(page, "first-manual");
+  await expect(
+    page.getByRole("button", { name: "Loading…", exact: true }),
+  ).toBeDisabled();
+  await expect(page.locator(".ins-output")).toHaveText("Input preview");
+
+  await releaseReply(page, "second-manual");
+  await expect(page.locator(".ins-output")).toHaveText(
+    "CURRENT SECOND RESPONSE",
+  );
+});
