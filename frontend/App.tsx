@@ -1246,7 +1246,9 @@ export default function App() {
     setNotice(`Deleted ${name}`);
   }
   async function deleteGraph(name: string) {
-    if (occupied) return;
+    // A save in flight still writes under the name it captured; mutating that
+    // file mid-flight would resurrect or fork it when the save lands.
+    if (occupied || saveInFlight.current) return;
     if (
       !(await confirmAction(
         `Delete the workflow ${name} and its run history?`,
@@ -1264,7 +1266,7 @@ export default function App() {
     } else setNotice(`Deleted ${name}`);
   }
   async function renameGraph(name: string) {
-    if (occupied) return;
+    if (occupied || saveInFlight.current) return;
     const to = await promptFor(`Rename ${name} to:`, {
       title: "Rename workflow",
       confirm: "Rename",
@@ -1304,7 +1306,7 @@ export default function App() {
     setNotice(`Renamed ${name} to ${result.name}`);
   }
   async function duplicateGraph(name: string) {
-    if (occupied) return;
+    if (occupied || saveInFlight.current) return;
     const to = await promptFor(`Save a copy of ${name} as:`, {
       title: "Duplicate workflow",
       confirm: "Duplicate",
@@ -1516,6 +1518,9 @@ export default function App() {
     trailing: "add" | "open" = "add",
     drag?: LibraryItem,
     actions?: { label: string; icon: ReactNode; run: () => void }[],
+    // Workflow open stays available during an in-flight save; rename/delete/
+    // duplicate must wait so the landing write cannot resurrect the old name.
+    mutateDisabled = disabled,
   ) => (
     <div className="library-row" key={key}>
       <button
@@ -1547,7 +1552,7 @@ export default function App() {
               aria-label={item.label}
               title={item.label}
               onClick={item.run}
-              disabled={disabled}
+              disabled={mutateDisabled}
             >
               {item.icon}
             </button>
@@ -1558,7 +1563,7 @@ export default function App() {
               aria-label={`Delete ${label}`}
               title={`Delete ${label}`}
               onClick={onDelete}
-              disabled={disabled}
+              disabled={mutateDisabled}
             >
               <Trash2 size={13} />
             </button>
@@ -1597,6 +1602,7 @@ export default function App() {
                       run: () => void action(() => duplicateGraph(name)),
                     },
                   ],
+                  occupied || readOnly || saving,
                 ),
               ),
           },

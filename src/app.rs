@@ -841,36 +841,48 @@ impl AppService {
                 result
             })),
         };
+        // Keep the finished session until the worker is actually running. A spawn
+        // failure must restore it so live outputs stay reachable.
+        let previous = current.clone();
         *current = Some(session.clone());
         let root = self.root.clone();
-        let spawn = std::thread::Builder::new()
-            .name(format!("uapz-run-{id}"))
-            .spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let http = UreqHttp::new(exec::HTTP_TIMEOUT);
-                    let report = exec::run_all_with(
-                        &graph,
-                        &targets,
-                        exec::Dirs::under(&root),
-                        &http,
-                        &exec::process_env,
-                        &control,
-                    );
-                    let mut run =
-                        history::record(&graph, &targets, &report, control.cache.as_deref());
-                    let save_error = history::save(&root, &run).err();
-                    if let Some(error) = &save_error {
-                        run.log
-                            .push(format!("The run record was not saved: {error}"));
-                    }
-                    (run, save_error)
-                }));
-                // A panic unwinds past the record; the session still leaves `running`
-                // the same way, so no node stays pending or running forever.
-                lock(&session).finish(result.ok());
-            });
-        if let Err(error) = spawn {
-            *current = None;
+        let worker = move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let http = UreqHttp::new(exec::HTTP_TIMEOUT);
+                let report = exec::run_all_with(
+                    &graph,
+                    &targets,
+                    exec::Dirs::under(&root),
+                    &http,
+                    &exec::process_env,
+                    &control,
+                );
+                let mut run = history::record(&graph, &targets, &report, control.cache.as_deref());
+                let save_error = history::save(&root, &run).err();
+                if let Some(error) = &save_error {
+                    run.log
+                        .push(format!("The run record was not saved: {error}"));
+                }
+                (run, save_error)
+            }));
+            // A panic unwinds past the record; the session still leaves `running`
+            // the same way, so no node stays pending or running forever.
+            lock(&session).finish(result.ok());
+        };
+        #[cfg(test)]
+        let fail_spawn = tests::take_fail_next_spawn();
+        #[cfg(not(test))]
+        let fail_spawn = false;
+        let spawned = if fail_spawn {
+            Err(std::io::Error::other("injected spawn failure"))
+        } else {
+            std::thread::Builder::new()
+                .name(format!("uapz-run-{id}"))
+                .spawn(worker)
+                .map(|_| ())
+        };
+        if let Err(error) = spawned {
+            *current = previous;
             return Err(format!("start execution worker: {error}"));
         }
         Ok(json!({"run_id":id}))
@@ -1246,6 +1258,13 @@ mod tests {
     use crate::node_data::{FileConfig, ScriptConfig};
     use std::time::{Duration, Instant};
 
+    static FAIL_NEXT_SPAWN: AtomicBool = AtomicBool::new(false);
+
+    /// Consume a one-shot spawn failure for the next `start_run` in this process.
+    pub(super) fn take_fail_next_spawn() -> bool {
+        FAIL_NEXT_SPAWN.swap(false, Ordering::Relaxed)
+    }
+
     struct Workspace {
         root: PathBuf,
         service: AppService,
@@ -1444,6 +1463,42 @@ mod tests {
                 .unwrap_err()
                 .contains("no longer stored")
         );
+    }
+
+    #[test]
+    fn a_spawn_failure_keeps_the_previous_finished_session() {
+        let workspace = Workspace::new();
+        workspace
+            .service
+            .request("start_run", json!({"doc":input_doc()}))
+            .unwrap();
+        let finished = workspace.until(|s| s["running"] == false);
+        let run_id = finished["run_id"].clone();
+        let live = workspace
+            .service
+            .request(
+                "output",
+                json!({"graph":"service-input","run_id":run_id,"node":"n0"}),
+            )
+            .unwrap();
+        assert_eq!(live["text"], "hello");
+        FAIL_NEXT_SPAWN.store(true, Ordering::Relaxed);
+        let error = workspace
+            .service
+            .request("start_run", json!({"doc":input_doc()}))
+            .unwrap_err();
+        assert!(error.contains("start execution worker"), "{error}");
+        let state = workspace.state();
+        assert_eq!(state["running"], false);
+        assert_eq!(state["run_id"], run_id);
+        let kept = workspace
+            .service
+            .request(
+                "output",
+                json!({"graph":"service-input","run_id":run_id,"node":"n0"}),
+            )
+            .unwrap();
+        assert_eq!(kept["text"], "hello");
     }
 
     #[test]

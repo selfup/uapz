@@ -53,3 +53,9 @@ I repeat: for python use `uv run python -`
 
 - No agent attribution in commits (no `Co-authored-by`, `Made-with`, or similar trailers/footers)
 - Author/committer identity must be the human owner’s configured git user only
+
+## Writing
+
+- Prefer plain ASCII in docs, comments, commit messages, and replies
+- Do not use uncommon symbols such as `§` (section sign); write "section 5.1" instead
+- Avoid ornamental unicode (arrows like `→`, fancy dashes, emoji) unless the file already uses them for a clear purpose

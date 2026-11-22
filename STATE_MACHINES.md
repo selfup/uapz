@@ -57,7 +57,7 @@ Transitions:
 | From | Trigger | Guard | To | Effect |
 | --- | --- | --- | --- | --- |
 | any | `start_run` (`AppService::start`) | no session is running (`AppService::start` running check), otherwise `a run is already active` | Occupied, running | New `Session` with every member node marked `pending`; worker thread spawned; the previous session is dropped, which sets its (already finished) cancel flag. |
-| Occupied, running | spawn fails (`AppService::start`) | | Empty | The new session is discarded; the previous finished session is lost with it. |
+| Occupied, running | spawn fails (`AppService::start`) | | previous slot (Occupied, finished or Empty) | The new session is discarded; the previous finished session is restored so its live outputs stay reachable. |
 | Occupied, running | worker ends (`Session::finish`) | | Occupied, finished | See 2.2. |
 | Occupied, finished or Empty | `clear_cache`, `clear_history`, `delete_graph`, `rename_graph` | `AppService::idle` holds the slot lock for the whole operation, so no run can start meanwhile | *Self* | |
 | Occupied, running | the same four requests | | *Self* | Error `wait for the active run to finish`. |
@@ -300,8 +300,9 @@ In smoke mode the window closes without asking.
 | any | `updateGraph` / `updateNode` | not read only; same epoch | Dirty | undo entry pushed; redo cleared |
 | Dirty | `save` | `saveInFlight` false | Clean if no edit landed during the request, else Dirty | `savedKey` set only when the document is unchanged; library refreshed |
 | any | `newGraph` / `openGraph` | not `occupied`; no run is being prepared or started; `discardDraft` agreed; navigation counter unchanged | Clean | epoch incremented; history, selection, children, shown run and attached run reset |
-| Clean | `deleteGraph` of the open graph | | Dirty | `savedKey = null` |
-| any | `renameGraph` of the open graph | not `occupied` | *Self* | name replaced; `savedKey` follows only when clean; the shown run, the history list and the remembered per-node runs are re-keyed to the new name (finding A) |
+| Clean | `deleteGraph` of the open graph | not `occupied`; no save in flight | Dirty | `savedKey = null` |
+| any | `renameGraph` of the open graph | not `occupied`; no save in flight | *Self* | name replaced; `savedKey` follows only when clean; the shown run, the history list and the remembered per-node runs are re-keyed to the new name (finding A) |
+| any | `duplicateGraph` | not `occupied`; no save in flight | *Self* | copy written under the new name |
 | any | undo / redo | not read only | Dirty or Clean by comparison with `savedKey` | view kept |
 | any | `openChild` | depth under 8; navigation counters unchanged | child pushed | snapshot when a run is shown, saved graph otherwise |
 
@@ -356,8 +357,10 @@ Invariants:
   cannot be resubmitted.
 - F2. One decision per review: `decidingReview` blocks the second click (finding D).
 - F3. Navigation, rename, delete, duplicate and Clear history are disabled while
-  `occupied`, matching the service's `idle()` guard. Save is allowed during a run on
-  purpose: the run uses the document captured at start.
+  `occupied`, matching the service's `idle()` guard. Rename, delete and duplicate are
+  also disabled while a save is in flight so a landing write cannot resurrect the old
+  name; opening another graph during that save stays allowed. Save is allowed during a
+  run on purpose: the run uses the document captured at start.
 - F4. Completion is detected once per attached run, whether or not a record exists
   (finding C).
 
@@ -425,8 +428,8 @@ until the dialog answers.
 ## 5. Findings
 
 Each finding names the invalid state or transition, how the code reached it, the evidence,
-and the fix. Issues are ordered by impact. All five below are fixed in this change set and
-pinned by the tests named.
+and the fix. Issues are ordered by impact. All below are fixed and pinned by the tests
+named.
 
 ### A. Renamed graph: records unreachable by the name they carry (high)
 
@@ -511,6 +514,30 @@ pinned by the tests named.
   (`tests/support/workspace.ts`), so `__testState.emit("close-requested")` reaches the
   renderer.
 
+### F. Save in flight could resurrect a renamed or deleted graph (medium)
+
+- **Invalid transition**: Dirty → save submitted → rename/delete/duplicate of that name →
+  save lands and writes the old name again (violates the library's one-file-per-name
+  expectation).
+- **Reached by**: rename, delete and duplicate stayed enabled while `saveInFlight` was
+  true. Opening another graph during a save is intentional and must stay available; a
+  blanket library lock would have removed that.
+- **Fix**: rename, delete and duplicate take the same `saveInFlight` guard as their
+  buttons (`mutateDisabled` while `saving`); open stays enabled. Invariant F3.
+- **Tests**: `async-workspace.spec.ts` "rename, delete and duplicate wait for an in-flight
+  save, while open stays available".
+
+### G. Spawn failure dropped the previous finished session (medium)
+
+- **Invalid state**: after `start_run` fails to spawn a worker, the slot is Empty even
+  though a finished session with live outputs was present (violates the 2.1 rule that a
+  finished session stays until the next run replaces it).
+- **Reached by**: `AppService::start` wrote the new session into the slot before spawn, then
+  cleared the slot to `None` on spawn failure.
+- **Fix**: keep the previous slot value and restore it when spawn fails; the never-started
+  session is discarded.
+- **Tests**: `app::tests::a_spawn_failure_keeps_the_previous_finished_session`.
+
 ### 5.1 Reachable but left as is
 
 These are real but low impact, or the alternative would cost an intended behaviour. Each
@@ -518,13 +545,11 @@ is listed so a later change does not mistake them for oversights.
 
 | Situation | What happens | Why unchanged |
 | --- | --- | --- |
-| Save in flight, then Rename, Delete or Duplicate of the same graph | The save completes under the old name, so a renamed graph reappears, or a deleted one comes back, as a second file. The open document stays consistent and dirty. | Opening another graph during a save is intended and tested (`async-workspace.spec.ts`); blocking library actions on `saving` would remove that. Window is one IPC round trip. |
 | `start_run` accepted but its reply never reaches the renderer | The service runs an unattached session: Cancel works, the review panel shows, but the run panel is empty and completion is not announced. | Only a transport failure between the webview and the shell produces this. A restart attaches to a running session (3.3). |
 | Live outputs over 4 MB in total while a run is still going | `output` answers `no longer stored` for the evicted node until the record exists; **Retry output** then works. | Bound is deliberate; the record recovers the output. |
 | A history run is inspected in the gap between a review decision and the completion poll | The completion notice is suppressed to keep the chosen run on screen; results and history are still recorded, and a service error is still shown. | Intended, pinned by `run-history.spec.ts`. |
 | Undo after renaming the open graph | The old name comes back; saving recreates the old file. | Undo restores documents, and the name is part of the document. |
 | Two targets fail; the record is reopened | `Run.failed` names the first to fail; the order of the others is not stored. | Only the first matters to the outcome's error and the headline. |
-| `start_run` spawn failure | The previous finished session's live outputs are gone; its record remains. | Spawn failure is an out-of-resources condition. |
 
 ### 5.2 Checked and sound
 
@@ -557,7 +582,9 @@ Paths that looked suspicious and held up, so they need not be re-derived:
 | R6, R7 feed bounds | `app::tests::feed_preserves_order_coalesces_text_and_replaces_completed_streams`, `app::tests::feed_retention_is_bounded_and_flags_utf8_truncation_and_real_evictions` |
 | F1 | `async-actions.spec.ts` "preparing a run blocks repeated execution", "an accepted run cannot be resubmitted" |
 | F2 | `run-lifecycle.spec.ts` "a review decision is sent once" |
+| F3 save-vs-mutate | `async-workspace.spec.ts` "rename, delete and duplicate wait for an in-flight save, while open stays available" |
 | F4, X1 | `run-lifecycle.spec.ts` "a run whose worker stopped without a record" |
+| 2.1 spawn failure restores previous | `app::tests::a_spawn_failure_keeps_the_previous_finished_session` |
 | 3.3 stale poll | `async-actions.spec.ts` "a late runtime poll" |
 | 3.5, X7 | `run-lifecycle.spec.ts` "a saved, idle workflow quits at once", "quitting while a run is in progress asks first"; `session.spec.ts` "leaving unsaved changes offers to save them first" |
 | D1 | `async-workspace.spec.ts`, `async-actions.spec.ts` prompt and save tests |

@@ -70,6 +70,35 @@ test("a save response from the previous graph cannot replace the open graph", as
   ).toHaveText("Parts");
 });
 
+test("rename, delete and duplicate wait for an in-flight save, while open stays available", async ({
+  page,
+}) => {
+  await queueReply(page, { method: "save_graph", gate: "saving-mutates" });
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect
+    .poll(async () => (await callsFor(page, "save_graph")).length)
+    .toBe(1);
+  const demo = page.locator(".library-row").filter({ hasText: "Demo" }).first();
+  await demo.hover();
+  await expect(demo.getByLabel("Rename Demo", { exact: true })).toBeDisabled();
+  await expect(
+    demo.getByLabel("Duplicate Demo", { exact: true }),
+  ).toBeDisabled();
+  await expect(demo.getByLabel("Delete Demo", { exact: true })).toBeDisabled();
+  await page
+    .locator(".library")
+    .getByRole("button", { name: "Parts", exact: true })
+    .click();
+  await expect(page.locator('[data-id="n4"]')).toBeVisible();
+  await releaseReply(page, "saving-mutates");
+  const parts = page
+    .locator(".library-row")
+    .filter({ hasText: "Parts" })
+    .first();
+  await parts.hover();
+  await expect(parts.getByLabel("Rename Parts", { exact: true })).toBeEnabled();
+});
+
 test("the latest graph selection wins when loads finish out of order", async ({
   page,
 }) => {
