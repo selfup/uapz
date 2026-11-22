@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# Run `npm ci` and `npx playwright install chromium` once before this script.
+# Run `./scripts/setup.sh` once before this script.
 cargo fmt --all --check
 npm run check
 npm run build

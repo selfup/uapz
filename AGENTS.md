@@ -48,3 +48,8 @@ Only use uv to install deps, and run python code.
 uv is built from source and manages python.
 
 I repeat: for python use `uv run python -`
+
+## Commits
+
+- No agent attribution in commits (no `Co-authored-by`, `Made-with`, or similar trailers/footers)
+- Author/committer identity must be the human owner’s configured git user only

@@ -20,8 +20,14 @@ depend on changed.
 
 ## Running
 
-Use Node.js 24, npm, stable Rust and the macOS Xcode command-line tools. To build and
-run the app with its frontend embedded:
+Use Node.js 24, npm, stable Rust and the macOS Xcode command-line tools. Install
+frontend, Playwright, and Rust crate dependencies once (or after lockfile changes):
+
+```sh
+./scripts/setup.sh
+```
+
+To build and run the app with its frontend embedded:
 
 ```sh
 ./scripts/run-app.sh
@@ -38,11 +44,11 @@ current directory. Use `--debug` for faster builds, or select another workspace:
 ```
 
 `UAPZ_WORKSPACE_DIR` also overrides the script's default workspace; an explicit
-`--workspace` takes precedence. Run `npm ci` again after dependency lockfile changes.
-For development with frontend hot reload:
+`--workspace` takes precedence. Run `./scripts/setup.sh` again after dependency
+lockfile changes. For development with frontend hot reload:
 
 ```sh
-npm ci
+./scripts/setup.sh
 cargo check --workspace --all-targets
 npm run desktop
 ```
@@ -83,6 +89,13 @@ management, the theme, delayed save, navigation and output responses, a run that
 without a record, one decision per review, and quitting while a run is active:
 
 ```sh
+./scripts/setup.sh
+./scripts/run-tests.sh
+```
+
+Or the same steps by hand (after `./scripts/setup.sh`):
+
+```sh
 cargo fmt --all --check
 cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
@@ -90,7 +103,6 @@ cargo test --workspace
 npm run check
 npm run build
 npm test
-npx playwright install chromium
 npm run test:ui
 ```
 
@@ -122,9 +134,10 @@ The application prints the result and exits automatically. The temporary workspa
 the generated fixtures for inspection.
 
 CI (`.github/workflows/ci.yml`) runs these Rust and frontend checks on a macOS runner
-for every push and pull request. After installing dependencies and Chromium,
-`scripts/run-tests.sh` runs the same validation locally. `scripts/run-tests.sh local`
-also starts LM Studio, reloads its models and runs the live suite with this machine's defaults.
+for every push and pull request. Locally, `scripts/setup.sh` installs npm, Playwright
+and Rust crate dependencies, then `scripts/run-tests.sh` runs the same validation.
+`scripts/run-tests.sh local` also starts LM Studio, reloads its models and runs the
+live suite with this machine's defaults.
 
 Live tests drive the executor against a real OpenAI-compatible server and a PostgreSQL
 server; they are ignored by default. With a chat model and an embedding model loaded in LM
@@ -846,6 +859,7 @@ ids and `-->` edges (node shapes and `|labels|` are tolerated) and laid out left
 | `src/review.rs` | File snapshots, bounded diffs, review decisions and stale-file checks |
 | `src/history.rs` | Run records, input values, output previews and history replay |
 | `src/providers.rs` | Provider request builders and reply parsers; the HTTP client, plain and streamed |
+| `scripts/setup.sh` | Frontend, Playwright and Rust crate dependency install |
 | `.github/workflows/ci.yml`, `scripts/run-tests.sh` | Rust/frontend checks, builds and interaction tests |
 | `src/node_data.rs` | The typed node content: configs, enums, summaries, validation |
 | `src/validate.rs` | Sanitizers and validators: names, paths, env vars, identifiers, SQL |
