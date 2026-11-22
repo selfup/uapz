@@ -1265,11 +1265,13 @@ mod tests {
     use crate::node_data::{FileConfig, ScriptConfig};
     use std::time::{Duration, Instant};
 
-    static FAIL_NEXT_SPAWN: AtomicBool = AtomicBool::new(false);
+    thread_local! {
+        static FAIL_NEXT_SPAWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
 
-    /// Consume a one-shot spawn failure for the next `start_run` in this process.
+    /// Consume a one-shot spawn failure for the next `start_run` on this thread.
     pub(super) fn take_fail_next_spawn() -> bool {
-        FAIL_NEXT_SPAWN.swap(false, Ordering::Relaxed)
+        FAIL_NEXT_SPAWN.with(|flag| flag.replace(false))
     }
 
     struct Workspace {
@@ -1489,7 +1491,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(live["text"], "hello");
-        FAIL_NEXT_SPAWN.store(true, Ordering::Relaxed);
+        FAIL_NEXT_SPAWN.with(|flag| flag.set(true));
         let error = workspace
             .service
             .request("start_run", json!({"doc":input_doc()}))
@@ -2441,5 +2443,327 @@ mod tests {
         assert!(session.stream.as_ref().unwrap().1.len() <= MAX_LIVE_TEXT);
         assert!(session.log_bytes <= MAX_LIVE_LOG);
         assert!(session.log.len() <= 2);
+    }
+
+    #[test]
+    fn spawn_failure_on_empty_slot_leaves_service_empty() {
+        let workspace = Workspace::new();
+        assert!(workspace.state().is_null());
+        FAIL_NEXT_SPAWN.with(|flag| flag.set(true));
+        let error = workspace
+            .service
+            .request("start_run", json!({"doc":input_doc()}))
+            .unwrap_err();
+        assert!(error.contains("start execution worker"), "{error}");
+        assert!(workspace.state().is_null());
+        workspace
+            .service
+            .request("start_run", json!({"doc":input_doc()}))
+            .unwrap();
+        let state = workspace.until(|s| s["running"] == false);
+        assert_eq!(state["run"]["outcome"]["kind"], "ok");
+    }
+
+    #[test]
+    fn active_run_blocks_all_idle_mutations_until_finished() {
+        let workspace = Workspace::new();
+        workspace
+            .service
+            .request("start_run", json!({"doc":review_doc()}))
+            .unwrap();
+        let state = workspace.until(|s| s["review"].is_object());
+        for (method, args) in [
+            ("clear_cache", json!({})),
+            ("clear_history", json!({"graph":"service-review"})),
+            ("delete_graph", json!({"name":"service-review"})),
+            (
+                "rename_graph",
+                json!({"from":"service-review","to":"renamed-review"}),
+            ),
+        ] {
+            let error = workspace.service.request(method, args).unwrap_err();
+            assert_eq!(error, "wait for the active run to finish", "{method}");
+        }
+        let error = workspace
+            .service
+            .request(
+                "review",
+                json!({
+                    "run_id": state["run_id"],
+                    "review_id": state["review"]["id"],
+                    "decision": "maybe"
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(error, "unknown review decision");
+        workspace
+            .service
+            .request("cancel_run", json!({"run_id":state["run_id"]}))
+            .unwrap();
+        workspace.until(|s| s["running"] == false);
+        assert_eq!(
+            workspace
+                .service
+                .request("clear_history", json!({"graph":"service-review"}))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            workspace.service.request("clear_cache", json!({})).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn sequential_reviews_enforce_unique_ids_and_all_review_guards() {
+        let workspace = Workspace::new();
+        let mut graph = review_doc();
+        graph.nodes.push(node(
+            "n2",
+            None,
+            NodeData::File(FileConfig {
+                path: "review-second.txt".into(),
+                review: true,
+                ..Default::default()
+            }),
+        ));
+        graph.edges.push(EdgeDoc {
+            from: "n1".into(),
+            to: "n2".into(),
+            output: None,
+        });
+        let started = workspace
+            .service
+            .request("start_run", json!({"doc":graph}))
+            .unwrap();
+        let run_id = started["run_id"].as_str().unwrap().to_string();
+        let first = workspace.until(|s| s["review"].is_object());
+        let first_id = first["review"]["id"].as_str().unwrap().to_string();
+        assert_eq!(first_id, format!("{run_id}-review-1"));
+        assert_eq!(first["marks"]["n0"], "ran");
+        assert_eq!(first["marks"]["n1"], "running");
+        assert_eq!(first["marks"]["n2"], "pending");
+
+        // Running with no pending review returns "there is no pending review".
+        let session = workspace.service.session(&run_id).unwrap();
+        let held = lock(&session).review.take().unwrap();
+        let no_pending = workspace
+            .service
+            .request(
+                "review",
+                json!({"run_id":run_id,"review_id":first_id,"decision":"apply"}),
+            )
+            .unwrap_err();
+        assert_eq!(no_pending, "there is no pending review");
+        lock(&session).review = Some(held);
+
+        workspace
+            .service
+            .request(
+                "review",
+                json!({"run_id":run_id,"review_id":first_id,"decision":"apply"}),
+            )
+            .unwrap();
+
+        // The second file node gets a distinct review id; the earlier id is stale.
+        let second = workspace
+            .until(|s| s["review"].is_object() && s["review"]["id"].as_str() != Some(&first_id));
+        let second_id = second["review"]["id"].as_str().unwrap().to_string();
+        assert_eq!(second_id, format!("{run_id}-review-2"));
+        let stale = workspace
+            .service
+            .request(
+                "review",
+                json!({"run_id":run_id,"review_id":first_id,"decision":"apply"}),
+            )
+            .unwrap_err();
+        assert_eq!(stale, "this review is stale");
+
+        // An already-answered channel surfaces "this review has already been answered".
+        {
+            let guard = lock(&session);
+            let (_, pending) = guard.review.as_ref().unwrap();
+            assert!(pending.decide(review::Decision::Apply));
+        }
+        let answered = workspace
+            .service
+            .request(
+                "review",
+                json!({"run_id":run_id,"review_id":second_id,"decision":"apply"}),
+            )
+            .unwrap_err();
+        assert_eq!(answered, "this review has already been answered");
+
+        let done = workspace.until(|s| s["running"] == false);
+        assert_eq!(done["run"]["outcome"]["kind"], "ok");
+        assert_eq!(
+            std::fs::read_to_string(workspace.root.join("review.txt")).unwrap(),
+            "hello\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.root.join("review-second.txt")).unwrap(),
+            "hello\n"
+        );
+        // A finished session rejects late review requests.
+        let finished_err = workspace
+            .service
+            .request(
+                "review",
+                json!({"run_id":run_id,"review_id":second_id,"decision":"apply"}),
+            )
+            .unwrap_err();
+        assert_eq!(finished_err, "this run is no longer awaiting review");
+    }
+
+    #[test]
+    fn cancelling_state_rejects_reviews_and_recorded_finish_clears_pending_marks() {
+        let workspace = Workspace::new();
+        let mut graph = review_doc();
+        graph.nodes.push(node(
+            "n2",
+            None,
+            NodeData::File(FileConfig {
+                path: "never-written.txt".into(),
+                review: false,
+                ..Default::default()
+            }),
+        ));
+        graph.edges.push(EdgeDoc {
+            from: "n1".into(),
+            to: "n2".into(),
+            output: None,
+        });
+        let started = workspace
+            .service
+            .request("start_run", json!({"doc":graph}))
+            .unwrap();
+        let run_id = started["run_id"].as_str().unwrap().to_string();
+        let awaiting = workspace.until(|s| s["review"].is_object());
+        assert_eq!(awaiting["cancelling"], false);
+        assert_eq!(awaiting["marks"]["n2"], "pending");
+
+        // Cancel the run and verify final marks agree 1-to-1 with run.nodes (R2, R3, H5, X3).
+        workspace
+            .service
+            .request("cancel_run", json!({"run_id":run_id}))
+            .unwrap();
+        let done = workspace.until(|s| s["running"] == false);
+        assert_eq!(done["cancelling"], false);
+        assert_eq!(done["run"]["outcome"]["kind"], "cancelled");
+        assert!(done["marks"].get("n1").is_none());
+        assert!(done["marks"].get("n2").is_none());
+        assert_eq!(done["marks"], json!({"n0": "ran"}));
+        let mark_keys: Vec<_> = done["marks"].as_object().unwrap().keys().collect();
+        let node_keys: Vec<_> = done["run"]["nodes"].as_object().unwrap().keys().collect();
+        assert_eq!(mark_keys, node_keys);
+        for key in &mark_keys {
+            assert_eq!(done["marks"][*key], done["run"]["nodes"][*key]["state"]);
+        }
+
+        // Verify the Cancelling state itself: running && cancel => cancelling: true and
+        // review requests fail with "this run is no longer awaiting review".
+        let session = lock(&workspace.service.current).clone().unwrap();
+        {
+            let mut guard = lock(&session);
+            guard.running = true;
+            guard.cancel.store(true, Ordering::Relaxed);
+            guard.review = None;
+        }
+        let cancelling_state = workspace.state();
+        assert_eq!(cancelling_state["running"], true);
+        assert_eq!(cancelling_state["cancelling"], true);
+        assert_eq!(
+            workspace
+                .service
+                .request(
+                    "review",
+                    json!({"run_id":run_id,"review_id":"r1","decision":"apply"}),
+                )
+                .unwrap_err(),
+            "this run is no longer awaiting review"
+        );
+        lock(&session).running = false;
+        assert_eq!(workspace.state()["cancelling"], false);
+    }
+
+    #[test]
+    fn save_error_records_run_and_surfaces_error_in_finished_session() {
+        let workspace = Workspace::new();
+        // Block `runs/` by placing a regular file there so history::save fails.
+        std::fs::write(workspace.root.join("runs"), "not a directory").unwrap();
+        workspace
+            .service
+            .request("start_run", json!({"doc":input_doc()}))
+            .unwrap();
+        let state = workspace.until(|s| s["running"] == false);
+        assert_eq!(state["cancelling"], false);
+        assert_eq!(state["run"]["outcome"]["kind"], "ok");
+        assert!(state["error"].as_str().is_some_and(|e| !e.is_empty()));
+        assert!(state["run"]["log"].as_array().unwrap().iter().any(|line| {
+            line.as_str()
+                .unwrap_or_default()
+                .contains("The run record was not saved")
+        }));
+        assert_eq!(state["marks"], json!({"n0": "ran"}));
+    }
+
+    #[test]
+    fn completed_output_preserves_other_nodes_stream_and_text_events() {
+        let workspace = Workspace::new();
+        workspace
+            .service
+            .request("start_run", json!({"doc":input_doc()}))
+            .unwrap();
+        workspace.until(|s| s["running"] == false);
+        let session = lock(&workspace.service.current).clone().unwrap();
+        let mut session = lock(&session);
+        session.events.clear();
+        session.event_bytes = 0;
+        session.next_seq = 1;
+        session.stream = None;
+        session.progress(Progress::Text {
+            id: "n0".into(),
+            text: "first stream".into(),
+        });
+        session.progress(Progress::Text {
+            id: "n1".into(),
+            text: "second stream".into(),
+        });
+        let result = session.run.as_ref().unwrap().nodes["n0"].clone();
+        // Completing n0 removes n0's text event but keeps n1's text event and active stream.
+        session.progress(Progress::Output {
+            id: "n0".into(),
+            result: Box::new(result.clone()),
+        });
+        let state = session.value();
+        assert_eq!(
+            state["stream"],
+            json!({"id": "n1", "text": "second stream"})
+        );
+        let events = state["events"].as_array().unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| e["kind"] == "text" && e["id"] == "n0")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e["kind"] == "text" && e["id"] == "n1")
+        );
+        // Completing n1 then clears stream and removes n1's text event.
+        session.progress(Progress::Output {
+            id: "n1".into(),
+            result: Box::new(result),
+        });
+        let state = session.value();
+        assert!(state["stream"].is_null());
+        assert!(
+            !state["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["kind"] == "text")
+        );
     }
 }

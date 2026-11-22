@@ -2,6 +2,7 @@ import type { Page } from "@playwright/test";
 import {
   test,
   expect,
+  parent,
   queueReply,
   releaseReply,
   callsFor,
@@ -348,4 +349,438 @@ test("save and quit refuses to quit while another save is already in flight", as
   expect(await page.evaluate(() => (window as any).__testState.quits)).toBe(0);
   await releaseReply(page, "in-flight-save");
   await expect(page.locator(".save-state")).toHaveText("Saved workflow");
+});
+
+test("launching with an active service session loads its graph as dirty and attaches", async ({
+  page,
+}) => {
+  await page.addInitScript((doc) => {
+    window.localStorage.setItem(
+      "uapz.layout",
+      JSON.stringify({
+        lastGraph: { workspace: "/test/workspace", name: "Parts" },
+      }),
+    );
+    (window as any).__testState.runtime = {
+      run_id: "live-1",
+      running: true,
+      cancelling: false,
+      graph: structuredClone(doc),
+      targets: ["n2"],
+      marks: { n0: "ran", n1: "ran", n2: "running" },
+      log: ["Resumed session"],
+      stream: null,
+      workflows: {},
+      review: {
+        id: "review-1",
+        node: "n2",
+        files: [
+          {
+            path: "heading.md",
+            before_bytes: null,
+            after_bytes: 8,
+            diff: "+ Example\n",
+          },
+        ],
+      },
+      run: null,
+      error: null,
+    };
+  }, parent);
+  await page.reload();
+  await expect(page.getByLabel("Workflow name", { exact: true })).toHaveValue(
+    "Demo",
+  );
+  await expect(page.locator(".save-state")).toHaveText("Unsaved changes");
+  await expect(
+    page.getByRole("tab", { name: "Run output", exact: true }),
+  ).toHaveAttribute("aria-selected", "true");
+  const review = page.getByRole("region", { name: "Review file changes" });
+  await expect(review).toBeVisible();
+  await review
+    .getByRole("button", { name: "Apply changes", exact: true })
+    .click();
+  await expect(page.getByRole("status")).toHaveText("Completed in 0.1s");
+});
+
+test("polling attaches to an unowned active run for the open graph", async ({
+  page,
+}) => {
+  // Open the Run inputs form so orphan attach must dismiss it and switch to Run output.
+  await page.getByRole("button", { name: "Run workflow", exact: true }).click();
+  await expect(
+    page.getByRole("region", { name: "Run inputs" }),
+  ).toBeVisible();
+  await page.evaluate((doc) => {
+    (window as any).__testState.runtime = {
+      run_id: "live-1",
+      running: true,
+      cancelling: false,
+      graph: structuredClone(doc),
+      targets: ["n2"],
+      marks: { n0: "ran", n1: "ran", n2: "running" },
+      log: ["Orphan run started"],
+      stream: null,
+      workflows: {},
+      review: {
+        id: "review-1",
+        node: "n2",
+        files: [
+          {
+            path: "heading.md",
+            before_bytes: null,
+            after_bytes: 8,
+            diff: "+ Example\n",
+          },
+        ],
+      },
+      run: null,
+      error: null,
+    };
+  }, parent);
+  const review = page.getByRole("region", { name: "Review file changes" });
+  await expect(review).toBeVisible();
+  await expect(
+    page.getByRole("region", { name: "Run inputs" }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("tab", { name: "Run output", exact: true }),
+  ).toHaveAttribute("aria-selected", "true");
+  await review
+    .getByRole("button", { name: "Apply changes", exact: true })
+    .click();
+  await expect(page.getByRole("status")).toHaveText("Completed in 0.1s");
+});
+
+test("cancelling a running workflow shows Cancelling state until the worker finishes", async ({
+  page,
+}) => {
+  const review = await startRun(page);
+  // Keep the worker running in the cancelling state after cancel_run is accepted.
+  await queueReply(page, { method: "cancel_run", value: null });
+  await page.evaluate(() => {
+    const state = (window as any).__testState;
+    state.runtime = { ...state.runtime, cancelling: true };
+  });
+  await page
+    .getByRole("banner")
+    .getByRole("button", { name: "Cancel run", exact: true })
+    .click();
+  await expect(
+    page
+      .getByRole("banner")
+      .getByRole("button", { name: "Cancelling…", exact: true }),
+  ).toBeDisabled();
+  await expect(
+    review.getByRole("button", { name: "Apply changes", exact: true }),
+  ).toBeDisabled();
+  await expect(
+    review.getByRole("button", { name: "Reject", exact: true }),
+  ).toBeDisabled();
+  await expect(
+    review.getByRole("button", { name: "Cancel run", exact: true }),
+  ).toBeDisabled();
+  // Once the pending review clears while still cancelling, the run panel badge shows Cancelling.
+  await page.evaluate(() => {
+    const state = (window as any).__testState;
+    state.runtime = { ...state.runtime, review: null };
+  });
+  await expect(page.locator(".run-status")).toHaveText("Cancelling");
+
+  await page.evaluate(() => {
+    const state = (window as any).__testState;
+    state.runtime = {
+      ...state.runtime,
+      running: false,
+      cancelling: false,
+      run: {
+        id: "cancelled-1",
+        graph: "Demo",
+        targets: ["n2"],
+        elapsed_ms: 15,
+        inputs: {},
+        nodes: {},
+        log: [],
+        outcome: { kind: "cancelled" },
+      },
+    };
+  });
+  await expect(page.getByRole("status")).toHaveText("Run cancelled");
+  await expect(page.locator(".run-status")).toHaveText("Cancelled");
+  await expect(
+    page.getByRole("button", { name: "Run workflow", exact: true }),
+  ).toBeEnabled();
+});
+
+test("workflows without input fields start immediately and return to idle on start failure", async ({
+  page,
+}) => {
+  await queueReply(page, {
+    method: "prepare_run",
+    value: { targets: ["n2"], fields: [], inputs: {} },
+  });
+  await queueReply(page, {
+    method: "start_run",
+    error: "Service refused immediate start",
+  });
+  await page.getByRole("button", { name: "Run workflow", exact: true }).click();
+  await expect(page.locator(".error-banner")).toContainText(
+    "Service refused immediate start",
+  );
+  await expect(
+    page.getByRole("region", { name: "Run inputs" }),
+  ).toHaveCount(0);
+  expect(await callsFor(page, "start_run")).toHaveLength(1);
+  await expect(
+    page.getByRole("button", { name: "Run workflow", exact: true }),
+  ).toBeEnabled();
+});
+
+test("save stays available during a run while navigation and destructive actions wait", async ({
+  page,
+}) => {
+  await startRun(page);
+  await expect(
+    page.getByRole("button", { name: "New", exact: true }),
+  ).toBeDisabled();
+  await expect(
+    page
+      .locator(".library")
+      .getByRole("button", { name: "Parts", exact: true }),
+  ).toBeDisabled();
+  const demoRow = page
+    .locator(".library-row")
+    .filter({ hasText: "Demo" })
+    .first();
+  await demoRow.hover();
+  await expect(
+    demoRow.getByLabel("Rename Demo", { exact: true }),
+  ).toBeDisabled();
+  await expect(
+    demoRow.getByLabel("Duplicate Demo", { exact: true }),
+  ).toBeDisabled();
+  await expect(
+    demoRow.getByLabel("Delete Demo", { exact: true }),
+  ).toBeDisabled();
+
+  await page.getByRole("tab", { name: "Node inspector", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "Clear cache", exact: true }),
+  ).toBeDisabled();
+  await expect(
+    page.getByRole("button", { name: "Clear history", exact: true }),
+  ).toBeDisabled();
+
+  const save = page.getByRole("button", { name: "Save", exact: true });
+  await expect(save).toBeEnabled();
+  await save.click();
+  await expect
+    .poll(async () => (await callsFor(page, "save_graph")).length)
+    .toBe(1);
+});
+
+test("a finished run with a save error surfaces the error even while inspecting history", async ({
+  page,
+}) => {
+  await page.evaluate(() => {
+    (window as any).__testState.history = [
+      {
+        id: "older-run",
+        graph: "Demo",
+        targets: ["n2"],
+        elapsed_ms: 20,
+        nodes: {
+          n0: {
+            state: "ran",
+            preview: "Older output",
+            label: "Text",
+            complete: true,
+          },
+        },
+        log: [],
+        outcome: { kind: "ok" },
+      },
+    ];
+  });
+  for (const name of ["Parts", "Demo"]) {
+    await page
+      .locator(".library")
+      .getByRole("button", { name, exact: true })
+      .click();
+    await expect(page.getByLabel("Workflow name", { exact: true })).toHaveValue(
+      name,
+    );
+  }
+  const review = await startRun(page);
+  await queueReply(page, { method: "runtime_state", gate: "save-err-poll" });
+  await pending(page, "save-err-poll");
+  await review
+    .getByRole("button", { name: "Apply changes", exact: true })
+    .click();
+  await expect(review).toHaveCount(0);
+  await page.evaluate(() => {
+    const state = (window as any).__testState;
+    state.runtime = {
+      ...state.runtime,
+      error: "The run record was not saved: disk full",
+    };
+  });
+  await page.getByRole("tab", { name: "Node inspector", exact: true }).click();
+  await page.getByRole("tab", { name: "History", exact: true }).click();
+  await page.locator(".ins-run > summary").last().click();
+  await page
+    .getByRole("button", { name: "Inspect this run", exact: true })
+    .last()
+    .click();
+  await expect(page.getByRole("status")).toHaveText("Showing run older-run");
+
+  await releaseReply(page, "save-err-poll");
+  await expect(page.locator(".error-banner")).toContainText(
+    "The run record was not saved: disk full",
+  );
+  await expect(page.getByRole("status")).toHaveText("Showing run older-run");
+});
+
+test("quitting handles unsaved idle, unsaved active, read-only child, and save failures", async ({
+  page,
+}) => {
+  const quits = () =>
+    page.evaluate(() => (window as any).__testState.quits as number);
+
+  // Dirty + Idle: Save and quit failure stays open; Save and quit success saves then quits.
+  await page.locator('[data-id="n0"]').click();
+  await page.getByLabel("Name", { exact: true }).fill("editedForQuit");
+  await expect(page.locator(".save-state")).toHaveText("Unsaved changes");
+
+  await queueReply(page, { method: "save_graph", error: "Read-only disk" });
+  await page.evaluate(() =>
+    (window as any).__testState.emit("close-requested"),
+  );
+  const dialog = page.getByRole("dialog", { name: "Quit uapz?" });
+  await expect(dialog).toContainText("This workflow has unsaved changes.");
+  await expect(dialog.getByRole("button")).toHaveText([
+    "Cancel",
+    "Quit without saving",
+    "Save and quit",
+  ]);
+  await dialog
+    .getByRole("button", { name: "Save and quit", exact: true })
+    .click();
+  await expect(page.locator(".error-banner")).toContainText("Read-only disk");
+  expect(await quits()).toBe(0);
+
+  await page.evaluate(() =>
+    (window as any).__testState.emit("close-requested"),
+  );
+  await dialog
+    .getByRole("button", { name: "Save and quit", exact: true })
+    .click();
+  await expect.poll(quits).toBe(1);
+  expect(await callsFor(page, "save_graph")).toHaveLength(2);
+
+  // Dirty + Idle: Quit without saving does not save.
+  await page.getByLabel("Name", { exact: true }).fill("discardForQuit");
+  await page.evaluate(() =>
+    (window as any).__testState.emit("close-requested"),
+  );
+  await dialog
+    .getByRole("button", { name: "Quit without saving", exact: true })
+    .click();
+  await expect.poll(quits).toBe(2);
+  expect(await callsFor(page, "save_graph")).toHaveLength(2);
+
+  // Dirty + Running: combined message with Save and quit, omitted in read-only child.
+  await startRun(page);
+  await page.evaluate(() =>
+    (window as any).__testState.emit("close-requested"),
+  );
+  await expect(dialog).toContainText(
+    "This workflow has unsaved changes, and a run is in progress. Quitting cancels the run.",
+  );
+  await expect(dialog.getByRole("button")).toHaveText([
+    "Cancel",
+    "Quit without saving",
+    "Save and quit",
+  ]);
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+
+  await page.locator('[data-id="n1"]').dblclick();
+  await expect(page.locator(".provenance")).toContainText("Read only");
+  await page.evaluate(() =>
+    (window as any).__testState.emit("close-requested"),
+  );
+  await expect(dialog.getByRole("button")).toHaveText([
+    "Cancel",
+    "Quit without saving",
+  ]);
+  await dialog
+    .getByRole("button", { name: "Quit without saving", exact: true })
+    .click();
+  await expect.poll(quits).toBe(3);
+});
+
+test("quitting while an accepted run is still pending asks before cancelling", async ({
+  page,
+}) => {
+  await page.getByRole("button", { name: "Run workflow", exact: true }).click();
+  await queueReply(page, { method: "start_run", gate: "pending-start" });
+  await page.getByRole("button", { name: "Start run", exact: true }).click();
+  await pending(page, "pending-start");
+  await queueReply(page, { method: "runtime_state", gate: "first-status" });
+  await releaseReply(page, "pending-start");
+  await pending(page, "first-status");
+
+  await page.evaluate(() =>
+    (window as any).__testState.emit("close-requested"),
+  );
+  const dialog = page.getByRole("dialog", { name: "Quit uapz?" });
+  await expect(dialog).toContainText(
+    "A run is in progress. Quitting cancels it.",
+  );
+  expect(await page.evaluate(() => (window as any).__testState.quits)).toBe(0);
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  await releaseReply(page, "first-status");
+  await expect(
+    page.getByRole("region", { name: "Review file changes" }),
+  ).toBeVisible();
+});
+
+test("an in-flight install_examples completion does not replace an open quit dialog", async ({
+  page,
+}) => {
+  await page.getByRole("button", { name: "New", exact: true }).click();
+  await page
+    .getByLabel("Workflow name", { exact: true })
+    .fill("unsaved-empty");
+  await page.evaluate((doc) => {
+    (window as any).__testState.graphs["reviewed-note"] = {
+      ...doc,
+      name: "reviewed-note",
+    };
+  }, parent);
+  await queueReply(page, {
+    method: "install_examples",
+    gate: "installing",
+    value: { installed: ["reviewed-note"], skipped: [] },
+  });
+  await page
+    .locator(".empty-canvas")
+    .getByRole("button", { name: "Install example workflows", exact: true })
+    .click();
+  await pending(page, "installing");
+
+  await page.evaluate(() =>
+    (window as any).__testState.emit("close-requested"),
+  );
+  const dialog = page.getByRole("dialog", { name: "Quit uapz?" });
+  await expect(dialog).toBeVisible();
+
+  await releaseReply(page, "installing");
+  // The quit dialog stays intact and the completed install does not navigate away.
+  await expect(dialog).toBeVisible();
+  await expect(page.getByLabel("Workflow name", { exact: true })).toHaveValue(
+    "unsaved-empty",
+  );
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(dialog).toHaveCount(0);
 });

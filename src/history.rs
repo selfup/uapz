@@ -873,4 +873,107 @@ mod tests {
         assert!(outside.exists());
         fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn first_failed_leads_report_headline_and_legacy_records_fall_back() {
+        let root = scratch("first-failed");
+        let doc = doc();
+        let mut rep = report(Err("n1 broke first".into()), Some("n1"));
+        rep.outputs.clear();
+        rep.failures = vec![
+            ("n1".into(), "n1 broke first".into()),
+            ("n0".into(), "n0 broke second".into()),
+        ];
+        let run = record(&doc, &["n1".into(), "n0".into()], &rep, None);
+        assert_eq!(run.failed.as_deref(), Some("n1"));
+        assert!(run.headline().contains("n1 failed"), "{}", run.headline());
+        save(&root, &run).unwrap();
+        let loaded = list(&root, &run.graph).pop().unwrap();
+        assert_eq!(loaded.failed.as_deref(), Some("n1"));
+        let back = loaded.report(None);
+        assert_eq!(back.failed.as_deref(), Some("n1"));
+        assert_eq!(back.failures.len(), 2);
+        assert_eq!(back.failures[0], ("n1".into(), "n1 broke first".into()));
+        assert!(
+            back.failures
+                .contains(&("n0".into(), "n0 broke second".into()))
+        );
+
+        // Legacy records without `failed` fall back to the first failed node by id.
+        let mut legacy = serde_json::to_value(&run).unwrap();
+        legacy.as_object_mut().unwrap().remove("failed");
+        let legacy: Run = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.failed.is_none());
+        assert!(
+            legacy.headline().contains("n0 failed"),
+            "{}",
+            legacy.headline()
+        );
+        let back = legacy.report(None);
+        assert_eq!(back.failed.as_deref(), Some("n0"));
+        assert_eq!(back.failures[0].0, "n0");
+
+        // Cancelled runs keep an earlier target's failure in Run.failed and nodes (H3, H6).
+        let mut cancelled_report = report(Err(exec::CANCELLED.into()), Some("n1"));
+        cancelled_report.outputs.clear();
+        cancelled_report.failures = vec![("n1".into(), "earlier failure".into())];
+        let cancelled = record(&doc, &["n1".into(), "n0".into()], &cancelled_report, None);
+        assert_eq!(cancelled.outcome, Outcome::Cancelled);
+        assert_eq!(cancelled.failed.as_deref(), Some("n1"));
+        assert_eq!(cancelled.nodes["n1"].state, State::Failed);
+        assert!(!cancelled.nodes.contains_key("n0"));
+
+        // Pre-execution failures carry no failed nodes (H2).
+        let mut pre = report(Err("missing input".into()), None);
+        pre.outputs.clear();
+        let pre_run = record(&doc, &["n1".into()], &pre, None);
+        assert_eq!(
+            pre_run.outcome,
+            Outcome::Failed {
+                error: "missing input".into()
+            }
+        );
+        assert!(pre_run.failed.is_none());
+        assert!(pre_run.nodes.is_empty());
+        assert!(
+            pre_run.headline().contains(" · failed"),
+            "{}",
+            pre_run.headline()
+        );
+        assert!(pre_run.report(None).failures.is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn merging_rename_prunes_beyond_max_runs_on_next_save() {
+        let root = scratch("merge-prune");
+        let mut doc_a = doc();
+        doc_a.name = "GraphA".into();
+        let mut doc_b = doc();
+        doc_b.name = "GraphB".into();
+        let mut run_a = record(&doc_a, &["n1".into()], &report(Ok(output("a")), None), None);
+        let mut run_b = record(&doc_b, &["n1".into()], &report(Ok(output("b")), None), None);
+        for n in 0..110 {
+            run_a.id = format!("20261025T0000{n:05}Z");
+            save(&root, &run_a).unwrap();
+        }
+        for n in 110..215 {
+            run_b.id = format!("20261025T0000{n:05}Z");
+            save(&root, &run_b).unwrap();
+        }
+        assert_eq!(rename(&root, "GraphA", "GraphB").unwrap(), 110);
+        // Listing caps at MAX_RUNS immediately.
+        let listed = list(&root, "GraphB");
+        assert_eq!(listed.len(), MAX_RUNS);
+        assert_eq!(listed[0].id, "20261025T000000214Z");
+        // The next save prunes the merged directory on disk down to MAX_RUNS.
+        run_b.id = "20261025T000000215Z".into();
+        save(&root, &run_b).unwrap();
+        let dir = root.join(DIR).join("GraphB");
+        assert_eq!(record_files(&dir).len(), MAX_RUNS);
+        assert!(!dir.join("20261025T000000000Z.json").exists());
+        assert!(dir.join("20261025T000000215Z.json").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
 }

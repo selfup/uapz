@@ -6821,4 +6821,204 @@ mod tests {
         assert_eq!(second.reused, ["n1"], "{:?}", second.log);
         fs::remove_dir_all(&root).unwrap();
     }
+
+    #[test]
+    fn shared_failing_upstream_runs_once_and_emits_failed_once() {
+        let root = scratch("shared-fail");
+        let counter = root.join("count.txt");
+        fs::write(
+            root.join("scripts/fail_once.sh"),
+            format!("printf 'x\\n' >> '{}'\nexit 1\n", counter.display()),
+        )
+        .unwrap();
+        fs::write(root.join("scripts/pass.sh"), "cat\n").unwrap();
+        let doc = graph(
+            vec![
+                node("n0", shell("fail_once.sh", &[], 10)),
+                node("n1", shell("pass.sh", &[], 10)),
+                node("n2", shell("pass.sh", &[], 10)),
+            ],
+            &[("n0", "n1"), ("n0", "n2")],
+        );
+        let http = FakeHttp::new(200, "{}");
+        let (control, seen) = recording_control();
+        let report = run_all_with(
+            &doc,
+            &["n1".into(), "n2".into()],
+            Dirs::under(&root),
+            &http,
+            &no_env,
+            &control,
+        );
+        assert!(report.result.is_err());
+        // N1: n0 ran at most once despite feeding two targets.
+        assert_eq!(fs::read_to_string(&counter).unwrap().lines().count(), 1);
+        // N2 & N3: Failed emitted once for n0 only, never for blocked targets n1 or n2.
+        let failed_events: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|p| match p {
+                Progress::Node {
+                    id,
+                    state: NodeState::Failed,
+                } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(failed_events, ["n0"]);
+        assert_eq!(report.failed.as_deref(), Some("n0"));
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].0, "n0");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn cache_key_setup_failure_records_failed_state_before_running() {
+        let root = scratch("missing-script");
+        let doc = graph(vec![node("n0", shell("missing.sh", &[], 10))], &[]);
+        let http = FakeHttp::new(200, "{}");
+        let (control, seen) = recording_control();
+        let report = run_with(&doc, "n0", Dirs::under(&root), &http, &no_env, &control);
+        assert!(report.result.is_err());
+        let events: Vec<(String, NodeState)> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|p| match p {
+                Progress::Node { id, state } => Some((id.clone(), *state)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(events, [("n0".into(), NodeState::Failed)]);
+        assert_eq!(report.failed.as_deref(), Some("n0"));
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].0, "n0");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn non_cacheable_nodes_always_run_even_with_warm_cache() {
+        let root = scratch("non-cacheable");
+        fs::write(root.join("data/live.txt"), "v1").unwrap();
+        let doc = graph(
+            vec![
+                NodeDoc {
+                    id: "n0".into(),
+                    x: 0.0,
+                    y: 0.0,
+                    kind: None,
+                    name: Some("val".into()),
+                    color: None,
+                    data: Some(NodeData::Input(workflow::InputConfig {
+                        default: "in".into(),
+                        ..Default::default()
+                    })),
+                },
+                node("n1", data("live.txt", DataFormat::Text)),
+                node(
+                    "n2",
+                    Some(NodeData::Directory(DirectoryConfig {
+                        path: "data".into(),
+                        include: vec!["*.txt".into()],
+                        ..DirectoryConfig::default()
+                    })),
+                ),
+                node(
+                    "n3",
+                    Some(NodeData::File(FileConfig {
+                        path: "out.txt".into(),
+                        mode: WriteMode::Overwrite,
+                        ..FileConfig::default()
+                    })),
+                ),
+            ],
+            &[("n1", "n3")],
+        );
+        let http = FakeHttp::new(200, "{}");
+        let (control, _) = recording_control();
+        let targets = vec!["n0".into(), "n2".into(), "n3".into()];
+        let first = run_all_with(&doc, &targets, Dirs::under(&root), &http, &no_env, &control);
+        assert!(first.result.is_ok());
+        assert!(first.reused.is_empty());
+        assert_eq!(lock(control.cache.as_ref().unwrap()).len(), 0);
+
+        fs::write(root.join("data/live.txt"), "v2").unwrap();
+        let second = run_all_with(&doc, &targets, Dirs::under(&root), &http, &no_env, &control);
+        assert!(second.result.is_ok());
+        assert!(second.reused.is_empty());
+        assert_eq!(fs::read_to_string(root.join("out.txt")).unwrap(), "v2\n");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn cache_keep_enforces_size_cap_touches_mtime_and_prunes_oldest_keeping_memory() {
+        let root = scratch("cache-prune");
+        let dir = root.join("cache");
+        let mut cache = Cache::persistent(dir.clone());
+
+        // Outputs above MAX_HISTORY_BYTES (8 MB) are refused by keep.
+        let oversized = Output::new(vec![b'a'; MAX_HISTORY_BYTES + 1], true, "Text");
+        assert!(!cache.keep(99, &oversized));
+        assert!(cache.fetch(99).is_none());
+
+        // Store two entries via lookup/store so key 1 is in memory too.
+        let out1 = Output::new(b"first".to_vec(), true, "Text");
+        let out2 = Output::new(b"second".to_vec(), true, "Text");
+        cache.store("node-1", 1, out1.clone());
+        cache.store("node-2", 2, out2.clone());
+        let (meta1, bin1) = cache.paths(1).unwrap();
+        let (meta2, bin2) = cache.paths(2).unwrap();
+
+        // Backdate entry 1 and verify keep touches its mtime to make it recent.
+        let old_time = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let older_time = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(500_000);
+        fs::File::options()
+            .append(true)
+            .open(&bin1)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+        assert!(cache.keep(1, &out1));
+        assert!(fs::metadata(&bin1).unwrap().modified().unwrap() > old_time);
+
+        // Now make entry 1 older than entry 2 and expand both sparse .bin files past
+        // MAX_CACHE_BYTES so prune evicts entry 1 from disk while keeping entry 2 and
+        // keeping entry 1 valid in memory.
+        let chunk = (MAX_CACHE_BYTES / 2) + 1024;
+        for (path, mtime) in [(&bin1, older_time), (&bin2, old_time)] {
+            let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+            file.set_len(chunk).unwrap();
+            file.set_modified(mtime).unwrap();
+        }
+        cache.prune(&dir);
+        assert!(!bin1.exists() && !meta1.exists());
+        assert!(bin2.exists() && meta2.exists());
+        assert_eq!(cache.len(), 1);
+        assert!(cache.fetch(1).is_none());
+        // Memory entry for node-1 remains valid even after disk eviction.
+        assert_eq!(cache.lookup("node-1", 1).unwrap().bytes, b"first");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn run_process_reports_missing_program() {
+        let root = scratch("missing-program");
+        let cancel = AtomicBool::new(false);
+        let program = "uapz-definitely-nonexistent-program-99999";
+        let error = run_process(
+            program,
+            &[],
+            &root,
+            &[],
+            b"",
+            Duration::from_secs(5),
+            &cancel,
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains(program), "{error}");
+        assert!(error.contains("not installed"), "{error}");
+        fs::remove_dir_all(&root).unwrap();
+    }
 }

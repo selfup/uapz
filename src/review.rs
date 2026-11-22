@@ -475,4 +475,36 @@ mod tests {
         assert_eq!(error, crate::exec::CANCELLED);
         assert!(!published);
     }
+
+    #[test]
+    fn second_decision_returns_false_and_first_decision_wins() {
+        let request = Arc::new(Request {
+            node: "n1".into(),
+            files: Vec::new(),
+        });
+        let decision = wait(request, &AtomicBool::new(false), |pending| {
+            assert!(pending.decide(Decision::Apply));
+            assert!(!pending.decide(Decision::Reject));
+        })
+        .unwrap();
+        assert_eq!(decision, Decision::Apply);
+    }
+
+    #[test]
+    fn create_mode_rejects_existing_file_during_prepare() {
+        let root = scratch("create-exists");
+        let target = root.join("existing.txt");
+        fs::write(&target, "keep me").unwrap();
+        let error = Batch::prepare(
+            &root,
+            "n1",
+            &[("existing.txt", &target, b"overwrite")],
+            WriteMode::Create,
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("already exists"), "{error}");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep me");
+        fs::remove_dir_all(root).unwrap();
+    }
 }

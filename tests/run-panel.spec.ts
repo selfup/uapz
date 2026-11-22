@@ -371,3 +371,95 @@ test("a failed node retains its partial streamed answer next to the failure", as
   await expect(feed).toContainText("Provider connection lost");
   await expect(feed).toContainText("partial output");
 });
+
+test("switching historical runs discards a late RunOutput response from the previous run", async ({
+  page,
+}) => {
+  await page.evaluate(() => {
+    (window as any).__testState.history = [
+      {
+        id: "run-a",
+        graph: "Demo",
+        targets: ["n2"],
+        elapsed_ms: 10,
+        nodes: {
+          n0: {
+            state: "ran",
+            preview: "Preview A",
+            label: "Text",
+            complete: false,
+            key: "key-a",
+          },
+        },
+        log: [],
+        outcome: { kind: "ok" },
+      },
+      {
+        id: "run-b",
+        graph: "Demo",
+        targets: ["n2"],
+        elapsed_ms: 20,
+        nodes: {
+          n0: {
+            state: "ran",
+            preview: "Complete B",
+            label: "Text",
+            complete: true,
+          },
+        },
+        log: [],
+        outcome: { kind: "ok" },
+      },
+    ];
+  });
+  for (const name of ["Parts", "Demo"]) {
+    await page
+      .locator(".library")
+      .getByRole("button", { name, exact: true })
+      .click();
+    await expect(page.getByLabel("Workflow name", { exact: true })).toHaveValue(
+      name,
+    );
+  }
+  await queueReply(page, {
+    method: "output",
+    args: { run_id: "run-a", node: "n0" },
+    gate: "stale-run-output",
+    value: {
+      label: "Text",
+      text: "STALE OUTPUT A",
+      base64: null,
+      saved: null,
+      complete: true,
+    },
+  });
+  await page.getByRole("tab", { name: "History", exact: true }).click();
+  await page.locator(".ins-run > summary").nth(0).click();
+  await page
+    .locator(".ins-run")
+    .nth(0)
+    .getByRole("button", { name: "Inspect this run", exact: true })
+    .click();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        Boolean((window as any).__testState.pending["stale-run-output"]),
+      ),
+    )
+    .toBe(true);
+
+  await page.getByRole("tab", { name: "Node inspector", exact: true }).click();
+  await page.getByRole("tab", { name: "History", exact: true }).click();
+  await page.locator(".ins-run > summary").nth(1).click();
+  await page
+    .locator(".ins-run")
+    .nth(1)
+    .getByRole("button", { name: "Inspect this run", exact: true })
+    .click();
+  const feed = page.getByLabel("Run output feed", { exact: true });
+  await expect(feed).toContainText("Complete B");
+
+  await releaseReply(page, "stale-run-output");
+  await expect(feed).toContainText("Complete B");
+  await expect(feed).not.toContainText("STALE OUTPUT A");
+});

@@ -169,3 +169,94 @@ test("a pending child load cannot open over a newly selected root graph", async 
     page.getByRole("button", { name: "Save", exact: true }),
   ).toBeEnabled();
 });
+
+test("renaming a dirty open workflow keeps it unsaved while renaming a clean one stays saved", async ({
+  page,
+}) => {
+  await queueReply(page, {
+    method: "rename_graph",
+    value: { name: "DemoClean" },
+  });
+  await page.evaluate(() => {
+    const state = (window as any).__testState;
+    state.graphs.DemoClean = state.graphs.Demo;
+    delete state.graphs.Demo;
+  });
+  const demo = page.locator(".library-row").filter({ hasText: "Demo" }).first();
+  await demo.hover();
+  await demo.getByLabel("Rename Demo", { exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Rename workflow" });
+  await dialog.getByLabel("New name").fill("DemoClean");
+  await dialog.getByRole("button", { name: "Rename", exact: true }).click();
+  await expect(page.getByLabel("Workflow name", { exact: true })).toHaveValue(
+    "DemoClean",
+  );
+  await expect(page.locator(".save-state")).toHaveText("Saved workflow");
+
+  // Make the open workflow dirty, then rename again: savedKey must not follow.
+  await page.locator('[data-id="n0"]').click();
+  await page.getByLabel("Name", { exact: true }).fill("dirtyBeforeRename");
+  await expect(page.locator(".save-state")).toHaveText("Unsaved changes");
+
+  await queueReply(page, {
+    method: "rename_graph",
+    value: { name: "DemoDirty" },
+  });
+  await page.evaluate(() => {
+    const state = (window as any).__testState;
+    state.graphs.DemoDirty = state.graphs.DemoClean;
+    delete state.graphs.DemoClean;
+  });
+  const clean = page
+    .locator(".library-row")
+    .filter({ hasText: "DemoClean" })
+    .first();
+  await clean.hover();
+  await clean.getByLabel("Rename DemoClean", { exact: true }).click();
+  await dialog.getByLabel("New name").fill("DemoDirty");
+  await dialog.getByRole("button", { name: "Rename", exact: true }).click();
+  await expect(page.getByLabel("Workflow name", { exact: true })).toHaveValue(
+    "DemoDirty",
+  );
+  await expect(page.locator(".save-state")).toHaveText("Unsaved changes");
+});
+
+test("nested workflow navigation stops at 8 levels", async ({ page }) => {
+  await page.evaluate(() => {
+    const state = (window as any).__testState;
+    state.graphs.Loop = {
+      version: 1,
+      name: "Loop",
+      view: { pan_x: 30, pan_y: 30, zoom: 1 },
+      nodes: [
+        {
+          id: "n1",
+          name: "Step",
+          x: 80,
+          y: 80,
+          data: { type: "workflow", graph: "Loop", output: "", inputs: {} },
+        },
+      ],
+      edges: [],
+      outputs: {},
+    };
+  });
+  await page.getByRole("button", { name: "Refresh library" }).click();
+  await page
+    .locator(".library")
+    .getByRole("button", { name: "Loop", exact: true })
+    .click();
+  const breadcrumbs = page.getByRole("navigation", {
+    name: "Workflow breadcrumbs",
+  });
+  await expect(breadcrumbs.getByRole("button")).toHaveCount(1);
+  for (let depth = 1; depth <= 8; depth += 1) {
+    await page.locator('[data-id="n1"]').dblclick();
+    await expect(breadcrumbs.getByRole("button")).toHaveCount(depth + 1);
+  }
+  await page.locator('[data-id="n1"]').dblclick();
+  await expect(page.locator(".error-banner")).toContainText(
+    "Workflow navigation is limited to 8 levels.",
+  );
+  await expect(breadcrumbs.getByRole("button")).toHaveCount(9);
+});

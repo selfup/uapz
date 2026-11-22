@@ -482,25 +482,31 @@ Paths that looked suspicious and held up, so they need not be re-derived:
 
 | Transition or invariant | Test |
 | --- | --- |
-| S1 second start refused; V3 stale ids; V1 duplicate decision | `app::tests::pending_review_blocks_second_run_and_rejects_stale_decisions` |
+| S1 second start refused; V3 stale ids; V1 duplicate decision | `app::tests::pending_review_blocks_second_run_and_rejects_stale_decisions`, `app::tests::sequential_reviews_enforce_unique_ids_and_all_review_guards`, `review::tests::second_decision_returns_false_and_first_decision_wins` |
+| 2.1 idle-guarded mutations (`clear_cache`, `clear_history`, `delete_graph`, `rename_graph`) | `app::tests::active_run_blocks_all_idle_mutations_until_finished` |
+| 2.1 spawn failure restores previous or Empty | `app::tests::a_spawn_failure_keeps_the_previous_finished_session`, `app::tests::spawn_failure_on_empty_slot_leaves_service_empty` |
 | Cancel wakes a review; `Cancelled` record | `app::tests::cancellation_wakes_review_and_retains_cancelled_history`, `review::tests::cancellation_wakes_a_waiting_review_and_wins_over_approval` |
 | R1 cancelled session never publishes review | `review::tests::cancelled_wait_does_not_publish_a_pending_review`, `app::tests::a_cancelled_session_never_publishes_a_review` |
+| R2 cancelling state, R3 recorded marks cleanup, H5, X3 | `app::tests::cancelling_state_rejects_reviews_and_recorded_finish_clears_pending_marks`, `tests/run-lifecycle.spec.ts` "cancelling a running workflow shows Cancelling state until the worker finishes" |
 | R3 and R5 on the crashed path | `app::tests::a_crashed_worker_leaves_no_pending_or_running_marks` |
+| 2.2 finished with save error | `app::tests::save_error_records_run_and_surfaces_error_in_finished_session`, `tests/run-lifecycle.spec.ts` "a finished run with a save error surfaces the error even while inspecting history" |
+| H2, H3, H6 `Run.failed`, legacy fallback, merging rename prune | `history::tests::first_failed_leads_report_headline_and_legacy_records_fall_back`, `history::tests::merging_rename_prunes_beyond_max_runs_on_next_save` |
 | H4, X4 | `history::tests::renamed_records_report_the_directory_they_are_listed_from`, `app::tests::history_outputs_stay_reachable_under_a_renamed_graph`, `tests/run-lifecycle.spec.ts` "renaming the open workflow re-keys its remembered runs so outputs are requested under the new name", "deleting the open workflow clears its history and remembered outputs" |
-| N3, H3, H5 | `exec::tests::independent_failures_each_get_a_failed_state`, `exec::tests::cancellation_takes_precedence_over_an_earlier_target_failure` |
+| N1, N2, N3, H3, H5 | `exec::tests::independent_failures_each_get_a_failed_state`, `exec::tests::cancellation_takes_precedence_over_an_earlier_target_failure`, `exec::tests::shared_failing_upstream_runs_once_and_emits_failed_once`, `exec::tests::cache_key_setup_failure_records_failed_state_before_running` |
 | N4 | `exec::tests::cancellation_after_a_whole_reply_prevents_saving_and_caching`, `exec::tests::agents_stream_text_into_progress_and_stop_on_cancel` |
-| P1 | `exec::tests::process_timeout_covers_pipes_inherited_by_grandchildren`, `exec::tests::cancellation_covers_pipes_inherited_by_grandchildren` |
-| V2 | `exec::tests::a_stale_file_stops_an_approved_batch_before_its_first_write` |
-| R6, R7 feed bounds | `app::tests::feed_preserves_order_coalesces_text_and_replaces_completed_streams`, `app::tests::feed_retention_is_bounded_and_flags_utf8_truncation_and_real_evictions` |
-| F1 | `tests/async-actions.spec.ts` "preparing a run blocks repeated execution and root navigation until its inputs are ready", "an accepted run cannot be resubmitted when its first status response is error/null", "a lost start_run reply still attaches to the service session that accepted it" |
+| 2.6 cache `keep`, `prune`, C1, C2, C3 | `exec::tests::cache_keep_enforces_size_cap_touches_mtime_and_prunes_oldest_keeping_memory`, `exec::tests::non_cacheable_nodes_always_run_even_with_warm_cache`, `exec::tests::corrupt_cache_bytes_are_misses_and_history_can_repair_them`, `exec::tests::cache_never_reads_writes_or_clears_a_symlinked_directory` |
+| 2.7 spawn error, P1 | `exec::tests::run_process_reports_missing_program`, `exec::tests::process_timeout_covers_pipes_inherited_by_grandchildren`, `exec::tests::cancellation_covers_pipes_inherited_by_grandchildren` |
+| V2, `Create` mode | `exec::tests::a_stale_file_stops_an_approved_batch_before_its_first_write`, `review::tests::create_mode_rejects_existing_file_during_prepare` |
+| R6, R7 feed bounds and multi-node stream preservation | `app::tests::feed_preserves_order_coalesces_text_and_replaces_completed_streams`, `app::tests::feed_retention_is_bounded_and_flags_utf8_truncation_and_real_evictions`, `app::tests::completed_output_preserves_other_nodes_stream_and_text_events` |
+| 3.1 rename dirty vs clean, 8-level child depth | `tests/async-workspace.spec.ts` "renaming a dirty open workflow keeps it unsaved while renaming a clean one stays saved", "nested workflow navigation stops at 8 levels" |
+| F1, no-fields start, orphan attach | `tests/async-actions.spec.ts` "preparing a run blocks repeated execution and root navigation until its inputs are ready", "an accepted run cannot be resubmitted when its first status response is error/null", "a lost start_run reply still attaches to the service session that accepted it"; `tests/run-lifecycle.spec.ts` "workflows without input fields start immediately and return to idle on start failure", "polling attaches to an unowned active run for the open graph" |
 | F2 | `tests/run-lifecycle.spec.ts` "a review decision is sent once however often its button is pressed while it is in flight" |
-| F3 save-vs-mutate and clear history | `tests/async-workspace.spec.ts` "rename, delete and duplicate wait for an in-flight save, while open stays available"; `tests/run-lifecycle.spec.ts` "clearing history waits while occupied and exits historical view cleanly" |
+| F3 save-during-run, save-vs-mutate and clear history | `tests/async-workspace.spec.ts` "rename, delete and duplicate wait for an in-flight save, while open stays available"; `tests/run-lifecycle.spec.ts` "save stays available during a run while navigation and destructive actions wait", "clearing history waits while occupied and exits historical view cleanly" |
 | F4, X1 | `tests/run-lifecycle.spec.ts` "a run whose worker stopped without a record is reported as failed and releases the editor" |
-| 2.1 spawn failure restores previous | `app::tests::a_spawn_failure_keeps_the_previous_finished_session` |
-| 3.3 stale poll | `tests/async-actions.spec.ts` "a late runtime poll snapshot/failure cannot override a newer completed status" |
-| 3.5, X7 | `tests/run-lifecycle.spec.ts` "a saved, idle workflow quits at once", "quitting while a run is in progress asks first, even with nothing unsaved", "quitting while start_run is in flight asks before cancelling", "save and quit refuses to quit while another save is already in flight"; `tests/session.spec.ts` "leaving unsaved changes offers to save them first" |
+| 3.3 stale poll, active session on launch | `tests/async-actions.spec.ts` "a late runtime poll snapshot/failure cannot override a newer completed status"; `tests/run-lifecycle.spec.ts` "launching with an active service session loads its graph as dirty and attaches" |
+| 3.5, 3.6, X7 | `tests/run-lifecycle.spec.ts` "a saved, idle workflow quits at once", "quitting while a run is in progress asks first, even with nothing unsaved", "quitting while start_run is in flight asks before cancelling", "quitting while an accepted run is still pending asks before cancelling", "quitting handles unsaved idle, unsaved active, read-only child, and save failures", "save and quit refuses to quit while another save is already in flight", "an in-flight install_examples completion does not replace an open quit dialog"; `tests/session.spec.ts` "leaving unsaved changes offers to save them first" |
 | D1 | `tests/async-workspace.spec.ts`, `tests/async-actions.spec.ts` prompt and save tests |
-| 3.4 | `tests/run-panel.spec.ts` "historical runs expose all results and failed full-output loads can be retried" |
+| 3.4, O1 | `tests/run-panel.spec.ts` "historical runs expose all results and failed full-output loads can be retried", "switching historical runs discards a late RunOutput response from the previous run"; `tests/outputs.spec.ts` "late output responses cannot appear under the next selected node" |
 
 ## 7. Keeping this file current
 
